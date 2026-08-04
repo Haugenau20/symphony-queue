@@ -37,7 +37,7 @@ describe('buildServiceConfig', () => {
       promptTemplate: '',
     }
     const cfg = buildServiceConfig(wf)
-    expect(Object.keys(cfg.tracker).sort()).toEqual(['activeStates', 'kind', 'terminalStates'])
+    expect(Object.keys(cfg.tracker).sort()).toEqual(['activeStates', 'kind', 'maxAttempts', 'root', 'terminalStates'])
     expect(JSON.stringify(cfg)).not.toContain('SOME_SECRET')
     expect(JSON.stringify(cfg)).not.toContain('example.invalid')
   })
@@ -80,9 +80,14 @@ describe('validateDispatchConfig', () => {
     expect(validateDispatchConfig(cfg)).toContain('unsupported tracker.kind: jira')
   })
 
-  it('accepts the file_queue tracker kind', () => {
-    const cfg = buildServiceConfig({ config: { tracker: { kind: 'file_queue' } }, promptTemplate: '' })
+  it('accepts the file_queue tracker kind with a root', () => {
+    const cfg = buildServiceConfig({ config: { tracker: { kind: 'file_queue', root: '/srv/queue' } }, promptTemplate: '' })
     expect(validateDispatchConfig(cfg)).toEqual([])
+  })
+
+  it('requires tracker.root for the file_queue tracker', () => {
+    const cfg = buildServiceConfig({ config: { tracker: { kind: 'file_queue' } }, promptTemplate: '' })
+    expect(validateDispatchConfig(cfg)).toContain('tracker.root is required for the file_queue tracker')
   })
 
   it('returns error for empty active_states', () => {
@@ -101,5 +106,37 @@ describe('parseAndValidateConfig', () => {
     expect(config.polling.intervalMs).toBe(30000)
     expect(config.agent.maxTurns).toBe(20)
     expect(errors).toContain('tracker.kind is required')
+  })
+})
+
+describe('queue config', () => {
+  it('defaults max_attempts and leaves root unset', () => {
+    const cfg = buildServiceConfig({ config: { tracker: { kind: 'file_queue' } }, promptTemplate: '' })
+    expect(cfg.tracker.maxAttempts).toBe(5)
+    expect(cfg.tracker.root).toBeNull()
+  })
+
+  it('parses root and max_attempts', () => {
+    const cfg = buildServiceConfig({
+      config: { tracker: { kind: 'file_queue', root: '/srv/queue', max_attempts: 3 } },
+      promptTemplate: '',
+    })
+    expect(cfg.tracker.root).toBe('/srv/queue')
+    expect(cfg.tracker.maxAttempts).toBe(3)
+  })
+
+  it('resolves a relative root against the workflow directory', () => {
+    const cfg = buildServiceConfig(
+      { config: { tracker: { kind: 'file_queue', root: 'queue' } }, promptTemplate: '' },
+      '/srv/project',
+    )
+    expect(cfg.tracker.root).toBe('/srv/project/queue')
+  })
+
+  it('rejects a non-positive max_attempts', () => {
+    expect(() => buildServiceConfig({
+      config: { tracker: { kind: 'file_queue', max_attempts: 0 } },
+      promptTemplate: '',
+    })).toThrow()
   })
 })

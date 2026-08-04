@@ -13,6 +13,9 @@ function expandPath(value: string, workflowDir?: string): string {
 
 const TrackerRawSchema = z.object({
   kind: z.string().default(''),
+  /** Queue root. The six state directories live directly under it. */
+  root: z.string().optional(),
+  max_attempts: z.number().int().positive().default(5),
   active_states: z.array(z.string()).default(['Todo', 'In Progress']),
   terminal_states: z.array(z.string()).default(['Done', 'Cancelled']),
 })
@@ -49,6 +52,8 @@ const OpenCodeRawSchema = z.object({
 
 export interface TrackerConfig {
   kind: string
+  root: string | null
+  maxAttempts: number
   activeStates: string[]
   terminalStates: string[]
 }
@@ -116,6 +121,8 @@ export function buildServiceConfig(wf: WorkflowDefinition, workflowDir?: string)
   return {
     tracker: {
       kind: trackerRaw.kind,
+      root: trackerRaw.root ? expandPath(trackerRaw.root, workflowDir) : null,
+      maxAttempts: trackerRaw.max_attempts,
       activeStates: [...trackerRaw.active_states],
       terminalStates: [...trackerRaw.terminal_states],
     },
@@ -161,6 +168,9 @@ export function validateDispatchConfig(cfg: ServiceConfig): string[] {
   }
   if (cfg.tracker.activeStates.length === 0) {
     errors.push('tracker.active_states must not be empty')
+  }
+  if (cfg.tracker.kind === 'file_queue' && !cfg.tracker.root) {
+    errors.push('tracker.root is required for the file_queue tracker')
   }
   return errors
 }

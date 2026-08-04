@@ -6,8 +6,7 @@ import { configureLogging, getLogger } from './log.js'
 import { SymphonyOrchestrator } from './orchestrator.js'
 import { AgentRunner } from './agent_runner.js'
 import { WorkspaceManager } from './workspace.js'
-import { MemoryTracker } from './tracker/memory.js'
-import type { TrackerAdapter } from './tracker/base.js'
+import { FileQueueTracker } from './tracker/file_queue.js'
 import { parseCliArgs, guardrailsBanner, usageMessage } from './cli.js'
 
 async function main(): Promise<void> {
@@ -44,10 +43,27 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  log.info({ trackerKind: config.tracker.kind }, 'symphony_config_loaded')
+  log.info({ trackerKind: config.tracker.kind, queueRoot: config.tracker.root }, 'symphony_config_loaded')
 
-  // Phase 2 replaces this with FileQueueTracker built from the queue config.
-  const tracker: TrackerAdapter = new MemoryTracker(config.tracker.activeStates)
+  let tracker: FileQueueTracker
+  try {
+    tracker = new FileQueueTracker({
+      root: config.tracker.root!,
+      maxAttempts: config.tracker.maxAttempts,
+      maxRetryBackoffMs: config.agent.maxRetryBackoffMs,
+    })
+  } catch (err) {
+    log.error({ error: String(err), queueRoot: config.tracker.root }, 'queue_root_unusable')
+    process.exit(1)
+  }
+
+  const recoverable = await tracker.fetchRecoverableIssues()
+  if (recoverable.length > 0) {
+    // SPEC §14.3: no scheduler state survives a restart, but whatever is still
+    // sitting in in-progress/ is exactly the set that was live. v1 simply lets
+    // the ordinary candidate path re-dispatch them.
+    log.info({ count: recoverable.length, ids: recoverable.map((i) => i.id) }, 'queue_recovery_set')
+  }
 
   const wsManager = new WorkspaceManager({
     root: config.workspace.root, afterCreate: config.hooks.afterCreate, beforeRun: config.hooks.beforeRun,
