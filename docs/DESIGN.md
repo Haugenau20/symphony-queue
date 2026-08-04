@@ -191,14 +191,13 @@ survived the stated acceptance criteria. Fixed to test a path-segment boundary
 (`relative === '..' || relative.startsWith('..' + sep)`), with tests for both directions.
 Note this bug only ever over-rejected, so nothing unsafe was previously admitted.
 
-**2. `attempts` and `next_retry_at` have no orchestrator caller yet.** Design rule 5 says a
-failed run moves the item to `failed/` with incremented attempts. The tracker implements and
-tests that, but nothing calls it in a live run: `SymphonyOrchestrator.onWorkerExit` records
-retries only in its in-memory `retryAttempts` map and never notifies the tracker. Wiring it up
-means one call to `updateIssueState(issueId, 'Failed')` in that method — which is a change to
-ported orchestrator code, and so outside what the bootstrap brief scoped. Left undone
-deliberately rather than done quietly. Until it is wired, a failed run retries from memory and
-the item stays in `in-progress/`.
+**2. `attempts` and `next_retry_at` had no orchestrator caller.** Design rule 5 says a failed
+run moves the item to `failed/` with incremented attempts. The tracker implemented and tested
+that, but nothing called it in a live run: `SymphonyOrchestrator.onWorkerExit` recorded retries
+only in its in-memory `retryAttempts` map and never notified the tracker. This was left undone
+deliberately at bootstrap because it meant changing ported orchestrator code.
+
+**Now fixed — see §9, which turned out to be the larger half of the same bug.**
 
 **3. The brief's file list left two dead config sections behind.** It says to strip
 `TrackerRawSchema`'s Linear fields, but `config.ts` also carried a whole `codex` section
@@ -219,3 +218,46 @@ outcome that `rename(2)` produces anyway when source and target are the same pat
 not tell the short-circuit from its absence. Replacing it with an assertion about `attempts`
 not double-counting is what made that branch real, and it also surfaced that the ENOENT
 re-scan path had no coverage at all.
+
+## 9. Exit transitions: the orchestrator records the outcome, the agent does not
+
+The state machine did not terminate. `dispatchIssue` moved an item `Todo → In Progress`, but
+`onWorkerExit` wrote the outcome only into the in-memory `completed` set and `retryAttempts`
+map. Nothing ever moved the file out of `in-progress/`.
+
+That is fine for exactly as long as the process lives, and broken the moment it restarts:
+`completed` is gone, `fetchCandidateIssues` returns `in-progress/` by design (§3, crash
+recovery), and so **every item that had already finished was dispatched again** — real agent
+turns, real tokens, on work that was done. The recovery mechanism and the missing exit
+transition combined into a loop.
+
+The seed project did not have this bug because in the Linear design the *agent* moved the
+ticket, using a `linear_graphql` MCP tool it was handed. Dropping Linear dropped the
+transition with it, and there is no equivalent here: the agent has no queue tool, does not
+know where the queue root is, and — per §5 — deliberately should not.
+
+**So the orchestrator owns exit transitions.** `onWorkerExit` is now `async` and calls
+`updateIssueState` before returning:
+
+- **Normal exit → `In Review`.** Note what this does *not* claim. The orchestrator does not
+  know the work is correct or complete, only that the agent stopped taking turns. `In Review`
+  is the human gate (§1), so "the agent finished" and "a human should look at this" are the
+  same event, and no judgement about quality is being encoded.
+- **Abnormal exit → `Failed`**, which is what finally makes the tracker's `attempts` /
+  `next_retry_at` bookkeeping and its `maxAttempts` ceiling run in a live system.
+
+Two consequences worth stating:
+
+**Only one retry schedule may be live at a time.** With the tracker recording failures, the
+in-memory `retryAttempts` entry became a second scheduler for the same item, with its own
+counter that resets on restart and no max-attempts ceiling. So the in-memory schedule is now a
+*fallback*: it is populated only when the tracker transition throws. When the tracker accepts
+it, the durable record owns the retry and the item is left unclaimed — it is in `failed/`, so
+`fetchCandidateIssues` will not return it until the sweep decides it is due.
+
+**Keeping the queue root away from the agent stays intact.** The alternative fix was to give
+the agent a `queue_move` tool. That would have put an agent-writable path into the queue for
+the sake of a transition the orchestrator already has every fact needed to make — and §5's
+whole premise is that the agent is the untrusted writer here. The orchestrator moving the file
+is both the smaller change and the one that keeps the agent's only queue surface being the
+workpad inside its own item.
