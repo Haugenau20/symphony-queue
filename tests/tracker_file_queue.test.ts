@@ -499,12 +499,61 @@ describe('full tick loop against FileQueueTracker', () => {
     expect(agentRunner.run).toHaveBeenCalledTimes(1)
     expect(seen[0]).toBe('SYM-001|Work on SYM-001: Item SYM-001.')
 
-    // the claim is the rename: the file is now in in-progress/
+    // The claim was the rename out of todo/, and the clean exit renamed it on
+    // into review/ — the human gate. Nothing may be left in in-progress/, or
+    // the next process start would re-dispatch a run that already happened.
     expect(readdirSync(join(root, 'todo'))).toEqual([])
-    expect(readdirSync(join(root, 'in-progress'))).toEqual(['SYM-001-x.md'])
-    // the human gate was never touched
-    expect(readdirSync(join(root, 'review'))).toEqual(['SYM-002-x.md'])
+    expect(readdirSync(join(root, 'in-progress'))).toEqual([])
+    expect(readdirSync(join(root, 'review')).sort()).toEqual(['SYM-001-x.md', 'SYM-002-x.md'])
     expect(orch.state.completed.has('SYM-001')).toBe(true)
+  })
+
+  it('moves the file to failed/ and stamps the retry deadline when the run fails', async () => {
+    writeItem('todo', 'SYM-001-x.md', item('SYM-001'))
+
+    const agentRunner = { run: vi.fn(async () => ({ sessionId: null, success: false, turnsCompleted: 0 })) }
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker(), agentRunner: agentRunner as any, promptTemplate: '',
+      terminalStates: ['Done', 'Cancelled'],
+    })
+
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    expect(readdirSync(join(root, 'in-progress'))).toEqual([])
+    expect(readdirSync(join(root, 'failed'))).toEqual(['SYM-001-x.md'])
+
+    // The durable counters are what survive a restart, so they must actually
+    // be written — not just tracked in the orchestrator's memory.
+    const parsed = parseQueueItem(readFileSync(join(root, 'failed', 'SYM-001-x.md'), 'utf-8'))
+    expect(parsed.frontMatter.attempts).toBe(1)
+    expect(parsed.frontMatter.nextRetryAt).not.toBeNull()
+    expect(parsed.frontMatter.nextRetryAt!.getTime()).toBeGreaterThan(Date.now())
+  })
+
+  it('re-dispatches nothing on a second tick once the queue is drained', async () => {
+    writeItem('todo', 'SYM-001-x.md', item('SYM-001'))
+
+    const agentRunner = { run: vi.fn(async () => ({ sessionId: 's', success: true, turnsCompleted: 1 })) }
+    const t = tracker()
+    const orch = new SymphonyOrchestrator({
+      tracker: t, agentRunner: agentRunner as any, promptTemplate: '',
+      terminalStates: ['Done', 'Cancelled'],
+    })
+
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    // A fresh orchestrator over the same queue root is exactly what a restart
+    // looks like: no in-memory `completed` set to protect the item.
+    const restarted = new SymphonyOrchestrator({
+      tracker: t, agentRunner: agentRunner as any, promptTemplate: '',
+      terminalStates: ['Done', 'Cancelled'],
+    })
+    await (restarted as any).tick()
+    await Promise.all(Array.from(restarted.state.running.values()).map((e) => e.task))
+
+    expect(agentRunner.run).toHaveBeenCalledTimes(1)
   })
 
   it('does not dispatch an item blocked by a non-terminal item', async () => {

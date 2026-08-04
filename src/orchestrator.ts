@@ -6,6 +6,21 @@ import type { AgentRunner } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
 
+/**
+ * Where a run lands when the agent's turns finish normally. `In Review` is the
+ * human gate (docs/DESIGN.md §1) — the orchestrator never decides that work is
+ * done, only that the agent stopped. A human moves it on to done/ or back to
+ * todo/.
+ */
+export const EXIT_STATE_NORMAL = 'In Review'
+
+/**
+ * Where a run lands on abnormal exit. `Failed` is a holding pen with a timer,
+ * not a terminal state: the tracker stamps attempts/next_retry_at and its sweep
+ * returns the item to todo/ when due (docs/DESIGN.md §4).
+ */
+export const EXIT_STATE_ABNORMAL = 'Failed'
+
 export function dispatchKey(issue: Issue): [number, number, string] {
   const prio = issue.priority ?? 9999
   const created = issue.createdAt?.getTime() ?? 0
@@ -270,10 +285,10 @@ export class SymphonyOrchestrator {
           workspace: ws ? { path: ws.path, key: ws.workspaceKey } : null,
         }) + (ws ? `\n\n## Workspace\n\nYour workspace is at \`${ws.path}\`. All work must be done inside this directory.` : '')
         const result = await this.agentRunner.run(issue, prompt)
-        this.onWorkerExit(issue.id, result.success)
+        await this.onWorkerExit(issue.id, result.success)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')
-        this.onWorkerExit(issue.id, false)
+        await this.onWorkerExit(issue.id, false)
       }
     })()
     this.state.running.set(issue.id, {
@@ -289,7 +304,7 @@ export class SymphonyOrchestrator {
     getLogger().info({ issueId: issue.id, identifier: issue.identifier, state: issue.state }, 'dispatched')
   }
 
-  private onWorkerExit(issueId: string, normal: boolean): void {
+  private async onWorkerExit(issueId: string, normal: boolean): Promise<void> {
     const entry = this.state.running.get(issueId)
     if (!entry) return
     this.state.running.delete(issueId)
@@ -298,9 +313,26 @@ export class SymphonyOrchestrator {
     this.state.agentTotals.totalTokens += entry.totalTokens
     this.state.agentTotals.inputTokens += entry.inputTokens
     this.state.agentTotals.outputTokens += entry.outputTokens
+
+    // Record the outcome on the tracker, not just in memory. `completed` and
+    // `retryAttempts` die with the process; the item on disk is what survives.
+    // Without this the run terminates but the item never leaves in-progress/,
+    // so the next start re-dispatches work that already ran (SPEC §7.2).
+    const targetState = normal ? EXIT_STATE_NORMAL : EXIT_STATE_ABNORMAL
+    let recorded = false
+    try {
+      await this.tracker.updateIssueState(issueId, targetState)
+      recorded = true
+      getLogger().info({ issueId, identifier: entry.identifier, state: targetState }, 'state_transitioned_on_exit')
+    } catch (stateErr) {
+      getLogger().warn({ issueId, identifier: entry.identifier, state: targetState, error: String(stateErr) }, 'exit_state_transition_failed')
+    }
+
     if (normal) {
       this.state.completed.add(issueId)
-    } else {
+    } else if (!recorded) {
+      // Tracker rejected the transition, so nothing durable owns the retry.
+      // Fall back to the in-memory schedule so the item is not simply dropped.
       const nextAttempt = entry.retryAttempt + 1
       this.state.retryAttempts.set(issueId, { issueId, identifier: entry.identifier, attempt: nextAttempt, dueAtMs: Date.now() + backoffDelay(nextAttempt, this.maxRetryBackoffMs), error: 'worker_exit_abnormal' })
       this.state.claimed.add(issueId)

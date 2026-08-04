@@ -167,9 +167,12 @@ describe('orchestrator tick against MemoryTracker', () => {
     tracker.addIssue(makeIssue({ id: 'q-2', identifier: 'SYM-002', title: 'Not yet', state: 'In Review' }))
 
     const seen: Array<{ issueId: string; prompt: string }> = []
+    const stateDuringRun: string[] = []
     const agentRunner = {
       run: vi.fn(async (issue: Issue, prompt: string) => {
         seen.push({ issueId: issue.id, prompt })
+        const [live] = await tracker.fetchIssueStatesByIds([issue.id])
+        stateDuringRun.push(live!.state)
         return { sessionId: 'sess-1', success: true, turnsCompleted: 1 }
       }),
     }
@@ -187,17 +190,24 @@ describe('orchestrator tick against MemoryTracker', () => {
     expect(seen[0]!.issueId).toBe('q-1')
     expect(seen[0]!.prompt).toBe('Work on SYM-001: Do the thing.')
 
-    // Todo -> In Progress is written back through the tracker before the run starts.
-    const [refreshed] = await tracker.fetchIssueStatesByIds(['q-1'])
-    expect(refreshed!.state).toBe('In Progress')
+    // Todo -> In Progress is written back through the tracker before the run
+    // starts, so it has to be observed from inside the run — by the time the
+    // worker exits the item has already moved on again.
+    expect(stateDuringRun).toEqual(['In Progress'])
 
     // A clean exit clears the claim and marks the issue completed.
     expect(orch.state.running.has('q-1')).toBe(false)
     expect(orch.state.claimed.has('q-1')).toBe(false)
     expect(orch.state.completed.has('q-1')).toBe(true)
+
+    // ...and — the part that has to survive a restart — the item is moved out
+    // of In Progress on the tracker. Leaving it there means the next start
+    // re-dispatches work that already ran.
+    const [afterExit] = await tracker.fetchIssueStatesByIds(['q-1'])
+    expect(afterExit!.state).toBe('In Review')
   })
 
-  it('schedules a backoff retry when the agent runner fails', async () => {
+  it('records Failed on the tracker when the agent runner fails', async () => {
     const tracker = new MemoryTracker(['Todo', 'In Progress'])
     tracker.addIssue(makeIssue({ id: 'q-3', identifier: 'SYM-003', state: 'Todo' }))
 
@@ -208,10 +218,34 @@ describe('orchestrator tick against MemoryTracker', () => {
     await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
 
     expect(orch.state.completed.has('q-3')).toBe(false)
-    expect(orch.state.claimed.has('q-3')).toBe(true)
-    const retry = orch.state.retryAttempts.get('q-3')
+    const [afterExit] = await tracker.fetchIssueStatesByIds(['q-3'])
+    expect(afterExit!.state).toBe('Failed')
+
+    // The durable record owns the retry now, so there must be no second,
+    // in-memory schedule racing it with its own attempt counter.
+    expect(orch.state.retryAttempts.has('q-3')).toBe(false)
+    expect(orch.state.claimed.has('q-3')).toBe(false)
+  })
+
+  it('falls back to an in-memory retry when the tracker rejects the Failed transition', async () => {
+    const tracker = new MemoryTracker(['Todo', 'In Progress'])
+    tracker.addIssue(makeIssue({ id: 'q-4', identifier: 'SYM-004', state: 'Todo' }))
+    const realUpdate = tracker.updateIssueState.bind(tracker)
+    vi.spyOn(tracker, 'updateIssueState').mockImplementation(async (id, state) => {
+      if (state === 'Failed') throw new Error('queue root went read-only')
+      return realUpdate(id, state)
+    })
+
+    const agentRunner = { run: vi.fn(async () => ({ sessionId: null, success: false, turnsCompleted: 0 })) }
+    const orch = new SymphonyOrchestrator({ tracker, agentRunner: agentRunner as any, promptTemplate: '' })
+
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    const retry = orch.state.retryAttempts.get('q-4')
     expect(retry?.attempt).toBe(1)
     expect(retry?.dueAtMs).toBeGreaterThan(Date.now())
+    expect(orch.state.claimed.has('q-4')).toBe(true)
   })
 
   it('survives a tracker whose candidate fetch throws', async () => {
