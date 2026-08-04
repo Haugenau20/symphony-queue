@@ -139,6 +139,83 @@ structurally re-declared it locally with a comment about "subpath export issues"
 unnecessary at this version, so the real type is imported and the local copy is gone. This is
 the sort of drift a pin is meant to catch.
 
-## 7. Things in the bootstrap brief that turned out to be wrong
+## 7. Other implementation choices worth knowing
 
-See the end of this document — recorded as they were found.
+**Every call does one full scan of all six directories.** `fetchCandidateIssues`,
+`fetchIssuesByStates`, `fetchIssueStatesByIds` and `updateIssueState` each re-read the queue
+from disk rather than caching. That is deliberate: the whole premise is that the filesystem is
+the truth and anything may have moved since the last look — a human dragging a file between
+folders is a supported operation. It also means there is no cache to invalidate after a
+rename. For a personal queue of tens-to-hundreds of small markdown files this is cheap; if it
+ever stops being cheap, the fix is a stat-based cache, not a database.
+
+**`blocked_by` holds ids, and states are resolved at read time.** Front matter stores a list
+of item ids; the tracker resolves each to its current directory-derived state during the scan
+it already performs. A blocker id that is not in the queue resolves to `state: null`, which
+the orchestrator's `shouldDispatch` treats as non-blocking. Invalid blocker ids are dropped at
+parse time — they are metadata and never become paths.
+
+**`Issue.url` is always `null`.** There is no web UI to link to, and a `file://` path would
+only serve to get interpolated into a prompt. The item's `id` is its identifier and its
+workspace key.
+
+**A `Failed` transition is the failure-recording operation.** Rather than widening the
+`TrackerAdapter` interface, `updateIssueState(id, 'Failed')` is what increments `attempts` and
+stamps `next_retry_at`. The early-return on "already in the target directory" is what keeps
+this from double-counting when the same transition is applied twice.
+
+**Ordering under crash.** The rename lands before the bookkeeping rewrite, in both the failure
+path and the retry sweep. A crash in the window leaves an item in `failed/` with stale
+counters (it retries earlier than intended) or in `todo/` with a stale `next_retry_at` (which
+is only ever read in `failed/`, so it is inert). Both are strictly better than risking the
+file itself, which is why the order is this way round. A `failed/` item with a null
+`next_retry_at` is treated as due, so a crash cannot strand an item.
+
+**Strict parsing, on purpose.** A field of the wrong type makes the whole item malformed and
+skipped, rather than being coerced or defaulted. SPEC §11.3 permits normalizing unusable
+nullable fields to `null`; that latitude is used only for `branch`, `jira` and `session_id`,
+where a value failing its shape check is dropped precisely because it is the kind of value
+that must never be trusted. Everything else is strict, because in this design an item the
+orchestrator cannot understand should stop and be looked at, not be silently reinterpreted.
+
+## 8. Things in the bootstrap brief that turned out to be wrong
+
+Three, all minor, none changing the shape of the design.
+
+**1. `path_safety.checkContainment` was already broken in the seed code.** The brief tells you
+to build every queue path through it (§4.6), which is right — but as copied it tested
+`relative.startsWith('..')`, which rejects any path whose *filename* merely begins with two
+dots. `queue-root/..foo` is contained, and the check said it was not. The traversal test in
+the brief's required list (`id: ../../etc/passwd`) passes either way, so the bug would have
+survived the stated acceptance criteria. Fixed to test a path-segment boundary
+(`relative === '..' || relative.startsWith('..' + sep)`), with tests for both directions.
+Note this bug only ever over-rejected, so nothing unsafe was previously admitted.
+
+**2. `attempts` and `next_retry_at` have no orchestrator caller yet.** Design rule 5 says a
+failed run moves the item to `failed/` with incremented attempts. The tracker implements and
+tests that, but nothing calls it in a live run: `SymphonyOrchestrator.onWorkerExit` records
+retries only in its in-memory `retryAttempts` map and never notifies the tracker. Wiring it up
+means one call to `updateIssueState(issueId, 'Failed')` in that method — which is a change to
+ported orchestrator code, and so outside what the bootstrap brief scoped. Left undone
+deliberately rather than done quietly. Until it is wired, a failed run retries from memory and
+the item stays in `in-progress/`.
+
+**3. The brief's file list left two dead config sections behind.** It says to strip
+`TrackerRawSchema`'s Linear fields, but `config.ts` also carried a whole `codex` section
+(`codex app-server`, `approval_policy`, `thread_sandbox`) and a `server` section for the HTTP
+dashboard. Both are meaningless here — the first names the wrong agent, the second configures
+a component the brief explicitly cuts — and the first would have failed the brief's own
+`grep -ri "codex"` acceptance check. Both removed, along with the `$VAR` environment-variable
+resolver, which existed solely to read a Linear API key. There is now no code path by which a
+secret can enter the config at all, which is a property worth keeping.
+
+One thing the brief was right about that is worth restating: writing the tests first was not
+enough on its own. Every test in `tracker_file_queue.test.ts` passed on the implementation's
+first run, which is exactly when a suite deserves suspicion. Deliberately breaking the
+implementation in seven places — id validation, the `state:` guard, the candidate filter, the
+retry deadline, the malformed-file guard, the idempotency short-circuit, and the atomic-write
+temp file — caught six and exposed one genuinely weak test. The idempotency test asserted an
+outcome that `rename(2)` produces anyway when source and target are the same path, so it could
+not tell the short-circuit from its absence. Replacing it with an assertion about `attempts`
+not double-counting is what made that branch real, and it also surfaced that the ENOENT
+re-scan path had no coverage at all.

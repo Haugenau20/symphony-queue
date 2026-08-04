@@ -78,6 +78,41 @@ forked:
 So: the SPEC is a durable reference, the code in both repos is disposable reference, and
 inheriting either git history would buy nothing.
 
+## Configuration
+
+Runtime config is the YAML front matter of a `WORKFLOW.md`; its body is the Liquid prompt
+template. The real one belongs to the consuming project, not here.
+
+```yaml
+---
+tracker:
+  kind: file_queue
+  root: ./queue          # the six state directories live directly under this
+  max_attempts: 5        # attempts beyond this stay in failed/ forever
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Cancelled]
+polling:
+  interval_ms: 30000
+workspace:
+  root: ./workspaces
+agent:
+  max_concurrent_agents: 4
+  max_turns: 20
+opencode:
+  server_url: http://localhost:4096
+---
+
+Work on {{ issue.identifier }}: {{ issue.title }}.
+```
+
+No secret can enter this config: there is no API key, endpoint or credential field anywhere in
+the schema, and the `$VAR` environment-variable resolver the seed project used to read a Linear
+token is gone.
+
+```bash
+node dist/main.js ./WORKFLOW.md --i-understand-that-this-will-be-running-without-the-usual-guardrails
+```
+
 ## Requirements
 
 - Node 22+ and npm. No Bun, no Deno.
