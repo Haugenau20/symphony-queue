@@ -37,7 +37,14 @@ describe('buildServiceConfig', () => {
       promptTemplate: '',
     }
     const cfg = buildServiceConfig(wf)
-    expect(Object.keys(cfg.tracker).sort()).toEqual(['activeStates', 'kind', 'maxAttempts', 'root', 'terminalStates'])
+    // Assert the invariant, not the field list: no key may look like a
+    // credential, and unknown keys must be dropped rather than passed through.
+    // Pinning the exact key set instead would fail on any legitimate addition —
+    // which is what it did when the gitlab tracker's base_url arrived — and a
+    // test that cries wolf on safe changes stops guarding the unsafe ones.
+    for (const key of Object.keys(cfg.tracker)) {
+      expect(key).not.toMatch(/token|secret|password|api_?key|credential/i)
+    }
     expect(JSON.stringify(cfg)).not.toContain('SOME_SECRET')
     expect(JSON.stringify(cfg)).not.toContain('example.invalid')
   })
@@ -138,5 +145,64 @@ describe('queue config', () => {
       config: { tracker: { kind: 'file_queue', max_attempts: 0 } },
       promptTemplate: '',
     })).toThrow()
+  })
+})
+
+describe('gitlab tracker config', () => {
+  const gl = (tracker: Record<string, unknown>) =>
+    buildServiceConfig({ config: { tracker: { kind: 'gitlab', ...tracker } }, promptTemplate: '' })
+
+  const complete = { base_url: 'https://gitlab.example', project_id: 'group/project' }
+
+  it('accepts gitlab as a supported kind', () => {
+    const errs = validateDispatchConfig(gl(complete))
+    expect(errs).not.toContain('unsupported tracker.kind: gitlab')
+  })
+
+  it('requires base_url and project_id', () => {
+    const errs = validateDispatchConfig(gl({}))
+    expect(errs).toContain('tracker.base_url is required for the gitlab tracker')
+    expect(errs).toContain('tracker.project_id is required for the gitlab tracker')
+  })
+
+  it('requires the token in the environment, not the workflow file', () => {
+    const prev = process.env.SYMPHONY_GITLAB_TOKEN
+    try {
+      delete process.env.SYMPHONY_GITLAB_TOKEN
+      expect(validateDispatchConfig(gl(complete)))
+        .toContain('SYMPHONY_GITLAB_TOKEN must be set in the environment for the gitlab tracker')
+
+      process.env.SYMPHONY_GITLAB_TOKEN = 'glpat-x'
+      expect(validateDispatchConfig(gl(complete))).toEqual([])
+    } finally {
+      if (prev === undefined) delete process.env.SYMPHONY_GITLAB_TOKEN
+      else process.env.SYMPHONY_GITLAB_TOKEN = prev
+    }
+  })
+
+  it('has no config field that could carry a secret', () => {
+    // The gitlab tracker config is deliberately token-free (DESIGN §8.3): if a
+    // `token`/`api_key` key ever appears here, a secret can reach a file on
+    // disk and this test is the thing that should stop it.
+    const cfg = gl({ ...complete, token: 'glpat-leaked', api_key: 'also-leaked' })
+    expect(JSON.stringify(cfg)).not.toContain('leaked')
+  })
+
+  it('defaults the label prefix and closed states', () => {
+    const cfg = gl(complete)
+    expect(cfg.tracker.labelPrefix).toBe('symphony')
+    expect(cfg.tracker.closedStates).toEqual(['Done', 'Cancelled'])
+  })
+
+  it('does not require tracker.root', () => {
+    const prev = process.env.SYMPHONY_GITLAB_TOKEN
+    process.env.SYMPHONY_GITLAB_TOKEN = 'glpat-x'
+    try {
+      expect(validateDispatchConfig(gl(complete)))
+        .not.toContain('tracker.root is required for the file_queue tracker')
+    } finally {
+      if (prev === undefined) delete process.env.SYMPHONY_GITLAB_TOKEN
+      else process.env.SYMPHONY_GITLAB_TOKEN = prev
+    }
   })
 })
