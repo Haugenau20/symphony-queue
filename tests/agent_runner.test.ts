@@ -128,6 +128,56 @@ describe('AgentRunner (SDK v2)', () => {
   })
 })
 
+describe('AgentRunner session working directory', () => {
+  it('builds its client rooted at the workspace it was handed', async () => {
+    // The prompt already names the workspace in prose, but prose does not
+    // reach the file-search tools — an unrooted session indexes from the
+    // server's default, which on a fresh OpenCode server is `/`.
+    const asked: Array<string | null> = []
+    const client = mockClient()
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
+      maxTurns: 1,
+      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
+    })
+    await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1')
+    expect(asked).toEqual(['/workspaces/TICKET-1'])
+  })
+
+  it('asks for the default root when there is no workspace', async () => {
+    const asked: Array<string | null> = []
+    const client = mockClient()
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
+      maxTurns: 1,
+      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
+    })
+    await runner.run(makeIssue(), 'do work')
+    expect(asked).toEqual([null])
+  })
+
+  it('builds a fresh client per run, so two items cannot share a root', async () => {
+    const asked: Array<string | null> = []
+    const client = mockClient()
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
+      maxTurns: 1,
+      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
+    })
+    await runner.run(makeIssue({ id: 'a' }), 'work', '/workspaces/A')
+    await runner.run(makeIssue({ id: 'b' }), 'work', '/workspaces/B')
+    expect(asked).toEqual(['/workspaces/A', '/workspaces/B'])
+  })
+
+  it('still accepts a plain client, which roots every session the same way', async () => {
+    const client = mockClient()
+    const runner = new AgentRunner(client, {
+      maxTurns: 1,
+      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
+    })
+    const result = await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1')
+    expect(result.success).toBe(true)
+    expect(client.session.create).toHaveBeenCalled()
+  })
+})
+
 describe('AgentRunner activity reporting', () => {
   // stall_timeout_ms is only a stall detector if something reports activity.
   // Without these signals it compares against the run's start time and becomes

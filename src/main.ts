@@ -84,7 +84,15 @@ async function main(): Promise<void> {
     afterRun: config.hooks.afterRun, beforeRemove: config.hooks.beforeRemove, hookTimeoutMs: config.hooks.timeoutMs,
   })
 
-  const client = createOpencodeClient({ baseUrl: config.opencode.serverUrl })
+  // One client per workspace, not one for all sessions: `directory` is
+  // client-level config in the SDK, and each item has its own workspace. A
+  // shared client roots every session at the server default — `/` on a fresh
+  // OpenCode server — which is not where any of the work is. Clients are thin
+  // wrappers over fetch, so building one per dispatch costs nothing.
+  const clientFor = (directory: string | null) => createOpencodeClient({
+    baseUrl: config.opencode.serverUrl,
+    ...(directory ? { directory } : {}),
+  })
 
   if (config.opencode.serverStartCommand) {
     const child = spawn(config.opencode.serverStartCommand, { stdio: 'inherit', shell: true, cwd: process.cwd(), detached: true })
@@ -105,7 +113,7 @@ async function main(): Promise<void> {
   // dispatches through the runner, so one of the two references has to be
   // late-bound. A closure over `orch` is the smaller lie than a setter.
   let orch: SymphonyOrchestrator | undefined
-  const agentRunner = new AgentRunner(client, {
+  const agentRunner = new AgentRunner(clientFor, {
     maxTurns: config.agent.maxTurns,
     issueStateFetcher: (ids) => tracker.fetchIssueStatesByIds(ids),
     onActivity: (activity) => orch?.recordAgentActivity(activity),

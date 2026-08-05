@@ -341,7 +341,7 @@ export class SymphonyOrchestrator {
         const prompt = renderPrompt(this.promptTemplate ?? '', issue, attempt ?? 0, {
           workspace: ws ? { path: ws.path, key: ws.workspaceKey } : null,
         }) + (ws ? `\n\n## Workspace\n\nYour workspace is at \`${ws.path}\`. All work must be done inside this directory.` : '')
-        const result = await this.agentRunner.run(issue, prompt)
+        const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null)
         await this.onWorkerExit(issue.id, result.success)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')

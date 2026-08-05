@@ -153,6 +153,29 @@ describe('terminal workspace sweep', () => {
   })
 })
 
+describe('dispatch hands the workspace to the runner', () => {
+  it('passes the workspace path so the session is rooted there', async () => {
+    // Without this the agent's session roots at the server default while its
+    // prompt talks about a directory somewhere else entirely.
+    const tracker = new MemoryTracker(['Todo', 'In Progress'])
+    tracker.addIssue(makeIssue({ id: 'q-1', identifier: 'SYM-001', state: 'Todo' }))
+    const agentRunner = { run: vi.fn().mockResolvedValue({ success: true, sessionId: 's', turnsCompleted: 1 }) }
+    const workspaceManager = stubWorkspaceManager()
+    workspaceManager.createForIssue.mockReturnValue({ path: '/workspaces/SYM-001', workspaceKey: 'SYM-001', createdNow: true })
+
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: agentRunner as any,
+      workspaceManager: workspaceManager as any, promptTemplate: 'go',
+    })
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    expect(agentRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
+    )
+  })
+})
+
 describe('stall detection uses reported activity', () => {
   function orchWithRun(stallTimeoutMs: number) {
     const tracker = {

@@ -2,6 +2,20 @@ import type { Issue } from './models.js'
 import { getLogger } from './log.js'
 import type { OpencodeClient, PermissionRule } from '@opencode-ai/sdk/v2'
 
+/**
+ * Builds a client rooted at a given directory, or at the server's default when
+ * given null.
+ *
+ * A factory rather than a client because `directory` is client-level config in
+ * the SDK, and symphony gives every item its own workspace. One shared client
+ * means every session roots wherever the server defaults — `/` for a fresh
+ * OpenCode server — so the agent's file-search tools index the whole container
+ * instead of the twenty files it is supposed to be working on. The prompt
+ * carries an absolute workspace path, which is why this worked at all, but
+ * "works" and "is rooted correctly" are not the same thing.
+ */
+export type OpencodeClientFactory = (directory: string | null) => OpencodeClient
+
 export interface AgentRunResult {
   sessionId: string | null
   success: boolean
@@ -50,19 +64,26 @@ Continuation guidance:
 `
 
 export class AgentRunner {
-  constructor(
-    private client: OpencodeClient,
-    private config: AgentRunnerConfig,
-  ) {}
+  private readonly clientFor: OpencodeClientFactory
 
-  async run(issue: Issue, prompt: string): Promise<AgentRunResult> {
+  constructor(
+    client: OpencodeClient | OpencodeClientFactory,
+    private config: AgentRunnerConfig,
+  ) {
+    this.clientFor = typeof client === 'function' ? client : () => client
+  }
+
+  async run(issue: Issue, prompt: string, workspacePath?: string | null): Promise<AgentRunResult> {
     const log = getLogger()
     let sessionId: string | null = null
     // Closing this closes the event subscription. Without it the SSE
     // connection outlives the run it was watching.
     const pumpStop = new AbortController()
+    // Root the session at the item's workspace. The prompt says the same thing
+    // in prose, but prose does not reach the file-search tools.
+    const client = this.clientFor(workspacePath ?? null)
     try {
-      const created = await this.client.session.create({
+      const created = await client.session.create({
         title: `${issue.identifier}: ${issue.title}`,
         permission: PERMISSIONS,
       })
@@ -70,9 +91,9 @@ export class AgentRunner {
       log.info({ issueId: issue.id, sessionId }, 'session_created')
       this.reportActivity(issue.id, sessionId, 'session_created')
       // Deliberately not awaited: it runs for as long as the session does.
-      void this.pumpSessionEvents(issue.id, sessionId, pumpStop.signal)
+      void this.pumpSessionEvents(client, issue.id, sessionId, pumpStop.signal)
 
-      const result = await this.client.session.prompt({
+      const result = await client.session.prompt({
         sessionID: sessionId,
         parts: [{ type: 'text', text: prompt }],
       })
@@ -89,7 +110,7 @@ export class AgentRunner {
           break
         }
 
-        const contResult = await this.client.session.prompt({
+        const contResult = await client.session.prompt({
           sessionID: sessionId,
           parts: [{ type: 'text', text: CONTINUATION_GUIDANCE(turn, this.config.maxTurns) }],
         })
@@ -132,10 +153,12 @@ export class AgentRunner {
    * fails, `agent_event_stream_unavailable` says so, and the detector degrades
    * to turn boundaries — which is exactly what existed before it.
    */
-  private async pumpSessionEvents(issueId: string, sessionId: string, signal: AbortSignal): Promise<void> {
+  private async pumpSessionEvents(
+    client: OpencodeClient, issueId: string, sessionId: string, signal: AbortSignal,
+  ): Promise<void> {
     if (!this.config.onActivity) return
     try {
-      const { stream } = await this.client.v2.session.events({ sessionID: sessionId }, { signal })
+      const { stream } = await client.v2.session.events({ sessionID: sessionId }, { signal })
       for await (const event of stream) {
         if (signal.aborted) return
         const type = (event as { type?: unknown } | null)?.type
