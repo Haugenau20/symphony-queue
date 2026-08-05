@@ -114,7 +114,6 @@ export class SymphonyOrchestrator {
 
   async run(): Promise<void> {
     getLogger().info('orchestrator_started')
-    await this.startupCleanup()
     await this.tick()
     while (this.running) {
       await new Promise((resolve) => setTimeout(resolve, this.tickInterval * 1000))
@@ -143,6 +142,7 @@ export class SymphonyOrchestrator {
 
   private async tick(): Promise<void> {
     this.state = await this.reconcileRunning()
+    await this.sweepTerminalWorkspaces()
     let issues: Issue[] = []
     try {
       issues = await this.tracker.fetchCandidateIssues()
@@ -251,16 +251,48 @@ export class SymphonyOrchestrator {
       this.state.agentTotals.totalTokens += entry.totalTokens
       this.state.agentTotals.inputTokens += entry.inputTokens
       this.state.agentTotals.outputTokens += entry.outputTokens
+      // The caller decides: a run cancelled because its issue reached a
+      // terminal state is finished with its clone, while one cancelled for a
+      // stall or a state we do not recognise may still be retried into the same
+      // workspace and must keep it.
+      if (cleanupWorkspace) this.removeWorkspace(entry.identifier)
     }
     return this.state
   }
 
-  private async startupCleanup(): Promise<void> {
+  private removeWorkspace(identifier: string): void {
+    try {
+      this.workspaceManager?.removeForIssue(identifier)
+    } catch (err) {
+      getLogger().warn({ identifier, error: String(err) }, 'workspace_removal_failed')
+    }
+  }
+
+  /**
+   * Delete the clones of items that have reached a terminal state.
+   *
+   * Runs every tick, not only at start-up. Terminal is a human decision — a
+   * label moved to `symphony::done`, a file dragged into `done/` — and nothing
+   * notifies us of it, so polling is the only way to hear about it. Sweeping
+   * only at start-up meant a long-lived orchestrator never reclaimed anything:
+   * clones piled up until someone restarted the process.
+   *
+   * Costs one extra issue listing per poll, the same call `fetchCandidateIssues`
+   * already makes. That is the price of not needing a restart to free disk.
+   */
+  private async sweepTerminalWorkspaces(): Promise<void> {
+    if (!this.workspaceManager) return
     try {
       const terminalIssues = await this.tracker.fetchIssuesByStates(this.terminalStates)
-      for (const ti of terminalIssues) this.workspaceManager?.removeForIssue(ti.identifier)
+      for (const ti of terminalIssues) {
+        // Never pull the floor out from under a live run. reconcileTrackerStates
+        // runs first and terminates these, cleaning up as it goes; anything
+        // still in `running` here is mid-flight and its clone is in use.
+        if (this.state.running.has(ti.id)) continue
+        this.removeWorkspace(ti.identifier)
+      }
     } catch (err) {
-      getLogger().warn({ error: String(err) }, 'startup_cleanup_failed')
+      getLogger().warn({ error: String(err) }, 'workspace_sweep_failed')
     }
   }
 
