@@ -7,6 +7,8 @@ import { SymphonyOrchestrator } from './orchestrator.js'
 import { AgentRunner } from './agent_runner.js'
 import { WorkspaceManager } from './workspace.js'
 import { FileQueueTracker } from './tracker/file_queue.js'
+import { GitLabTracker } from './tracker/gitlab.js'
+import type { TrackerAdapter } from './tracker/base.js'
 import { parseCliArgs, guardrailsBanner, usageMessage } from './cli.js'
 
 async function main(): Promise<void> {
@@ -43,26 +45,38 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  log.info({ trackerKind: config.tracker.kind, queueRoot: config.tracker.root }, 'symphony_config_loaded')
+  log.info({ trackerKind: config.tracker.kind }, 'symphony_config_loaded')
 
-  let tracker: FileQueueTracker
+  let tracker: TrackerAdapter
   try {
-    tracker = new FileQueueTracker({
-      root: config.tracker.root!,
-      maxAttempts: config.tracker.maxAttempts,
-      maxRetryBackoffMs: config.agent.maxRetryBackoffMs,
-    })
+    tracker = config.tracker.kind === 'gitlab'
+      ? new GitLabTracker({
+          baseUrl: config.tracker.baseUrl!,
+          projectId: config.tracker.projectId!,
+          // From the environment, never the workflow file — there is no code
+          // path by which a secret enters the config.
+          token: process.env.SYMPHONY_GITLAB_TOKEN!,
+          labelPrefix: config.tracker.labelPrefix,
+          closedStates: config.tracker.closedStates,
+        })
+      : new FileQueueTracker({
+          root: config.tracker.root!,
+          maxAttempts: config.tracker.maxAttempts,
+          maxRetryBackoffMs: config.agent.maxRetryBackoffMs,
+        })
   } catch (err) {
-    log.error({ error: String(err), queueRoot: config.tracker.root }, 'queue_root_unusable')
+    log.error({ error: String(err), trackerKind: config.tracker.kind }, 'tracker_init_failed')
     process.exit(1)
   }
 
-  const recoverable = await tracker.fetchRecoverableIssues()
-  if (recoverable.length > 0) {
-    // SPEC §14.3: no scheduler state survives a restart, but whatever is still
-    // sitting in in-progress/ is exactly the set that was live. v1 simply lets
-    // the ordinary candidate path re-dispatch them.
-    log.info({ count: recoverable.length, ids: recoverable.map((i) => i.id) }, 'queue_recovery_set')
+  if (tracker instanceof FileQueueTracker) {
+    const recoverable = await tracker.fetchRecoverableIssues()
+    if (recoverable.length > 0) {
+      // SPEC §14.3: no scheduler state survives a restart, but whatever is still
+      // sitting in in-progress/ is exactly the set that was live. v1 simply lets
+      // the ordinary candidate path re-dispatch them.
+      log.info({ count: recoverable.length, ids: recoverable.map((i) => i.id) }, 'queue_recovery_set')
+    }
   }
 
   const wsManager = new WorkspaceManager({

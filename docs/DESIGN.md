@@ -261,3 +261,86 @@ the sake of a transition the orchestrator already has every fact needed to make 
 whole premise is that the agent is the untrusted writer here. The orchestrator moving the file
 is both the smaller change and the one that keeps the agent's only queue surface being the
 workpad inside its own item.
+
+## 10. GitLab Issues as a second tracker
+
+`GitLabTracker` sits beside `FileQueueTracker` behind the same four-method
+`TrackerAdapter`. `tracker.kind` picks one. Neither is going away: the file
+queue needs no network, no token and no server, which is what makes it the
+offline test path and the zero-risk first run, and it is what most of this
+suite exercises. GitLab is for real work.
+
+### State is labels, and we always send the whole set
+
+A GitLab issue has only `opened` and `closed`, so workflow state lives in a
+`symphony::<state>` label. The obvious implementation — add the new label,
+remove the old — is two requests, and a crash between them leaves an issue
+wearing two states.
+
+So every transition sends the **full label set** on one `PUT`: existing labels
+minus every `symphony::*`, plus the target. One request, no intermediate state,
+and a human's `bug` or `priority::2` survives untouched.
+
+The useful consequence is that **this does not depend on scoped labels**, which
+are a Premium feature. Mutual exclusion is enforced by us computing the set, not
+by GitLab enforcing the `::` convention. On Premium the labels additionally
+render as key/value and are exclusive in the UI, which is nice and changes
+nothing here. The adapter behaves identically on Free.
+
+An issue carrying no `symphony::` label is not ours and is skipped, never
+adopted. An issue carrying *two* is also skipped, with a warning — only a hand
+edit or another tool can produce that, and refusing to guess is the same call
+the file queue makes about a malformed file.
+
+### There is no atomic claim, and that is the real cost
+
+The file queue gets a lock for free: `rename(2)` either moves the file or fails
+with `ENOENT`, so two orchestrators racing to claim an item cannot both win
+(§2). The Issues API has no compare-and-swap — no "set this label only if it is
+currently todo" — so that guarantee does not survive the move to GitLab.
+
+With a single orchestrator process the in-memory `claimed` set is the lock and
+double-dispatch cannot happen. With two orchestrators polling one project, it
+can. This is a genuine capability the file queue has and this adapter does not,
+and it is recorded here rather than papered over with a read-after-write check
+that would detect the race without preventing it.
+
+### What GitLab is better at
+
+- **`Issue.url` is real.** In the file queue it is deliberately `null` (§7).
+  Here it is the web URL, which means the human gate is a page you can open from
+  a phone rather than an `ls` on one particular machine.
+- **MRs link themselves.** An MR that says `Closes #42` shows up on the issue,
+  so `review/` has a review surface without symphony doing anything.
+- **Blockers are first-class** — where the tier allows. `blocks` /
+  `is_blocked_by` links are Premium; on Free the links endpoint only ever
+  returns `relates_to`, which is not a blocker, so `blockedBy` comes back empty
+  and dispatch proceeds. Degrading to "no blockers" is the right shape either
+  way, and links are fetched only for `Todo` issues because `shouldDispatch`
+  consults them nowhere else.
+
+### Secrets still cannot enter the config
+
+`config.ts` gained `base_url`, `project_id`, `label_prefix` and `closed_states`
+— and deliberately **no** token field. `SYMPHONY_GITLAB_TOKEN` is read from the
+environment in `main.ts`, so the property §8.3 established holds: there is no
+code path by which a credential reaches a file on disk. `validateDispatchConfig`
+checks the variable is present so a missing token is reported by the ordinary
+preflight instead of failing on the first poll.
+
+Errors never include the response body. A GitLab error page can echo the request
+that produced it, and the token travels in a `PRIVATE-TOKEN` header.
+
+### Deployment consequence, for the harness side
+
+This is the one thing that gets worse. Symphony currently runs with no
+credentials and no egress at all. Polling GitLab means it needs a project token
+and a route to the API, so that property goes away.
+
+The mitigation is better than what it replaces: give symphony a **project**
+access token with the **Reporter** role, which can read and write issues on one
+project and cannot push code at all, and give the agent a separate Developer
+token for the repository. Neither can do the other's job, so a compromised
+orchestrator can vandalize issue text and nothing else. Note the role does the
+constraining — `api` is full API access for that project, and there is no
+issues-only scope.

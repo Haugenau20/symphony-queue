@@ -13,11 +13,23 @@ function expandPath(value: string, workflowDir?: string): string {
 
 const TrackerRawSchema = z.object({
   kind: z.string().default(''),
-  /** Queue root. The six state directories live directly under it. */
+  /** file_queue: queue root. The six state directories live directly under it. */
   root: z.string().optional(),
   max_attempts: z.number().int().positive().default(5),
   active_states: z.array(z.string()).default(['Todo', 'In Progress']),
   terminal_states: z.array(z.string()).default(['Done', 'Cancelled']),
+
+  /**
+   * gitlab: instance base URL (no trailing slash, no /api/v4) and the project
+   * to work. There is deliberately no token field — the token is read from the
+   * environment, so no code path can pull a secret out of the workflow file.
+   */
+  base_url: z.string().optional(),
+  project_id: z.string().optional(),
+  /** Label namespace: `symphony` gives `symphony::todo`, `symphony::review`, … */
+  label_prefix: z.string().default('symphony'),
+  /** States that also close the GitLab issue. Moving off one reopens it. */
+  closed_states: z.array(z.string()).default(['Done', 'Cancelled']),
 })
 
 const PollingRawSchema = z.object({
@@ -56,6 +68,10 @@ export interface TrackerConfig {
   maxAttempts: number
   activeStates: string[]
   terminalStates: string[]
+  baseUrl: string | null
+  projectId: string | null
+  labelPrefix: string
+  closedStates: string[]
 }
 
 export interface PollingConfig {
@@ -125,6 +141,10 @@ export function buildServiceConfig(wf: WorkflowDefinition, workflowDir?: string)
       maxAttempts: trackerRaw.max_attempts,
       activeStates: [...trackerRaw.active_states],
       terminalStates: [...trackerRaw.terminal_states],
+      baseUrl: trackerRaw.base_url ?? null,
+      projectId: trackerRaw.project_id ?? null,
+      labelPrefix: trackerRaw.label_prefix,
+      closedStates: [...trackerRaw.closed_states],
     },
     polling: { intervalMs: pollRaw.interval_ms },
     workspace: { root: wsRoot },
@@ -155,7 +175,7 @@ export function parseAndValidateConfig(wf: WorkflowDefinition, workflowDir?: str
   return { config, errors: validateDispatchConfig(config) }
 }
 
-export const SUPPORTED_TRACKER_KINDS = ['file_queue'] as const
+export const SUPPORTED_TRACKER_KINDS = ['file_queue', 'gitlab'] as const
 
 type SupportedTrackerKind = (typeof SUPPORTED_TRACKER_KINDS)[number]
 
@@ -171,6 +191,15 @@ export function validateDispatchConfig(cfg: ServiceConfig): string[] {
   }
   if (cfg.tracker.kind === 'file_queue' && !cfg.tracker.root) {
     errors.push('tracker.root is required for the file_queue tracker')
+  }
+  if (cfg.tracker.kind === 'gitlab') {
+    if (!cfg.tracker.baseUrl) errors.push('tracker.base_url is required for the gitlab tracker')
+    if (!cfg.tracker.projectId) errors.push('tracker.project_id is required for the gitlab tracker')
+    // Checked here rather than at construction so a missing token surfaces in
+    // the same preflight as every other config error, before any dispatch.
+    if (!process.env.SYMPHONY_GITLAB_TOKEN) {
+      errors.push('SYMPHONY_GITLAB_TOKEN must be set in the environment for the gitlab tracker')
+    }
   }
   return errors
 }
