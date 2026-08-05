@@ -37,3 +37,23 @@ export function renderPrompt(
 
   return engine.parseAndRenderSync(template, ctx)
 }
+
+/**
+ * The nudge sent at the start of every turn after the first.
+ *
+ * Separate from the task prompt because it is sent repeatedly and must stay
+ * short, and configurable from the workflow because it is the one place to say
+ * what "finished" means for a given tracker. The built-in default cannot say
+ * that — "open a merge request" is right for GitLab and meaningless for the
+ * file queue — so it says the tracker-neutral part and leaves the rest to
+ * `agent.continuation_guidance`.
+ */
+export function renderContinuation(
+  template: string, turn: number, maxTurns: number,
+): string {
+  return engine.parseAndRenderSync(template, {
+    turn,
+    max_turns: maxTurns,
+    turns_remaining: Math.max(maxTurns - turn, 0),
+  })
+}

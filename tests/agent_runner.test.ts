@@ -356,6 +356,62 @@ describe('AgentRunner continuation turns', () => {
     expect(client.session.prompt).toHaveBeenCalledTimes(2)
   })
 
+  it('tells the agent how much runway is left', async () => {
+    // Running out of turns mid-task is the normal failure of a smaller model:
+    // it keeps refining while the finishing step goes undone, and the run then
+    // exits "cleanly" with nothing to show for it.
+    const client = mockClient()
+    const runner = new AgentRunner(client, {
+      maxTurns: 3,
+      issueStateFetcher: async () => [makeIssue()],
+    })
+    await runner.run(makeIssue(), 'do work')
+    const last = client.session.prompt.mock.calls[2][0].parts[0].text
+    expect(last).toContain('turn 3 of 3')
+    expect(last).toContain('0 turn(s) remain')
+    expect(last).toMatch(/finishing step/)
+  })
+
+  it('does not describe the workpad as a section of a queue item', async () => {
+    // That is the FILE QUEUE's storage described as though it were universal.
+    // Under the gitlab tracker there is no item file and the workpad is an
+    // issue comment, so the instruction pointed at nothing.
+    const client = mockClient()
+    const runner = new AgentRunner(client, {
+      maxTurns: 2,
+      issueStateFetcher: async () => [makeIssue()],
+    })
+    await runner.run(makeIssue(), 'do work')
+    const cont = client.session.prompt.mock.calls[1][0].parts[0].text
+    expect(cont).not.toContain('queue item')
+    expect(cont).toContain('workpad')
+  })
+
+  it('lets the workflow replace the guidance to name its own finishing step', async () => {
+    const client = mockClient()
+    const runner = new AgentRunner(client, {
+      maxTurns: 2,
+      issueStateFetcher: async () => [makeIssue()],
+      continuationGuidance: 'Turn {{ turn }}/{{ max_turns }}. Open the merge request before you stop.',
+    })
+    await runner.run(makeIssue(), 'do work')
+    const cont = client.session.prompt.mock.calls[1][0].parts[0].text
+    expect(cont).toBe('Turn 2/2. Open the merge request before you stop.')
+  })
+
+  it('falls back to the default when the workflow template is broken', async () => {
+    // A bad template in WORKFLOW.md must not strand a run already under way.
+    const client = mockClient()
+    const runner = new AgentRunner(client, {
+      maxTurns: 2,
+      issueStateFetcher: async () => [makeIssue()],
+      continuationGuidance: 'broken {{ unclosed',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.success).toBe(true)
+    expect(client.session.prompt.mock.calls[1][0].parts[0].text).toContain('Continuation guidance')
+  })
+
   it('uses continuation guidance for subsequent turns', async () => {
     const client = mockClient()
     const runner = new AgentRunner(client, {

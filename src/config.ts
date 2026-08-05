@@ -53,6 +53,14 @@ const AgentRawSchema = z.object({
   max_turns: z.number().int().positive().default(20),
   max_retry_backoff_ms: z.number().int().positive().default(300000),
   max_concurrent_agents_by_state: z.record(z.number().positive()).default({}),
+  /**
+   * Replaces the built-in nudge sent at the start of every turn after the
+   * first. Liquid, with `turn`, `max_turns` and `turns_remaining` in scope.
+   * The built-in cannot name the finishing step — "open a merge request" is
+   * right for GitLab and meaningless for the file queue — so a workflow that
+   * cares says it here.
+   */
+  continuation_guidance: z.string().nullable().default(null),
 })
 
 const OpenCodeRawSchema = z.object({
@@ -95,6 +103,7 @@ export interface AgentConfig {
   maxTurns: number
   maxRetryBackoffMs: number
   maxConcurrentAgentsByState: Record<string, number>
+  continuationGuidance: string | null
 }
 
 export interface OpenCodeConfig {
@@ -160,6 +169,7 @@ export function buildServiceConfig(wf: WorkflowDefinition, workflowDir?: string)
       maxTurns: aRaw.max_turns,
       maxRetryBackoffMs: aRaw.max_retry_backoff_ms,
       maxConcurrentAgentsByState: perState,
+      continuationGuidance: aRaw.continuation_guidance ?? null,
     },
     opencode: {
       serverUrl: oRaw.server_url,

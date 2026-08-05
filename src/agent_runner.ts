@@ -1,5 +1,6 @@
 import type { Issue } from './models.js'
 import { getLogger } from './log.js'
+import { renderContinuation } from './prompt_builder.js'
 import type { OpencodeClient, PermissionRule } from '@opencode-ai/sdk/v2'
 
 /**
@@ -42,6 +43,13 @@ export interface AgentRunnerConfig {
    * run timeout wearing a stall detector's name.
    */
   onActivity?: (activity: AgentActivity) => void
+  /**
+   * Overrides DEFAULT_CONTINUATION_GUIDANCE. Liquid, with `turn`, `max_turns`
+   * and `turns_remaining` in scope. This is where a workflow says what
+   * "finished" means for its tracker — the default cannot, since "open a merge
+   * request" is right for GitLab and meaningless for the file queue.
+   */
+  continuationGuidance?: string | null
 }
 
 const PERMISSIONS: PermissionRule[] = [
@@ -52,14 +60,29 @@ const PERMISSIONS: PermissionRule[] = [
   { permission: 'external_directory', pattern: '*', action: 'allow' },
 ]
 
-const CONTINUATION_GUIDANCE = (turn: number, maxTurns: number) => `
+/**
+ * Sent at the start of every turn after the first, unless the workflow supplies
+ * its own via `agent.continuation_guidance`.
+ *
+ * Deliberately tracker-neutral. It used to say "keep the Workpad section of the
+ * queue item up to date", which is the file queue's storage described as though
+ * it were universal — under the gitlab tracker there is no item file and the
+ * workpad is an issue comment, so the instruction pointed at nothing.
+ *
+ * `turns_remaining` is here because running out of turns mid-task is the normal
+ * failure of a smaller model: it keeps refining while the finishing step goes
+ * undone, and the run then exits "cleanly" with nothing to show. Telling it how
+ * much runway is left is the cheapest available correction.
+ */
+export const DEFAULT_CONTINUATION_GUIDANCE = `
 Continuation guidance:
 
-- The previous turn completed normally, but the queue item is still in an active state, so the work is not finished.
-- This is continuation turn ${turn} of ${maxTurns} for the current agent run.
+- The previous turn completed normally, but the work item is still in an active state, so the work is not finished.
+- This is continuation turn {{ turn }} of {{ max_turns }}; {{ turns_remaining }} turn(s) remain after this one.
 - Resume from the current workspace state instead of restarting from scratch.
 - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-- Keep the Workpad section of the queue item up to date with your running plan, so the work is resumable if this run is interrupted.
+- Keep your workpad up to date, in the form the task instructions specified, so the work is resumable if this run is interrupted.
+- If the finishing step named in the task instructions is still undone and the turns are running out, do it now rather than continuing to refine.
 - Focus on the remaining work and do not end the turn while the item stays active unless you are truly blocked.
 `
 
@@ -112,7 +135,7 @@ export class AgentRunner {
 
         const contResult = await client.session.prompt({
           sessionID: sessionId,
-          parts: [{ type: 'text', text: CONTINUATION_GUIDANCE(turn, this.config.maxTurns) }],
+          parts: [{ type: 'text', text: this.continuationText(turn) }],
         })
         if (contResult.error) {
           log.warn({ issueId: issue.id, sessionId, turn }, 'continuation_turn_failed')
@@ -153,6 +176,18 @@ export class AgentRunner {
    * fails, `agent_event_stream_unavailable` says so, and the detector degrades
    * to turn boundaries — which is exactly what existed before it.
    */
+  private continuationText(turn: number): string {
+    const template = this.config.continuationGuidance || DEFAULT_CONTINUATION_GUIDANCE
+    try {
+      return renderContinuation(template, turn, this.config.maxTurns)
+    } catch (err) {
+      // A broken template in WORKFLOW.md must not strand a run that is already
+      // under way: fall back rather than failing the turn.
+      getLogger().warn({ error: String(err) }, 'continuation_guidance_render_failed')
+      return renderContinuation(DEFAULT_CONTINUATION_GUIDANCE, turn, this.config.maxTurns)
+    }
+  }
+
   private async pumpSessionEvents(
     client: OpencodeClient, issueId: string, sessionId: string, signal: AbortSignal,
   ): Promise<void> {
