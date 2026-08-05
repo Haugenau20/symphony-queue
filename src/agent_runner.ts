@@ -9,9 +9,25 @@ export interface AgentRunResult {
   turnsCompleted: number
 }
 
+/** One observed sign of life from a running agent. */
+export interface AgentActivity {
+  issueId: string
+  sessionId: string
+  /** The SDK event type, or a synthetic name for the milestones we raise. */
+  event: string | null
+  at: Date
+}
+
 export interface AgentRunnerConfig {
   maxTurns: number
   issueStateFetcher: (issueIds: string[]) => Promise<Issue[]>
+  /**
+   * Called whenever the agent shows a sign of life. This is the input the
+   * stall detector was missing: without it `stall_timeout_ms` can only be
+   * compared against the moment the run STARTED, which makes it a wall-clock
+   * run timeout wearing a stall detector's name.
+   */
+  onActivity?: (activity: AgentActivity) => void
 }
 
 const PERMISSIONS: PermissionRule[] = [
@@ -42,6 +58,9 @@ export class AgentRunner {
   async run(issue: Issue, prompt: string): Promise<AgentRunResult> {
     const log = getLogger()
     let sessionId: string | null = null
+    // Closing this closes the event subscription. Without it the SSE
+    // connection outlives the run it was watching.
+    const pumpStop = new AbortController()
     try {
       const created = await this.client.session.create({
         title: `${issue.identifier}: ${issue.title}`,
@@ -49,6 +68,9 @@ export class AgentRunner {
       })
       sessionId = created.data!.id
       log.info({ issueId: issue.id, sessionId }, 'session_created')
+      this.reportActivity(issue.id, sessionId, 'session_created')
+      // Deliberately not awaited: it runs for as long as the session does.
+      void this.pumpSessionEvents(issue.id, sessionId, pumpStop.signal)
 
       const result = await this.client.session.prompt({
         sessionID: sessionId,
@@ -59,6 +81,7 @@ export class AgentRunner {
       }
 
       let turnsCompleted = 1
+      this.reportActivity(issue.id, sessionId, 'turn_completed')
       for (let turn = 2; turn <= this.config.maxTurns; turn++) {
         const refreshedIssue = await this.refreshIssueState(issue.id)
         if (!refreshedIssue || !this.isActiveState(refreshedIssue.state)) {
@@ -76,6 +99,7 @@ export class AgentRunner {
         }
 
         turnsCompleted = turn
+        this.reportActivity(issue.id, sessionId, 'turn_completed')
       }
 
       log.info({ issueId: issue.id, turnsCompleted }, 'agent_run_completed')
@@ -84,6 +108,54 @@ export class AgentRunner {
       const message = err instanceof Error ? err.message : String(err)
       log.error({ issueId: issue.id, error: message }, 'agent_run_failed')
       return { sessionId: null, success: false, error: message, turnsCompleted: 0 }
+    } finally {
+      pumpStop.abort()
+    }
+  }
+
+  /**
+   * Follow the session's event stream and report every event as activity.
+   *
+   * A turn boundary is already a liveness signal, but turns are exactly the
+   * thing that runs long: an agent cloning a repository and building it can
+   * spend half an hour inside one. The event stream is what distinguishes
+   * "working" from "wedged" at any finer grain than that.
+   *
+   * Per-session rather than the global `/event` stream on purpose: a global
+   * subscription would have to be filtered by session id, and a filter that is
+   * wrong in the permissive direction stamps one run's activity onto another
+   * and reports a genuinely wedged agent as healthy. Subscribing by id cannot
+   * make that mistake.
+   *
+   * Sessions are created through the v1-shaped `session.create` and watched
+   * through the v2 `session.events`. If those id spaces ever diverge, this call
+   * fails, `agent_event_stream_unavailable` says so, and the detector degrades
+   * to turn boundaries — which is exactly what existed before it.
+   */
+  private async pumpSessionEvents(issueId: string, sessionId: string, signal: AbortSignal): Promise<void> {
+    if (!this.config.onActivity) return
+    try {
+      const { stream } = await this.client.v2.session.events({ sessionID: sessionId }, { signal })
+      for await (const event of stream) {
+        if (signal.aborted) return
+        const type = (event as { type?: unknown } | null)?.type
+        this.reportActivity(issueId, sessionId, typeof type === 'string' ? type : null)
+      }
+    } catch (err) {
+      // Losing the stream must not fail the run. It degrades to the turn
+      // boundaries above — which is the whole of what existed before — so the
+      // worst case is the coarser signal, not a dead agent.
+      if (!signal.aborted) {
+        getLogger().warn({ issueId, sessionId, error: String(err) }, 'agent_event_stream_unavailable')
+      }
+    }
+  }
+
+  private reportActivity(issueId: string, sessionId: string, event: string | null): void {
+    try {
+      this.config.onActivity?.({ issueId, sessionId, event, at: new Date() })
+    } catch (err) {
+      getLogger().warn({ issueId, error: String(err) }, 'activity_callback_failed')
     }
   }
 

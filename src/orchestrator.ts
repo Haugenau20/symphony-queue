@@ -2,7 +2,7 @@ import { getLogger } from './log.js'
 import type { OrchestratorState, Issue } from './models.js'
 import { createOrchestratorState } from './models.js'
 import type { TrackerAdapter } from './tracker/base.js'
-import type { AgentRunner } from './agent_runner.js'
+import type { AgentRunner, AgentActivity } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
 
@@ -221,6 +221,24 @@ export class SymphonyOrchestrator {
     return this.state
   }
 
+  /**
+   * Stamp a running entry with the moment its agent last showed a sign of life.
+   *
+   * This is the input `reconcileStalledRuns` was always missing.
+   * `lastAgentTimestamp` was set to null at dispatch and nothing ever wrote to
+   * it, so the `?? entry.startedAt` fallback below always applied and
+   * `stall_timeout_ms` measured how long a run had been ALIVE rather than how
+   * long it had been SILENT — killing any run that outlived the timeout however
+   * much progress it was making.
+   */
+  recordAgentActivity(activity: AgentActivity): void {
+    const entry = this.state.running.get(activity.issueId)
+    if (!entry) return
+    entry.lastAgentTimestamp = activity.at
+    entry.lastAgentEvent = activity.event
+    entry.sessionId = activity.sessionId
+  }
+
   private reconcileStalledRuns(): OrchestratorState {
     if (this.stallTimeoutMs <= 0) return this.state
     const now = new Date()
@@ -228,8 +246,15 @@ export class SymphonyOrchestrator {
     for (const [issueId, entry] of this.state.running) {
       const reference = entry.lastAgentTimestamp ?? entry.startedAt
       if (!reference) continue
-      if (now.getTime() - reference.getTime() > this.stallTimeoutMs) {
-        getLogger().warn({ issueId, identifier: entry.identifier }, 'stall_detected')
+      const idleMs = now.getTime() - reference.getTime()
+      if (idleMs > this.stallTimeoutMs) {
+        getLogger().warn({
+          issueId, identifier: entry.identifier, idleMs, lastEvent: entry.lastAgentEvent,
+          // Separates "the agent went quiet" from "we never saw it at all",
+          // which normally means the event stream never connected and the
+          // timeout has silently gone back to being a run timeout.
+          sawActivity: entry.lastAgentTimestamp !== null,
+        }, 'stall_detected')
         if (entry.cancel) entry.cancel()
         toRemove.push(issueId)
       }

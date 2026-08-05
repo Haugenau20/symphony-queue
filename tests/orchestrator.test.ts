@@ -153,6 +153,70 @@ describe('terminal workspace sweep', () => {
   })
 })
 
+describe('stall detection uses reported activity', () => {
+  function orchWithRun(stallTimeoutMs: number) {
+    const tracker = {
+      fetchCandidateIssues: vi.fn().mockResolvedValue([]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue([]),
+      fetchIssueStatesByIds: vi.fn().mockResolvedValue([]),
+    }
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: { run: vi.fn() } as any, stallTimeoutMs,
+    })
+    orch.state.running.set('run-1', runningEntry('run-1', 'TICKET-1'))
+    orch.state.claimed.add('run-1')
+    return orch
+  }
+
+  it('spares a long run that is still reporting activity', async () => {
+    // The defect this exists for: lastAgentTimestamp was never written, so the
+    // reference was always startedAt and ANY run outliving stall_timeout_ms was
+    // killed — however much progress it was making. Five minutes by default,
+    // against a task that clones a repository.
+    const orch = orchWithRun(1000)
+    const entry = orch.state.running.get('run-1')!
+    entry.startedAt = new Date(Date.now() - 600000)
+    orch.recordAgentActivity({ issueId: 'run-1', sessionId: 's1', event: 'tool.executed', at: new Date() })
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(true)
+  })
+
+  it('still kills a run that has gone silent for longer than the timeout', async () => {
+    const orch = orchWithRun(1000)
+    const entry = orch.state.running.get('run-1')!
+    entry.startedAt = new Date(Date.now() - 600000)
+    orch.recordAgentActivity({
+      issueId: 'run-1', sessionId: 's1', event: 'tool.executed',
+      at: new Date(Date.now() - 300000),
+    })
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(false)
+  })
+
+  it('falls back to the start time when no activity was ever reported', async () => {
+    // The event stream may be unavailable. A coarse timeout beats none.
+    const orch = orchWithRun(1000)
+    orch.state.running.get('run-1')!.startedAt = new Date(Date.now() - 600000)
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(false)
+  })
+
+  it('records the session id so logs can be tied to a session', async () => {
+    const orch = orchWithRun(1000)
+    orch.recordAgentActivity({ issueId: 'run-1', sessionId: 'sess-42', event: 'session_created', at: new Date() })
+    const entry = orch.state.running.get('run-1')!
+    expect(entry.sessionId).toBe('sess-42')
+    expect(entry.lastAgentEvent).toBe('session_created')
+  })
+
+  it('ignores activity for an issue that is no longer running', () => {
+    const orch = orchWithRun(1000)
+    expect(() => orch.recordAgentActivity({
+      issueId: 'gone', sessionId: 's1', event: null, at: new Date(),
+    })).not.toThrow()
+  })
+})
+
 describe('terminateRunningIssue honours its cleanup flag', () => {
   function orchWith(currentState: string) {
     const tracker = {

@@ -101,11 +101,16 @@ async function main(): Promise<void> {
     log.warn('Proceeding despite health check failure; first session request will confirm connectivity')
   }
 
+  // The runner reports agent activity to the orchestrator and the orchestrator
+  // dispatches through the runner, so one of the two references has to be
+  // late-bound. A closure over `orch` is the smaller lie than a setter.
+  let orch: SymphonyOrchestrator | undefined
   const agentRunner = new AgentRunner(client, {
     maxTurns: config.agent.maxTurns,
     issueStateFetcher: (ids) => tracker.fetchIssueStatesByIds(ids),
+    onActivity: (activity) => orch?.recordAgentActivity(activity),
   })
-  const orch = new SymphonyOrchestrator({
+  orch = new SymphonyOrchestrator({
     tracker, agentRunner, workspaceManager: wsManager,
     promptTemplate: store.workflow?.promptTemplate,
     maxConcurrent: config.agent.maxConcurrentAgents, pollIntervalMs: config.polling.intervalMs,
