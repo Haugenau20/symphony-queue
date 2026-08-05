@@ -2,7 +2,7 @@ import { getLogger } from './log.js'
 import type { OrchestratorState, Issue } from './models.js'
 import { createOrchestratorState } from './models.js'
 import type { TrackerAdapter } from './tracker/base.js'
-import type { AgentRunner } from './agent_runner.js'
+import type { AgentRunner, AgentActivity } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
 
@@ -114,7 +114,6 @@ export class SymphonyOrchestrator {
 
   async run(): Promise<void> {
     getLogger().info('orchestrator_started')
-    await this.startupCleanup()
     await this.tick()
     while (this.running) {
       await new Promise((resolve) => setTimeout(resolve, this.tickInterval * 1000))
@@ -143,6 +142,7 @@ export class SymphonyOrchestrator {
 
   private async tick(): Promise<void> {
     this.state = await this.reconcileRunning()
+    await this.sweepTerminalWorkspaces()
     let issues: Issue[] = []
     try {
       issues = await this.tracker.fetchCandidateIssues()
@@ -221,6 +221,24 @@ export class SymphonyOrchestrator {
     return this.state
   }
 
+  /**
+   * Stamp a running entry with the moment its agent last showed a sign of life.
+   *
+   * This is the input `reconcileStalledRuns` was always missing.
+   * `lastAgentTimestamp` was set to null at dispatch and nothing ever wrote to
+   * it, so the `?? entry.startedAt` fallback below always applied and
+   * `stall_timeout_ms` measured how long a run had been ALIVE rather than how
+   * long it had been SILENT — killing any run that outlived the timeout however
+   * much progress it was making.
+   */
+  recordAgentActivity(activity: AgentActivity): void {
+    const entry = this.state.running.get(activity.issueId)
+    if (!entry) return
+    entry.lastAgentTimestamp = activity.at
+    entry.lastAgentEvent = activity.event
+    entry.sessionId = activity.sessionId
+  }
+
   private reconcileStalledRuns(): OrchestratorState {
     if (this.stallTimeoutMs <= 0) return this.state
     const now = new Date()
@@ -228,8 +246,15 @@ export class SymphonyOrchestrator {
     for (const [issueId, entry] of this.state.running) {
       const reference = entry.lastAgentTimestamp ?? entry.startedAt
       if (!reference) continue
-      if (now.getTime() - reference.getTime() > this.stallTimeoutMs) {
-        getLogger().warn({ issueId, identifier: entry.identifier }, 'stall_detected')
+      const idleMs = now.getTime() - reference.getTime()
+      if (idleMs > this.stallTimeoutMs) {
+        getLogger().warn({
+          issueId, identifier: entry.identifier, idleMs, lastEvent: entry.lastAgentEvent,
+          // Separates "the agent went quiet" from "we never saw it at all",
+          // which normally means the event stream never connected and the
+          // timeout has silently gone back to being a run timeout.
+          sawActivity: entry.lastAgentTimestamp !== null,
+        }, 'stall_detected')
         if (entry.cancel) entry.cancel()
         toRemove.push(issueId)
       }
@@ -251,16 +276,48 @@ export class SymphonyOrchestrator {
       this.state.agentTotals.totalTokens += entry.totalTokens
       this.state.agentTotals.inputTokens += entry.inputTokens
       this.state.agentTotals.outputTokens += entry.outputTokens
+      // The caller decides: a run cancelled because its issue reached a
+      // terminal state is finished with its clone, while one cancelled for a
+      // stall or a state we do not recognise may still be retried into the same
+      // workspace and must keep it.
+      if (cleanupWorkspace) this.removeWorkspace(entry.identifier)
     }
     return this.state
   }
 
-  private async startupCleanup(): Promise<void> {
+  private removeWorkspace(identifier: string): void {
+    try {
+      this.workspaceManager?.removeForIssue(identifier)
+    } catch (err) {
+      getLogger().warn({ identifier, error: String(err) }, 'workspace_removal_failed')
+    }
+  }
+
+  /**
+   * Delete the clones of items that have reached a terminal state.
+   *
+   * Runs every tick, not only at start-up. Terminal is a human decision — a
+   * label moved to `symphony::done`, a file dragged into `done/` — and nothing
+   * notifies us of it, so polling is the only way to hear about it. Sweeping
+   * only at start-up meant a long-lived orchestrator never reclaimed anything:
+   * clones piled up until someone restarted the process.
+   *
+   * Costs one extra issue listing per poll, the same call `fetchCandidateIssues`
+   * already makes. That is the price of not needing a restart to free disk.
+   */
+  private async sweepTerminalWorkspaces(): Promise<void> {
+    if (!this.workspaceManager) return
     try {
       const terminalIssues = await this.tracker.fetchIssuesByStates(this.terminalStates)
-      for (const ti of terminalIssues) this.workspaceManager?.removeForIssue(ti.identifier)
+      for (const ti of terminalIssues) {
+        // Never pull the floor out from under a live run. reconcileTrackerStates
+        // runs first and terminates these, cleaning up as it goes; anything
+        // still in `running` here is mid-flight and its clone is in use.
+        if (this.state.running.has(ti.id)) continue
+        this.removeWorkspace(ti.identifier)
+      }
     } catch (err) {
-      getLogger().warn({ error: String(err) }, 'startup_cleanup_failed')
+      getLogger().warn({ error: String(err) }, 'workspace_sweep_failed')
     }
   }
 
@@ -284,7 +341,7 @@ export class SymphonyOrchestrator {
         const prompt = renderPrompt(this.promptTemplate ?? '', issue, attempt ?? 0, {
           workspace: ws ? { path: ws.path, key: ws.workspaceKey } : null,
         }) + (ws ? `\n\n## Workspace\n\nYour workspace is at \`${ws.path}\`. All work must be done inside this directory.` : '')
-        const result = await this.agentRunner.run(issue, prompt)
+        const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null)
         await this.onWorkerExit(issue.id, result.success)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')

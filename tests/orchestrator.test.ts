@@ -79,27 +79,210 @@ describe('backoffDelay', () => {
   })
 })
 
-describe('startupCleanup', () => {
-  it('calls workspaceManager.removeForIssue for terminal issues', async () => {
+function runningEntry(issueId: string, identifier: string) {
+  return {
+    session: null, issueId, identifier, issue: makeIssue({ id: issueId, identifier }),
+    sessionId: null, lastAgentEvent: null, lastAgentTimestamp: null, lastAgentMessage: '',
+    inputTokens: 0, outputTokens: 0, totalTokens: 0,
+    lastReportedInputTokens: 0, lastReportedOutputTokens: 0, lastReportedTotalTokens: 0,
+    retryAttempt: 0, startedAt: new Date(), task: Promise.resolve(), cancel: null,
+  } as any
+}
+
+function stubWorkspaceManager() {
+  return {
+    removeForIssue: vi.fn(), createForIssue: vi.fn(),
+    runAfterCreate: vi.fn(), runBeforeRun: vi.fn(), runAfterRun: vi.fn(),
+  }
+}
+
+describe('terminal workspace sweep', () => {
+  function harness(terminal: Issue[]) {
     const tracker = {
       fetchCandidateIssues: vi.fn().mockResolvedValue([]),
-      fetchIssuesByStates: vi.fn().mockResolvedValue([
-        makeIssue({ id: 'done-1', identifier: 'TICKET-1', state: 'Done' }),
-      ]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue(terminal),
       fetchIssueStatesByIds: vi.fn().mockResolvedValue([]),
     }
-    const agentRunner = { run: vi.fn() }
-    const workspaceManager = { removeForIssue: vi.fn(), createForIssue: vi.fn(), runBeforeRun: vi.fn(), runAfterRun: vi.fn() }
+    const workspaceManager = stubWorkspaceManager()
     const orch = new SymphonyOrchestrator({
       tracker: tracker as any,
-      agentRunner: agentRunner as any,
+      agentRunner: { run: vi.fn() } as any,
       workspaceManager: workspaceManager as any,
     })
+    return { tracker, workspaceManager, orch }
+  }
 
-    await (orch as any).startupCleanup()
-
+  it('removes the clone of an issue that reached a terminal state', async () => {
+    const { tracker, workspaceManager, orch } = harness([
+      makeIssue({ id: 'done-1', identifier: 'TICKET-1', state: 'Done' }),
+    ])
+    await (orch as any).sweepTerminalWorkspaces()
     expect(workspaceManager.removeForIssue).toHaveBeenCalledWith('TICKET-1')
     expect(tracker.fetchIssuesByStates).toHaveBeenCalled()
+  })
+
+  it('sweeps on every tick, not only at start-up', async () => {
+    // Terminal is a human decision that nothing notifies us about, so a sweep
+    // that only ran at start-up meant a long-lived orchestrator never
+    // reclaimed anything: clones piled up until someone restarted the process.
+    const { workspaceManager, orch } = harness([
+      makeIssue({ id: 'done-1', identifier: 'TICKET-1', state: 'Done' }),
+    ])
+    await (orch as any).tick()
+    await (orch as any).tick()
+    expect(workspaceManager.removeForIssue).toHaveBeenCalledTimes(2)
+  })
+
+  it('leaves the clone of a still-running issue alone', async () => {
+    // Deleting a workspace out from under a live agent destroys uncommitted
+    // work mid-run. reconcileTrackerStates terminates these first and cleans
+    // up as it goes; whatever is still in `running` here is in flight.
+    const { workspaceManager, orch } = harness([
+      makeIssue({ id: 'run-1', identifier: 'TICKET-1', state: 'Done' }),
+    ])
+    orch.state.running.set('run-1', runningEntry('run-1', 'TICKET-1'))
+    await (orch as any).sweepTerminalWorkspaces()
+    expect(workspaceManager.removeForIssue).not.toHaveBeenCalled()
+  })
+
+  it('survives a tracker that throws', async () => {
+    const { workspaceManager, orch } = harness([])
+    ;(orch as any).tracker.fetchIssuesByStates = vi.fn().mockRejectedValue(new Error('gitlab 503'))
+    await expect((orch as any).sweepTerminalWorkspaces()).resolves.toBeUndefined()
+    expect(workspaceManager.removeForIssue).not.toHaveBeenCalled()
+  })
+})
+
+describe('dispatch hands the workspace to the runner', () => {
+  it('passes the workspace path so the session is rooted there', async () => {
+    // Without this the agent's session roots at the server default while its
+    // prompt talks about a directory somewhere else entirely.
+    const tracker = new MemoryTracker(['Todo', 'In Progress'])
+    tracker.addIssue(makeIssue({ id: 'q-1', identifier: 'SYM-001', state: 'Todo' }))
+    const agentRunner = { run: vi.fn().mockResolvedValue({ success: true, sessionId: 's', turnsCompleted: 1 }) }
+    const workspaceManager = stubWorkspaceManager()
+    workspaceManager.createForIssue.mockReturnValue({ path: '/workspaces/SYM-001', workspaceKey: 'SYM-001', createdNow: true })
+
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: agentRunner as any,
+      workspaceManager: workspaceManager as any, promptTemplate: 'go',
+    })
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    expect(agentRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
+    )
+  })
+})
+
+describe('stall detection uses reported activity', () => {
+  function orchWithRun(stallTimeoutMs: number) {
+    const tracker = {
+      fetchCandidateIssues: vi.fn().mockResolvedValue([]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue([]),
+      fetchIssueStatesByIds: vi.fn().mockResolvedValue([]),
+    }
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: { run: vi.fn() } as any, stallTimeoutMs,
+    })
+    orch.state.running.set('run-1', runningEntry('run-1', 'TICKET-1'))
+    orch.state.claimed.add('run-1')
+    return orch
+  }
+
+  it('spares a long run that is still reporting activity', async () => {
+    // The defect this exists for: lastAgentTimestamp was never written, so the
+    // reference was always startedAt and ANY run outliving stall_timeout_ms was
+    // killed — however much progress it was making. Five minutes by default,
+    // against a task that clones a repository.
+    const orch = orchWithRun(1000)
+    const entry = orch.state.running.get('run-1')!
+    entry.startedAt = new Date(Date.now() - 600000)
+    orch.recordAgentActivity({ issueId: 'run-1', sessionId: 's1', event: 'tool.executed', at: new Date() })
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(true)
+  })
+
+  it('still kills a run that has gone silent for longer than the timeout', async () => {
+    const orch = orchWithRun(1000)
+    const entry = orch.state.running.get('run-1')!
+    entry.startedAt = new Date(Date.now() - 600000)
+    orch.recordAgentActivity({
+      issueId: 'run-1', sessionId: 's1', event: 'tool.executed',
+      at: new Date(Date.now() - 300000),
+    })
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(false)
+  })
+
+  it('falls back to the start time when no activity was ever reported', async () => {
+    // The event stream may be unavailable. A coarse timeout beats none.
+    const orch = orchWithRun(1000)
+    orch.state.running.get('run-1')!.startedAt = new Date(Date.now() - 600000)
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(false)
+  })
+
+  it('records the session id so logs can be tied to a session', async () => {
+    const orch = orchWithRun(1000)
+    orch.recordAgentActivity({ issueId: 'run-1', sessionId: 'sess-42', event: 'session_created', at: new Date() })
+    const entry = orch.state.running.get('run-1')!
+    expect(entry.sessionId).toBe('sess-42')
+    expect(entry.lastAgentEvent).toBe('session_created')
+  })
+
+  it('ignores activity for an issue that is no longer running', () => {
+    const orch = orchWithRun(1000)
+    expect(() => orch.recordAgentActivity({
+      issueId: 'gone', sessionId: 's1', event: null, at: new Date(),
+    })).not.toThrow()
+  })
+})
+
+describe('terminateRunningIssue honours its cleanup flag', () => {
+  function orchWith(currentState: string) {
+    const tracker = {
+      fetchCandidateIssues: vi.fn().mockResolvedValue([]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue([]),
+      fetchIssueStatesByIds: vi.fn().mockResolvedValue([
+        makeIssue({ id: 'run-1', identifier: 'TICKET-1', state: currentState }),
+      ]),
+    }
+    const workspaceManager = stubWorkspaceManager()
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: { run: vi.fn() } as any,
+      workspaceManager: workspaceManager as any,
+    })
+    orch.state.running.set('run-1', runningEntry('run-1', 'TICKET-1'))
+    orch.state.claimed.add('run-1')
+    return { orch, workspaceManager }
+  }
+
+  it('removes the workspace when the issue reached a terminal state', async () => {
+    // The item is done: nothing will be retried into this clone, so keeping it
+    // is pure accumulation. The flag was accepted and then ignored before.
+    const { orch, workspaceManager } = orchWith('Done')
+    await orch.reconcileTrackerStates()
+    expect(workspaceManager.removeForIssue).toHaveBeenCalledWith('TICKET-1')
+  })
+
+  it('keeps the workspace when the issue merely left the active set', async () => {
+    // Not terminal: a human may put it back, and a retry resumes in the same
+    // workspace. Deleting it would throw away the agent's uncommitted work.
+    const { orch, workspaceManager } = orchWith('In Review')
+    await orch.reconcileTrackerStates()
+    expect(orch.state.running.has('run-1')).toBe(false)
+    expect(workspaceManager.removeForIssue).not.toHaveBeenCalled()
+  })
+
+  it('keeps the workspace when a run is killed as stalled', async () => {
+    const { orch, workspaceManager } = orchWith('In Progress')
+    orch.state.running.get('run-1')!.startedAt = new Date(Date.now() - 600000)
+    ;(orch as any).stallTimeoutMs = 1000
+    ;(orch as any).reconcileStalledRuns()
+    expect(orch.state.running.has('run-1')).toBe(false)
+    expect(workspaceManager.removeForIssue).not.toHaveBeenCalled()
   })
 })
 

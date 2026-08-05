@@ -2,6 +2,20 @@ import type { Issue } from './models.js'
 import { getLogger } from './log.js'
 import type { OpencodeClient, PermissionRule } from '@opencode-ai/sdk/v2'
 
+/**
+ * Builds a client rooted at a given directory, or at the server's default when
+ * given null.
+ *
+ * A factory rather than a client because `directory` is client-level config in
+ * the SDK, and symphony gives every item its own workspace. One shared client
+ * means every session roots wherever the server defaults — `/` for a fresh
+ * OpenCode server — so the agent's file-search tools index the whole container
+ * instead of the twenty files it is supposed to be working on. The prompt
+ * carries an absolute workspace path, which is why this worked at all, but
+ * "works" and "is rooted correctly" are not the same thing.
+ */
+export type OpencodeClientFactory = (directory: string | null) => OpencodeClient
+
 export interface AgentRunResult {
   sessionId: string | null
   success: boolean
@@ -9,9 +23,25 @@ export interface AgentRunResult {
   turnsCompleted: number
 }
 
+/** One observed sign of life from a running agent. */
+export interface AgentActivity {
+  issueId: string
+  sessionId: string
+  /** The SDK event type, or a synthetic name for the milestones we raise. */
+  event: string | null
+  at: Date
+}
+
 export interface AgentRunnerConfig {
   maxTurns: number
   issueStateFetcher: (issueIds: string[]) => Promise<Issue[]>
+  /**
+   * Called whenever the agent shows a sign of life. This is the input the
+   * stall detector was missing: without it `stall_timeout_ms` can only be
+   * compared against the moment the run STARTED, which makes it a wall-clock
+   * run timeout wearing a stall detector's name.
+   */
+  onActivity?: (activity: AgentActivity) => void
 }
 
 const PERMISSIONS: PermissionRule[] = [
@@ -34,23 +64,36 @@ Continuation guidance:
 `
 
 export class AgentRunner {
-  constructor(
-    private client: OpencodeClient,
-    private config: AgentRunnerConfig,
-  ) {}
+  private readonly clientFor: OpencodeClientFactory
 
-  async run(issue: Issue, prompt: string): Promise<AgentRunResult> {
+  constructor(
+    client: OpencodeClient | OpencodeClientFactory,
+    private config: AgentRunnerConfig,
+  ) {
+    this.clientFor = typeof client === 'function' ? client : () => client
+  }
+
+  async run(issue: Issue, prompt: string, workspacePath?: string | null): Promise<AgentRunResult> {
     const log = getLogger()
     let sessionId: string | null = null
+    // Closing this closes the event subscription. Without it the SSE
+    // connection outlives the run it was watching.
+    const pumpStop = new AbortController()
+    // Root the session at the item's workspace. The prompt says the same thing
+    // in prose, but prose does not reach the file-search tools.
+    const client = this.clientFor(workspacePath ?? null)
     try {
-      const created = await this.client.session.create({
+      const created = await client.session.create({
         title: `${issue.identifier}: ${issue.title}`,
         permission: PERMISSIONS,
       })
       sessionId = created.data!.id
       log.info({ issueId: issue.id, sessionId }, 'session_created')
+      this.reportActivity(issue.id, sessionId, 'session_created')
+      // Deliberately not awaited: it runs for as long as the session does.
+      void this.pumpSessionEvents(client, issue.id, sessionId, pumpStop.signal)
 
-      const result = await this.client.session.prompt({
+      const result = await client.session.prompt({
         sessionID: sessionId,
         parts: [{ type: 'text', text: prompt }],
       })
@@ -59,6 +102,7 @@ export class AgentRunner {
       }
 
       let turnsCompleted = 1
+      this.reportActivity(issue.id, sessionId, 'turn_completed')
       for (let turn = 2; turn <= this.config.maxTurns; turn++) {
         const refreshedIssue = await this.refreshIssueState(issue.id)
         if (!refreshedIssue || !this.isActiveState(refreshedIssue.state)) {
@@ -66,7 +110,7 @@ export class AgentRunner {
           break
         }
 
-        const contResult = await this.client.session.prompt({
+        const contResult = await client.session.prompt({
           sessionID: sessionId,
           parts: [{ type: 'text', text: CONTINUATION_GUIDANCE(turn, this.config.maxTurns) }],
         })
@@ -76,6 +120,7 @@ export class AgentRunner {
         }
 
         turnsCompleted = turn
+        this.reportActivity(issue.id, sessionId, 'turn_completed')
       }
 
       log.info({ issueId: issue.id, turnsCompleted }, 'agent_run_completed')
@@ -84,6 +129,56 @@ export class AgentRunner {
       const message = err instanceof Error ? err.message : String(err)
       log.error({ issueId: issue.id, error: message }, 'agent_run_failed')
       return { sessionId: null, success: false, error: message, turnsCompleted: 0 }
+    } finally {
+      pumpStop.abort()
+    }
+  }
+
+  /**
+   * Follow the session's event stream and report every event as activity.
+   *
+   * A turn boundary is already a liveness signal, but turns are exactly the
+   * thing that runs long: an agent cloning a repository and building it can
+   * spend half an hour inside one. The event stream is what distinguishes
+   * "working" from "wedged" at any finer grain than that.
+   *
+   * Per-session rather than the global `/event` stream on purpose: a global
+   * subscription would have to be filtered by session id, and a filter that is
+   * wrong in the permissive direction stamps one run's activity onto another
+   * and reports a genuinely wedged agent as healthy. Subscribing by id cannot
+   * make that mistake.
+   *
+   * Sessions are created through the v1-shaped `session.create` and watched
+   * through the v2 `session.events`. If those id spaces ever diverge, this call
+   * fails, `agent_event_stream_unavailable` says so, and the detector degrades
+   * to turn boundaries — which is exactly what existed before it.
+   */
+  private async pumpSessionEvents(
+    client: OpencodeClient, issueId: string, sessionId: string, signal: AbortSignal,
+  ): Promise<void> {
+    if (!this.config.onActivity) return
+    try {
+      const { stream } = await client.v2.session.events({ sessionID: sessionId }, { signal })
+      for await (const event of stream) {
+        if (signal.aborted) return
+        const type = (event as { type?: unknown } | null)?.type
+        this.reportActivity(issueId, sessionId, typeof type === 'string' ? type : null)
+      }
+    } catch (err) {
+      // Losing the stream must not fail the run. It degrades to the turn
+      // boundaries above — which is the whole of what existed before — so the
+      // worst case is the coarser signal, not a dead agent.
+      if (!signal.aborted) {
+        getLogger().warn({ issueId, sessionId, error: String(err) }, 'agent_event_stream_unavailable')
+      }
+    }
+  }
+
+  private reportActivity(issueId: string, sessionId: string, event: string | null): void {
+    try {
+      this.config.onActivity?.({ issueId, sessionId, event, at: new Date() })
+    } catch (err) {
+      getLogger().warn({ issueId, error: String(err) }, 'activity_callback_failed')
     }
   }
 
