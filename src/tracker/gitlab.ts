@@ -1,6 +1,21 @@
+import { fetch as undiciFetch, ProxyAgent, type Dispatcher, type RequestInit } from 'undici'
 import type { Issue, BlockerRef } from '../models.js'
 import type { TrackerAdapter } from './base.js'
 import { getLogger } from '../log.js'
+
+/**
+ * The proxy this process should reach the outside world through, or null.
+ *
+ * Node's global `fetch` is undici, and **undici does not read the proxy
+ * environment variables**. Setting HTTP_PROXY in the container therefore does
+ * nothing by itself: the request goes out direct, and in a deployment whose
+ * networks are `internal: true` there is no route at all, so every call dies as
+ * `TypeError: fetch failed` with the proxy sitting there unused. Reading the
+ * variables here is what makes setting them mean something.
+ */
+export function proxyFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
+  return env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || null
+}
 
 /**
  * GitLab Issues as the work tracker.
@@ -64,6 +79,20 @@ export interface GitLabTrackerConfig {
   /** States that also close the issue. Moving off one reopens it. */
   closedStates?: string[]
   requestTimeoutMs?: number
+  /**
+   * Proxy for GitLab traffic. Defaults to the environment; pass `null` to force
+   * a direct connection.
+   *
+   * Scoped to this tracker rather than installed as undici's global dispatcher,
+   * and that distinction is load-bearing: symphony also talks to the OpenCode
+   * server at an internal hostname on a network the proxy cannot reach. A global
+   * dispatcher would push those calls through the proxy too and break the one
+   * connection symphony cannot do without. This is the same split NO_PROXY
+   * expresses for tools that do read the environment.
+   */
+  proxyUrl?: string | null
+  /** Injectable for tests. Defaults to undici's fetch, which honours `dispatcher`. */
+  fetchImpl?: typeof undiciFetch
 }
 
 const DEFAULT_STATE_LABELS: Record<string, string> = {
@@ -78,6 +107,24 @@ const DEFAULT_STATE_LABELS: Record<string, string> = {
 /** An issue carrying none of our labels is not ours; it is skipped, not adopted. */
 const UNTRACKED = null
 
+/**
+ * The useful part of a failed `fetch`: an errno, a TLS reason, anything but
+ * "fetch failed". Walks the cause chain because undici nests them.
+ */
+export function describeCause(err: unknown): string {
+  const parts: string[] = []
+  let current: unknown = err
+  for (let depth = 0; current && depth < 4; depth++) {
+    const e = current as { code?: unknown; message?: unknown; cause?: unknown }
+    const label = typeof e.code === 'string' ? e.code
+      : typeof e.message === 'string' ? e.message
+      : null
+    if (label && !parts.includes(label)) parts.push(label)
+    current = e.cause
+  }
+  return parts.length > 0 ? parts.join(': ') : String(err)
+}
+
 export class GitLabTracker implements TrackerAdapter {
   private readonly baseUrl: string
   private readonly projectId: string
@@ -87,6 +134,9 @@ export class GitLabTracker implements TrackerAdapter {
   private readonly labelToState: Record<string, string>
   private readonly closedStates: Set<string>
   private readonly timeoutMs: number
+  private readonly dispatcher: Dispatcher | undefined
+  private readonly viaProxy: boolean
+  private readonly fetchImpl: typeof undiciFetch
 
   constructor(config: GitLabTrackerConfig) {
     if (!config.baseUrl) throw new Error('gitlab tracker: base_url is required')
@@ -105,6 +155,16 @@ export class GitLabTracker implements TrackerAdapter {
     for (const [state, suffix] of Object.entries(this.stateLabels)) {
       this.labelToState[this.label(suffix).toLowerCase()] = state
     }
+
+    const proxyUrl = config.proxyUrl !== undefined ? config.proxyUrl : proxyFromEnv()
+    this.viaProxy = Boolean(proxyUrl)
+    this.dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
+    this.fetchImpl = config.fetchImpl ?? undiciFetch
+    // Whether egress is proxied decides which failures are even possible, so it
+    // belongs in the log before the first request rather than inferred from the
+    // wreckage of one. The URL itself is not logged: it is allowed to carry
+    // credentials.
+    getLogger().info({ viaProxy: this.viaProxy, baseUrl: this.baseUrl }, 'gitlab_tracker_ready')
   }
 
   private label(suffix: string): string {
@@ -275,10 +335,23 @@ export class GitLabTracker implements TrackerAdapter {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       signal: AbortSignal.timeout(this.timeoutMs),
+      dispatcher: this.dispatcher,
     }
     if (body) init.body = JSON.stringify(body)
 
-    const res = await fetch(url, init)
+    let res
+    try {
+      res = await this.fetchImpl(url, init)
+    } catch (err) {
+      // fetch collapses every transport failure into "TypeError: fetch failed"
+      // and hides the reason in `.cause`. Unwrapping it is the difference
+      // between "something is wrong" and "ECONNREFUSED to the proxy" — and this
+      // is the layer where nobody is watching a terminal to go and find out.
+      throw new Error(
+        `GitLab API ${method} ${path} could not connect: ${describeCause(err)} ` +
+        `(egress: ${this.viaProxy ? 'via proxy' : 'DIRECT — no proxy configured'})`,
+      )
+    }
     if (!res.ok) {
       // Never echo the response body: a GitLab error page can contain the
       // request that produced it, and the token travels in a header.

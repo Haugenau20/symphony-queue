@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { GitLabTracker, readPriority } from '../src/tracker/gitlab.js'
+import { GitLabTracker, readPriority, proxyFromEnv, describeCause } from '../src/tracker/gitlab.js'
 import { SymphonyOrchestrator } from '../src/orchestrator.js'
 
 const BASE = 'https://gitlab.internal.example'
@@ -25,10 +25,12 @@ function route(method: string, urlPart: string, json: unknown, status = 200) {
   })
 }
 
+let fakeFetch: (url: string, init: RequestInit) => Promise<unknown>
+
 beforeEach(() => {
   calls = []
   routes = []
-  vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+  fakeFetch = vi.fn(async (url: string, init: RequestInit) => {
     const method = init?.method ?? 'GET'
     calls.push({
       method,
@@ -37,20 +39,28 @@ beforeEach(() => {
       headers: (init?.headers ?? {}) as Record<string, string>,
     })
     const hit = routes.find((r) => r.match(method, String(url)))
-    if (!hit) return { ok: false, status: 404, json: async () => ({}) } as unknown as Response
+    if (!hit) return { ok: false, status: 404, json: async () => ({}) }
     return {
       ok: (hit.status ?? 200) < 400,
       status: hit.status ?? 200,
       json: async () => hit.json,
-    } as unknown as Response
-  }))
+    }
+  })
 })
 
 afterEach(() => { vi.unstubAllGlobals() })
 
+/**
+ * Injected rather than stubbed onto globalThis: the adapter calls undici's
+ * fetch, not the global one, because only undici's honours the `dispatcher`
+ * that routes it through a proxy. `proxyUrl: null` keeps the suite hermetic —
+ * without it, a machine that happens to export HTTPS_PROXY would have these
+ * tests building a real ProxyAgent.
+ */
 function tracker(overrides?: Partial<ConstructorParameters<typeof GitLabTracker>[0]>) {
   return new GitLabTracker({
-    baseUrl: BASE, projectId: PROJECT, token: 'glpat-secret', ...overrides,
+    baseUrl: BASE, projectId: PROJECT, token: 'glpat-secret',
+    proxyUrl: null, fetchImpl: fakeFetch as never, ...overrides,
   })
 }
 
@@ -239,6 +249,96 @@ describe('errors', () => {
     route('GET', '/issues?', { message: 'PRIVATE-TOKEN glpat-secret rejected' }, 401)
     await expect(tracker().fetchCandidateIssues()).rejects.toThrow(/returned 401/)
     await expect(tracker().fetchCandidateIssues()).rejects.not.toThrow(/glpat-secret/)
+  })
+
+  it('reports the real transport cause, not "fetch failed"', async () => {
+    // What "TypeError: fetch failed" cost us: a first live run that said only
+    // that something was wrong, with the reason buried in err.cause. Nobody is
+    // at a terminal to go digging on an unattended run.
+    const boom = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:3128'), { code: 'ECONNREFUSED' }),
+    })
+    const t = tracker({ fetchImpl: (async () => { throw boom }) as never })
+    await expect(t.fetchCandidateIssues()).rejects.toThrow(/ECONNREFUSED/)
+  })
+
+  it('says which way egress was attempted when a connection fails', async () => {
+    // Direct-vs-proxied is the single most useful bit for this failure, and it
+    // is not otherwise recoverable from the logs.
+    const boom = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('nope'), { code: 'ENOTFOUND' }),
+    })
+    const direct = tracker({ proxyUrl: null, fetchImpl: (async () => { throw boom }) as never })
+    await expect(direct.fetchCandidateIssues()).rejects.toThrow(/DIRECT — no proxy configured/)
+
+    const proxied = tracker({ proxyUrl: 'http://squid:3128', fetchImpl: (async () => { throw boom }) as never })
+    await expect(proxied.fetchCandidateIssues()).rejects.toThrow(/via proxy/)
+  })
+
+  it('does not leak the proxy URL, which may carry credentials', async () => {
+    const boom = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } })
+    const t = tracker({
+      proxyUrl: 'http://user:hunter2@squid:3128',
+      fetchImpl: (async () => { throw boom }) as never,
+    })
+    await expect(t.fetchCandidateIssues()).rejects.not.toThrow(/hunter2/)
+  })
+})
+
+describe('proxy configuration', () => {
+  // Node's global fetch is undici and undici ignores HTTP_PROXY, so setting the
+  // variable did nothing until this read it. On a stack whose networks are all
+  // `internal: true` that is the difference between working and every single
+  // API call failing.
+  it('takes the proxy from the environment, preferring HTTPS_PROXY', () => {
+    expect(proxyFromEnv({ HTTPS_PROXY: 'http://a:3128', HTTP_PROXY: 'http://b:3128' })).toBe('http://a:3128')
+    expect(proxyFromEnv({ HTTP_PROXY: 'http://b:3128' })).toBe('http://b:3128')
+    expect(proxyFromEnv({ http_proxy: 'http://c:3128' })).toBe('http://c:3128')
+    expect(proxyFromEnv({})).toBeNull()
+  })
+
+  it('sends a dispatcher with every request when a proxy is configured', async () => {
+    const seen: Array<unknown> = []
+    const t = tracker({
+      proxyUrl: 'http://squid:3128',
+      fetchImpl: (async (_u: string, init: { dispatcher?: unknown }) => {
+        seen.push(init.dispatcher)
+        return { ok: true, status: 200, json: async () => [] }
+      }) as never,
+    })
+    await t.fetchCandidateIssues()
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toBeDefined()
+  })
+
+  it('sends no dispatcher when no proxy is configured', async () => {
+    const seen: Array<unknown> = []
+    const t = tracker({
+      proxyUrl: null,
+      fetchImpl: (async (_u: string, init: { dispatcher?: unknown }) => {
+        seen.push(init.dispatcher)
+        return { ok: true, status: 200, json: async () => [] }
+      }) as never,
+    })
+    await t.fetchCandidateIssues()
+    expect(seen[0]).toBeUndefined()
+  })
+})
+
+describe('describeCause', () => {
+  it('walks the cause chain and keeps the first useful label', () => {
+    expect(describeCause(Object.assign(new TypeError('fetch failed'), {
+      cause: { code: 'ECONNREFUSED' },
+    }))).toContain('ECONNREFUSED')
+  })
+  it('falls back to the message when there is no code', () => {
+    expect(describeCause(new Error('self-signed certificate in chain')))
+      .toContain('self-signed certificate')
+  })
+  it('does not loop forever on a self-referencing cause', () => {
+    const e: { message: string; cause?: unknown } = { message: 'a' }
+    e.cause = e
+    expect(describeCause(e)).toBe('a')
   })
 })
 
