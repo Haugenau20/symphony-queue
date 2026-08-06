@@ -119,6 +119,7 @@ async function main(): Promise<void> {
     onActivity: (activity) => orch?.recordAgentActivity(activity),
     continuationGuidance: config.agent.continuationGuidance,
     completionMarker: config.agent.completionMarker,
+    sessionTimeoutMs: config.opencode.sessionTimeoutMs,
   })
   orch = new SymphonyOrchestrator({
     tracker, agentRunner, workspaceManager: wsManager,

@@ -172,6 +172,7 @@ describe('dispatch hands the workspace to the runner', () => {
 
     expect(agentRunner.run).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
+      expect.any(AbortSignal),
     )
   })
 })

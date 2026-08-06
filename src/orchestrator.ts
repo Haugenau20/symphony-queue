@@ -341,7 +341,11 @@ export class SymphonyOrchestrator {
         const prompt = renderPrompt(this.promptTemplate ?? '', issue, attempt ?? 0, {
           workspace: ws ? { path: ws.path, key: ws.workspaceKey } : null,
         }) + (ws ? `\n\n## Workspace\n\nYour workspace is at \`${ws.path}\`. All work must be done inside this directory.` : '')
-        const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null)
+        // The signal was created here and passed to nothing, so `cancel()` —
+        // the stall detector's only lever — aborted an AbortController nobody
+        // listened to. The run it "killed" carried on, evicted from `running`
+        // but still holding the workspace and still talking to the model.
+        const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
         await this.onWorkerExit(issue.id, result.success)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')

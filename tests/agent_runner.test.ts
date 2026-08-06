@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { AgentRunner, declaresCompletion, promptText } from '../src/agent_runner.js'
+import { AgentRunner, declaresCompletion, promptText, describeApiError } from '../src/agent_runner.js'
 import type { Issue } from '../src/models.js'
 
 function makeIssue(overrides?: Partial<Issue>): Issue {
@@ -64,8 +64,10 @@ describe('AgentRunner (SDK v2)', () => {
       title: 'TICKET-1: Test',
     }))
     expect(client.session.prompt).toHaveBeenCalledTimes(1)
+    // Second argument carries the abort signal that bounds the prompt.
     expect(client.session.prompt).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionID: 'session-1' })
+      expect.objectContaining({ sessionID: 'session-1' }),
+      expect.anything(),
     )
   })
 
@@ -125,6 +127,102 @@ describe('AgentRunner (SDK v2)', () => {
         ]),
       })
     )
+  })
+})
+
+describe('AgentRunner failure diagnostics', () => {
+  // A run that died on the first prompt used to leave `session_created` and,
+  // minutes later, a transition to Failed — nothing else. result.error was
+  // discarded and no line was logged at all, so it could not be told apart
+  // from a stall, a crash, or an exhausted turn loop.
+  it('carries the server error into the result instead of an opaque label', async () => {
+    const client = mockClient()
+    client.session.prompt = vi.fn().mockResolvedValue({
+      error: { message: 'upstream timed out after 300s' },
+    })
+    const runner = new AgentRunner(client, { maxTurns: 3, issueStateFetcher: async () => [] })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('initial_prompt_failed')
+    expect(result.error).toContain('upstream timed out')
+  })
+
+  it('carries the server error from a continuation turn too', async () => {
+    let n = 0
+    const client = mockClient()
+    client.session.prompt = vi.fn(async () => (n++ === 0
+      ? { data: { parts: [] } }
+      : { error: { message: 'model overloaded' } }))
+    const runner = new AgentRunner(client, {
+      maxTurns: 3, issueStateFetcher: async () => [makeIssue()],
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('continuation_turn_failed')
+    expect(result.error).toContain('model overloaded')
+  })
+
+  it('bounds each prompt with session_timeout_ms', async () => {
+    const seen: Array<AbortSignal | undefined> = []
+    const client = mockClient()
+    client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
+      seen.push(o?.signal); return { data: { parts: [] } }
+    })
+    const runner = new AgentRunner(client, {
+      maxTurns: 1, issueStateFetcher: async () => [], sessionTimeoutMs: 60000,
+    })
+    await runner.run(makeIssue(), 'do work')
+    expect(seen[0]).toBeInstanceOf(AbortSignal)
+    expect(seen[0]!.aborted).toBe(false)
+  })
+
+  it('honours the orchestrator cancelling a run', async () => {
+    // The orchestrator built an AbortController and passed it to nothing, so
+    // the stall detector's only lever aborted a signal nobody listened to and
+    // the "killed" run carried on unseen.
+    const controller = new AbortController()
+    const seen: Array<AbortSignal | undefined> = []
+    const client = mockClient()
+    client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
+      seen.push(o?.signal); return { data: { parts: [] } }
+    })
+    const runner = new AgentRunner(client, { maxTurns: 1, issueStateFetcher: async () => [] })
+    await runner.run(makeIssue(), 'do work', null, controller.signal)
+    expect(seen[0]).toBeInstanceOf(AbortSignal)
+    controller.abort()
+    expect(seen[0]!.aborted).toBe(true)
+  })
+
+  it('aborts the prompt when either the timeout or the orchestrator fires', async () => {
+    const controller = new AbortController()
+    const seen: Array<AbortSignal | undefined> = []
+    const client = mockClient()
+    client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
+      seen.push(o?.signal); return { data: { parts: [] } }
+    })
+    const runner = new AgentRunner(client, {
+      maxTurns: 1, issueStateFetcher: async () => [], sessionTimeoutMs: 60000,
+    })
+    await runner.run(makeIssue(), 'do work', null, controller.signal)
+    controller.abort()
+    expect(seen[0]!.aborted).toBe(true)
+  })
+})
+
+describe('describeApiError', () => {
+  it('renders the shapes an API error actually arrives in', () => {
+    expect(describeApiError('boom')).toBe('boom')
+    expect(describeApiError(new Error('boom'))).toBe('boom')
+    expect(describeApiError({ message: 'boom', status: 504 })).toContain('boom')
+    expect(describeApiError(undefined)).toBe('unknown')
+  })
+  it('truncates, because this goes in every failure line', () => {
+    expect(describeApiError('x'.repeat(5000), 100)).toHaveLength(101)
+  })
+  it('survives a value that cannot be serialised', () => {
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    expect(() => describeApiError(cyclic)).not.toThrow()
   })
 })
 
