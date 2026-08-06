@@ -118,6 +118,7 @@ async function main(): Promise<void> {
     issueStateFetcher: (ids) => tracker.fetchIssueStatesByIds(ids),
     onActivity: (activity) => orch?.recordAgentActivity(activity),
     continuationGuidance: config.agent.continuationGuidance,
+    completionMarker: config.agent.completionMarker,
   })
   orch = new SymphonyOrchestrator({
     tracker, agentRunner, workspaceManager: wsManager,

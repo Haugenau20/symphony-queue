@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { AgentRunner } from '../src/agent_runner.js'
+import { AgentRunner, declaresCompletion, promptText } from '../src/agent_runner.js'
 import type { Issue } from '../src/models.js'
 
 function makeIssue(overrides?: Partial<Issue>): Issue {
@@ -125,6 +125,124 @@ describe('AgentRunner (SDK v2)', () => {
         ]),
       })
     )
+  })
+})
+
+describe('AgentRunner completion marker', () => {
+  // Without a completion signal the turn loop has no exit but exhaustion.
+  // Symphony owns the item's state and does not move it until the run is over,
+  // so "is the item still active?" is true on every iteration — an agent that
+  // finished at turn 3 of 10 is told "the work is not finished" seven more
+  // times, with a live credential and a pushed branch to fiddle with.
+  const reply = (text: string) => ({ data: { parts: [{ type: 'text', text }] } })
+
+  function clientReplying(...texts: string[]) {
+    let n = 0
+    return {
+      session: {
+        create: vi.fn().mockResolvedValue({ data: { id: 'session-1' } }),
+        prompt: vi.fn(async () => reply(texts[Math.min(n++, texts.length - 1)] ?? '')),
+      },
+      v2: { session: { events: eventStream([]) } },
+    } as any
+  }
+
+  it('stops as soon as the agent declares itself finished', async () => {
+    const client = clientReplying('still working', 'nearly there', 'all done\nSYMPHONY_DONE')
+    const runner = new AgentRunner(client, {
+      maxTurns: 10,
+      issueStateFetcher: async () => [makeIssue()],
+      completionMarker: 'SYMPHONY_DONE',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.turnsCompleted).toBe(3)
+    expect(result.stopReason).toBe('completed')
+    expect(client.session.prompt).toHaveBeenCalledTimes(3)
+  })
+
+  it('can finish on the very first turn', async () => {
+    const client = clientReplying('done immediately\nSYMPHONY_DONE')
+    const runner = new AgentRunner(client, {
+      maxTurns: 10,
+      issueStateFetcher: async () => [makeIssue()],
+      completionMarker: 'SYMPHONY_DONE',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.turnsCompleted).toBe(1)
+    expect(result.stopReason).toBe('completed')
+    expect(client.session.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports max_turns when the agent never declared itself finished', async () => {
+    // The distinction the logs could not previously make: interrupted mid-task
+    // looks identical to finished, and both are filed as reviewable.
+    const client = clientReplying('working')
+    const runner = new AgentRunner(client, {
+      maxTurns: 4,
+      issueStateFetcher: async () => [makeIssue()],
+      completionMarker: 'SYMPHONY_DONE',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.turnsCompleted).toBe(4)
+    expect(result.stopReason).toBe('max_turns')
+  })
+
+  it('ignores the marker quoted inside a sentence', async () => {
+    // Agents narrate their own instructions. A substring match would read
+    // "I'll reply with SYMPHONY_DONE when the MR is open" as the declaration
+    // itself and cut the run off before any work happened.
+    const client = clientReplying("I will reply with SYMPHONY_DONE once the MR is open.", 'working', 'working', 'working')
+    const runner = new AgentRunner(client, {
+      maxTurns: 3,
+      issueStateFetcher: async () => [makeIssue()],
+      completionMarker: 'SYMPHONY_DONE',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.stopReason).toBe('max_turns')
+    expect(result.turnsCompleted).toBe(3)
+  })
+
+  it('uses every turn when the marker is disabled', async () => {
+    const client = clientReplying('SYMPHONY_DONE')
+    const runner = new AgentRunner(client, {
+      maxTurns: 3,
+      issueStateFetcher: async () => [makeIssue()],
+      completionMarker: '',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.turnsCompleted).toBe(3)
+    expect(result.stopReason).toBe('max_turns')
+  })
+
+  it('reports issue_inactive when a human ends the item mid-run', async () => {
+    const client = clientReplying('working')
+    const runner = new AgentRunner(client, {
+      maxTurns: 5,
+      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
+      completionMarker: 'SYMPHONY_DONE',
+    })
+    const result = await runner.run(makeIssue(), 'do work')
+    expect(result.stopReason).toBe('issue_inactive')
+    expect(result.turnsCompleted).toBe(1)
+  })
+})
+
+describe('declaresCompletion', () => {
+  it('matches only a whole line', () => {
+    expect(declaresCompletion('work done\nSYMPHONY_DONE', 'SYMPHONY_DONE')).toBe(true)
+    expect(declaresCompletion('  SYMPHONY_DONE  ', 'SYMPHONY_DONE')).toBe(true)
+    expect(declaresCompletion('I will say SYMPHONY_DONE later', 'SYMPHONY_DONE')).toBe(false)
+    expect(declaresCompletion('SYMPHONY_DONE_NOT', 'SYMPHONY_DONE')).toBe(false)
+    expect(declaresCompletion('anything', '')).toBe(false)
+  })
+})
+
+describe('promptText', () => {
+  it('joins text parts and ignores everything else', () => {
+    expect(promptText({ parts: [{ type: 'text', text: 'a' }, { type: 'tool' }, { type: 'text', text: 'b' }] }))
+      .toBe('a\nb')
+    expect(promptText(null)).toBe('')
+    expect(promptText({})).toBe('')
   })
 })
 

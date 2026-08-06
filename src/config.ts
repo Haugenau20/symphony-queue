@@ -61,6 +61,16 @@ const AgentRawSchema = z.object({
    * cares says it here.
    */
   continuation_guidance: z.string().nullable().default(null),
+  /**
+   * The line an agent emits to declare itself finished, ending the run before
+   * max_turns. Empty string disables the check.
+   *
+   * Without it the turn loop has no exit but exhaustion: symphony owns the
+   * item's state and does not move it until the run is over, so the "is the
+   * item still active?" test is true on every iteration and an agent that
+   * finished early is prompted to keep going until the turns are gone.
+   */
+  completion_marker: z.string().default('SYMPHONY_DONE'),
 })
 
 const OpenCodeRawSchema = z.object({
@@ -104,6 +114,7 @@ export interface AgentConfig {
   maxRetryBackoffMs: number
   maxConcurrentAgentsByState: Record<string, number>
   continuationGuidance: string | null
+  completionMarker: string
 }
 
 export interface OpenCodeConfig {
@@ -170,6 +181,7 @@ export function buildServiceConfig(wf: WorkflowDefinition, workflowDir?: string)
       maxRetryBackoffMs: aRaw.max_retry_backoff_ms,
       maxConcurrentAgentsByState: perState,
       continuationGuidance: aRaw.continuation_guidance ?? null,
+      completionMarker: aRaw.completion_marker,
     },
     opencode: {
       serverUrl: oRaw.server_url,

@@ -22,6 +22,13 @@ export interface AgentRunResult {
   success: boolean
   error?: string
   turnsCompleted: number
+  /**
+   * Why the turn loop ended. `max_turns` means the agent was INTERRUPTED — it
+   * never said it was finished — and the item is about to be filed as reviewable
+   * anyway. That distinction was previously unrecoverable from the logs: a run
+   * that finished and one that ran out of runway looked identical.
+   */
+  stopReason?: 'completed' | 'max_turns' | 'issue_inactive'
 }
 
 /** One observed sign of life from a running agent. */
@@ -50,6 +57,11 @@ export interface AgentRunnerConfig {
    * request" is right for GitLab and meaningless for the file queue.
    */
   continuationGuidance?: string | null
+  /**
+   * The line an agent emits to declare itself finished. Empty disables the
+   * check, which restores the old behaviour: every run uses every turn.
+   */
+  completionMarker?: string | null
 }
 
 const PERMISSIONS: PermissionRule[] = [
@@ -85,6 +97,25 @@ Continuation guidance:
 - If the finishing step named in the task instructions is still undone and the turns are running out, do it now rather than continuing to refine.
 - Focus on the remaining work and do not end the turn while the item stays active unless you are truly blocked.
 `
+
+/**
+ * True when `text` contains `marker` on a line of its own.
+ *
+ * Whole-line rather than substring: agents narrate their instructions ("I'll
+ * reply with SYMPHONY_DONE once the MR is open"), and a substring match would
+ * read that as the declaration itself and cut the run off mid-task.
+ */
+export function declaresCompletion(text: string, marker: string): boolean {
+  if (!marker) return false
+  return text.split('\n').some((line) => line.trim() === marker)
+}
+
+/** Concatenate the text parts of a prompt response; ignore tool and file parts. */
+export function promptText(data: unknown): string {
+  const parts = (data as { parts?: Array<{ type?: string; text?: string }> } | null)?.parts
+  if (!Array.isArray(parts)) return ''
+  return parts.filter((p) => typeof p?.text === 'string').map((p) => p.text).join('\n')
+}
 
 export class AgentRunner {
   private readonly clientFor: OpencodeClientFactory
@@ -126,10 +157,18 @@ export class AgentRunner {
 
       let turnsCompleted = 1
       this.reportActivity(issue.id, sessionId, 'turn_completed')
+      const marker = this.config.completionMarker ?? ''
+      if (declaresCompletion(promptText(result.data), marker)) {
+        log.info({ issueId: issue.id, turnsCompleted }, 'agent_reported_complete')
+        return { sessionId, success: true, turnsCompleted, stopReason: 'completed' }
+      }
+
+      let stopReason: AgentRunResult['stopReason'] = 'max_turns'
       for (let turn = 2; turn <= this.config.maxTurns; turn++) {
         const refreshedIssue = await this.refreshIssueState(issue.id)
         if (!refreshedIssue || !this.isActiveState(refreshedIssue.state)) {
           log.info({ issueId: issue.id, turnsCompleted: turn - 1 }, 'issue_no_longer_active')
+          stopReason = 'issue_inactive'
           break
         }
 
@@ -144,10 +183,26 @@ export class AgentRunner {
 
         turnsCompleted = turn
         this.reportActivity(issue.id, sessionId, 'turn_completed')
+
+        // The agent's own "I am finished". Without it the loop has no exit but
+        // max_turns: the issue stays In Progress for the whole run (symphony
+        // owns that label and only moves it afterwards), so isActiveState is
+        // true every time, and an agent that finished at turn 3 gets told
+        // "the work is not finished" for every remaining turn.
+        if (declaresCompletion(promptText(contResult.data), marker)) {
+          log.info({ issueId: issue.id, turnsCompleted }, 'agent_reported_complete')
+          stopReason = 'completed'
+          break
+        }
       }
 
-      log.info({ issueId: issue.id, turnsCompleted }, 'agent_run_completed')
-      return { sessionId, success: true, turnsCompleted }
+      if (stopReason === 'max_turns') {
+        // Not a failure, but not a finish either: the agent was interrupted
+        // mid-task and whatever it had is about to be filed as reviewable.
+        log.warn({ issueId: issue.id, turnsCompleted }, 'agent_run_hit_max_turns')
+      }
+      log.info({ issueId: issue.id, turnsCompleted, stopReason }, 'agent_run_completed')
+      return { sessionId, success: true, turnsCompleted, stopReason }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error({ issueId: issue.id, error: message }, 'agent_run_failed')
