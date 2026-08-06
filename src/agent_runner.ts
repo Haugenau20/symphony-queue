@@ -62,6 +62,13 @@ export interface AgentRunnerConfig {
    * check, which restores the old behaviour: every run uses every turn.
    */
   completionMarker?: string | null
+  /**
+   * Per-prompt ceiling. `opencode.session_timeout_ms` was parsed into config
+   * and then used by nothing, so the only limit on a hung prompt was whatever
+   * the LLM gateway or proxy happened to enforce — arriving as an opaque error
+   * with no timing attached.
+   */
+  sessionTimeoutMs?: number
 }
 
 const PERMISSIONS: PermissionRule[] = [
@@ -110,6 +117,21 @@ export function declaresCompletion(text: string, marker: string): boolean {
   return text.split('\n').some((line) => line.trim() === marker)
 }
 
+/**
+ * A loggable rendering of an API error. Truncated, because a server error can
+ * carry an arbitrarily long body and this goes in every failure line.
+ */
+export function describeApiError(err: unknown, limit = 600): string {
+  if (err === null || err === undefined) return 'unknown'
+  let text: string
+  if (typeof err === 'string') text = err
+  else if (err instanceof Error) text = err.message
+  else {
+    try { text = JSON.stringify(err) } catch { text = String(err) }
+  }
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
 /** Concatenate the text parts of a prompt response; ignore tool and file parts. */
 export function promptText(data: unknown): string {
   const parts = (data as { parts?: Array<{ type?: string; text?: string }> } | null)?.parts
@@ -127,7 +149,9 @@ export class AgentRunner {
     this.clientFor = typeof client === 'function' ? client : () => client
   }
 
-  async run(issue: Issue, prompt: string, workspacePath?: string | null): Promise<AgentRunResult> {
+  async run(
+    issue: Issue, prompt: string, workspacePath?: string | null, signal?: AbortSignal,
+  ): Promise<AgentRunResult> {
     const log = getLogger()
     let sessionId: string | null = null
     // Closing this closes the event subscription. Without it the SSE
@@ -147,12 +171,26 @@ export class AgentRunner {
       // Deliberately not awaited: it runs for as long as the session does.
       void this.pumpSessionEvents(client, issue.id, sessionId, pumpStop.signal)
 
-      const result = await client.session.prompt({
-        sessionID: sessionId,
-        parts: [{ type: 'text', text: prompt }],
-      })
+      const startedAt = Date.now()
+      const result = await client.session.prompt(
+        { sessionID: sessionId, parts: [{ type: 'text', text: prompt }] },
+        { signal: this.promptSignal(signal) },
+      )
       if (result.error) {
-        return { sessionId, success: false, error: 'initial_prompt_failed', turnsCompleted: 0 }
+        // This return used to log NOTHING and discard result.error, so a run
+        // that died here left only `session_created` and, minutes later, a
+        // state transition to Failed — with no way to tell it apart from a
+        // stall, a crash, or an exhausted turn loop. The duration matters as
+        // much as the message: a failure at exactly 300s is a timeout
+        // somewhere downstream, not a rejected request.
+        log.warn({
+          issueId: issue.id, sessionId, durationMs: Date.now() - startedAt,
+          error: describeApiError(result.error),
+        }, 'initial_prompt_failed')
+        return {
+          sessionId, success: false, turnsCompleted: 0,
+          error: `initial_prompt_failed: ${describeApiError(result.error, 200)}`,
+        }
       }
 
       let turnsCompleted = 1
@@ -172,13 +210,20 @@ export class AgentRunner {
           break
         }
 
-        const contResult = await client.session.prompt({
-          sessionID: sessionId,
-          parts: [{ type: 'text', text: this.continuationText(turn) }],
-        })
+        const turnStartedAt = Date.now()
+        const contResult = await client.session.prompt(
+          { sessionID: sessionId, parts: [{ type: 'text', text: this.continuationText(turn) }] },
+          { signal: this.promptSignal(signal) },
+        )
         if (contResult.error) {
-          log.warn({ issueId: issue.id, sessionId, turn }, 'continuation_turn_failed')
-          return { sessionId, success: false, error: 'continuation_turn_failed', turnsCompleted }
+          log.warn({
+            issueId: issue.id, sessionId, turn, durationMs: Date.now() - turnStartedAt,
+            error: describeApiError(contResult.error),
+          }, 'continuation_turn_failed')
+          return {
+            sessionId, success: false, turnsCompleted,
+            error: `continuation_turn_failed: ${describeApiError(contResult.error, 200)}`,
+          }
         }
 
         turnsCompleted = turn
@@ -231,6 +276,20 @@ export class AgentRunner {
    * fails, `agent_event_stream_unavailable` says so, and the detector degrades
    * to turn boundaries — which is exactly what existed before it.
    */
+  /**
+   * Bound each prompt by session_timeout_ms, and honour the orchestrator's
+   * cancellation. Both were missing: the timeout config was dead, and the
+   * orchestrator's AbortController was wired to nothing at all — so a run the
+   * stall detector "killed" carried on running, invisible, holding the
+   * workspace it had been evicted from.
+   */
+  private promptSignal(external?: AbortSignal): AbortSignal | undefined {
+    const timeoutMs = this.config.sessionTimeoutMs
+    const timeout = timeoutMs && timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined
+    if (external && timeout) return AbortSignal.any([external, timeout])
+    return external ?? timeout
+  }
+
   private continuationText(turn: number): string {
     const template = this.config.continuationGuidance || DEFAULT_CONTINUATION_GUIDANCE
     try {
