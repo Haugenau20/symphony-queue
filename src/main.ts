@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { createOpencodeClient } from '@opencode-ai/sdk/v2'
+import { makeOpencodeClientFactory } from './opencode_client.js'
 import { WorkflowStore } from './workflow_store.js'
 import { validateDispatchConfig } from './config.js'
 import { configureLogging, getLogger } from './log.js'
@@ -84,15 +84,9 @@ async function main(): Promise<void> {
     afterRun: config.hooks.afterRun, beforeRemove: config.hooks.beforeRemove, hookTimeoutMs: config.hooks.timeoutMs,
   })
 
-  // One client per workspace, not one for all sessions: `directory` is
-  // client-level config in the SDK, and each item has its own workspace. A
-  // shared client roots every session at the server default — `/` on a fresh
-  // OpenCode server — which is not where any of the work is. Clients are thin
-  // wrappers over fetch, so building one per dispatch costs nothing.
-  const clientFor = (directory: string | null) => createOpencodeClient({
-    baseUrl: config.opencode.serverUrl,
-    ...(directory ? { directory } : {}),
-  })
+  // Per-workspace clients over a shared, timeout-free dispatcher. Both halves
+  // of that matter and both are explained in ./opencode_client.ts.
+  const clientFor = makeOpencodeClientFactory(config.opencode.serverUrl)
 
   if (config.opencode.serverStartCommand) {
     const child = spawn(config.opencode.serverStartCommand, { stdio: 'inherit', shell: true, cwd: process.cwd(), detached: true })
