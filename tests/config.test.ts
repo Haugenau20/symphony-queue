@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { buildServiceConfig, validateDispatchConfig, parseAndValidateConfig } from '../src/config.js'
+import {
+  buildServiceConfig,
+  validateDispatchConfig,
+  validateCompletionSignal,
+  parseAndValidateConfig,
+} from '../src/config.js'
 import type { WorkflowDefinition } from '../src/models.js'
 
 describe('buildServiceConfig', () => {
@@ -204,5 +209,65 @@ describe('gitlab tracker config', () => {
       if (prev === undefined) delete process.env.SYMPHONY_GITLAB_TOKEN
       else process.env.SYMPHONY_GITLAB_TOKEN = prev
     }
+  })
+})
+
+describe('validateCompletionSignal', () => {
+  // A marker the prompt never mentions is a marker the agent is never asked
+  // for, so `declaresCompletion` is false on every turn and the loop can only
+  // end by exhaustion. The runs still succeed and the issues still reach
+  // review, which is exactly why this needs catching at config load rather
+  // than being left to show up as a slow model.
+  const withAgent = (agent: Record<string, unknown>, prompt: string) =>
+    validateCompletionSignal(
+      buildServiceConfig({ config: { agent }, promptTemplate: prompt }),
+      prompt,
+    )
+
+  it('passes when the prompt body names the marker', () => {
+    expect(withAgent({}, 'End your reply with SYMPHONY_DONE on a line of its own.')).toEqual([])
+  })
+
+  it('passes when only the continuation guidance names the marker', () => {
+    // Turn 1 can leave it out entirely as long as the nudge sent on every
+    // later turn carries it — the agent still gets asked.
+    const errs = validateCompletionSignal(
+      buildServiceConfig({
+        config: { agent: { continuation_guidance: 'When the MR is open, reply SYMPHONY_DONE.' } },
+        promptTemplate: 'Do the work.',
+      }),
+      'Do the work.',
+    )
+    expect(errs).toEqual([])
+  })
+
+  it('passes when a custom marker is named', () => {
+    expect(withAgent({ completion_marker: 'ALL_FINISHED' }, 'Say ALL_FINISHED when done.')).toEqual([])
+  })
+
+  it('fails when neither mentions it, and says how many turns that wastes', () => {
+    const errs = withAgent({ max_turns: 10 }, 'Do the work and open a merge request.')
+    expect(errs).toHaveLength(1)
+    expect(errs[0]).toContain('SYMPHONY_DONE')
+    expect(errs[0]).toContain('10 turns')
+  })
+
+  it('offers the explicit opt-out in the message rather than just refusing', () => {
+    const errs = withAgent({}, 'Do the work.')
+    expect(errs[0]).toContain('completion_marker: ""')
+  })
+
+  it('says nothing when early exit is explicitly disabled', () => {
+    // `completion_marker: ""` is the documented way to accept that every run
+    // uses its full budget. Opting out is not a misconfiguration.
+    expect(withAgent({ completion_marker: '' }, 'Do the work.')).toEqual([])
+  })
+
+  it('is reported by parseAndValidateConfig alongside the dispatch errors', () => {
+    const { errors } = parseAndValidateConfig({
+      config: { tracker: { kind: 'file_queue', root: '/queue' } },
+      promptTemplate: 'Do the work.',
+    })
+    expect(errors.some((e) => e.includes('completion_marker'))).toBe(true)
   })
 })

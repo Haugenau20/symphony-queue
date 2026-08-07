@@ -397,3 +397,28 @@ describe('full tick loop against GitLabTracker', () => {
     expect(agentRunner.run).not.toHaveBeenCalled()
   })
 })
+
+describe('annotateIssue', () => {
+  it('posts the note to the issue as a comment', async () => {
+    route('POST', '/notes', { id: 1 })
+    await tracker().annotateIssue('42', 'ran out of turns')
+
+    const call = calls.find((c) => c.method === 'POST')!
+    expect(call.url).toBe(`${API}/issues/42/notes`)
+    expect(call.body).toEqual({ body: 'ran out of turns' })
+  })
+
+  it('url-encodes the issue id', async () => {
+    route('POST', '/notes', { id: 1 })
+    await tracker().annotateIssue('a/b', 'note')
+    expect(calls.find((c) => c.method === 'POST')!.url).toContain('/issues/a%2Fb/notes')
+  })
+
+  it('surfaces a rejection rather than swallowing it', async () => {
+    // The orchestrator decides that a failed note is survivable; the adapter
+    // must not make that call on its behalf, or a permission problem would be
+    // invisible everywhere.
+    route('POST', '/notes', { message: '403 Forbidden' }, 403)
+    await expect(tracker().annotateIssue('42', 'note')).rejects.toThrow()
+  })
+})

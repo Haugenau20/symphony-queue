@@ -194,7 +194,13 @@ export function buildServiceConfig(wf: WorkflowDefinition, workflowDir?: string)
 
 export function parseAndValidateConfig(wf: WorkflowDefinition, workflowDir?: string): { config: ServiceConfig; errors: string[] } {
   const config = buildServiceConfig(wf, workflowDir)
-  return { config, errors: validateDispatchConfig(config) }
+  return {
+    config,
+    errors: [
+      ...validateDispatchConfig(config),
+      ...validateCompletionSignal(config, wf.promptTemplate),
+    ],
+  }
 }
 
 export const SUPPORTED_TRACKER_KINDS = ['file_queue', 'gitlab'] as const
@@ -224,4 +230,44 @@ export function validateDispatchConfig(cfg: ServiceConfig): string[] {
     }
   }
   return errors
+}
+
+/**
+ * A `completion_marker` the prompt never mentions is a marker the agent is
+ * never asked for. `declaresCompletion` is then false on every turn and the
+ * loop has no exit but exhaustion — symphony owns the issue's label and does
+ * not move it mid-run, so the "is it still active?" test is true every time.
+ * The run does its work, opens its merge request, and then spends every
+ * remaining turn being told to keep going while holding a live credential.
+ *
+ * A hard error rather than a warning, because the failure is invisible from
+ * outside: the runs succeed, the issues reach review, the merge requests are
+ * correct. Only `stopReason` in the container log says the turns were burned,
+ * and nothing at all says why. A workflow file that fell behind its example is
+ * enough to cause it, and the symptom looks like a slow or clumsy model.
+ *
+ * Checkable precisely because the mention cannot be indirect: `renderPrompt`
+ * and `renderContinuation` both run Liquid with `strictVariables: true`, and
+ * neither context carries the marker — a template referring to it would throw
+ * rather than interpolate. A literal substring is its only route to the agent.
+ *
+ * Opting out stays explicit: `completion_marker: ""` disables early exit and
+ * accepts that every run spends its full budget.
+ */
+export function validateCompletionSignal(cfg: ServiceConfig, promptTemplate: string): string[] {
+  const marker = cfg.agent.completionMarker
+  if (!marker) return []
+
+  const mentioned = promptTemplate.includes(marker)
+    || (cfg.agent.continuationGuidance?.includes(marker) ?? false)
+  if (mentioned) return []
+
+  return [
+    `agent.completion_marker is ${JSON.stringify(marker)} but neither the prompt `
+    + 'body nor agent.continuation_guidance mentions it. The agent is never asked '
+    + 'to emit it, so no run can end early and every run will use all '
+    + `${cfg.agent.maxTurns} turns of agent.max_turns. Either tell the agent to end `
+    + `its reply with ${marker} on a line of its own, or set completion_marker: "" `
+    + 'to accept that runs always use every turn.',
+  ]
 }
