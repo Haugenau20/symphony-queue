@@ -244,6 +244,20 @@ export class GitLabTracker implements TrackerAdapter {
     getLogger().info({ issueId, from: currentState, to: stateName }, 'gitlab_state_updated')
   }
 
+  /**
+   * A note on the issue. Within Reporter — this tracker's whole permission
+   * budget is reading and writing issues, and commenting is squarely inside it.
+   *
+   * Deliberately not folded into `updateIssueState`: the state transition is
+   * load-bearing (an item that does not move is re-dispatched on the next
+   * start) and this is commentary. They must be able to fail independently, so
+   * a GitLab instance that rejects the note never costs us the transition.
+   */
+  async annotateIssue(issueId: string, note: string): Promise<void> {
+    await this.request('POST', `/issues/${encodeURIComponent(issueId)}/notes`, { body: note })
+    getLogger().info({ issueId }, 'gitlab_note_added')
+  }
+
   // --- internals ------------------------------------------------------------
 
   /**

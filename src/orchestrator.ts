@@ -2,7 +2,7 @@ import { getLogger } from './log.js'
 import type { OrchestratorState, Issue } from './models.js'
 import { createOrchestratorState } from './models.js'
 import type { TrackerAdapter } from './tracker/base.js'
-import type { AgentRunner, AgentActivity } from './agent_runner.js'
+import type { AgentRunner, AgentActivity, AgentRunResult } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
 
@@ -346,7 +346,7 @@ export class SymphonyOrchestrator {
         // listened to. The run it "killed" carried on, evicted from `running`
         // but still holding the workspace and still talking to the model.
         const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
-        await this.onWorkerExit(issue.id, result.success)
+        await this.onWorkerExit(issue.id, result.success, result)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')
         await this.onWorkerExit(issue.id, false)
@@ -365,7 +365,9 @@ export class SymphonyOrchestrator {
     getLogger().info({ issueId: issue.id, identifier: issue.identifier, state: issue.state }, 'dispatched')
   }
 
-  private async onWorkerExit(issueId: string, normal: boolean): Promise<void> {
+  private async onWorkerExit(
+    issueId: string, normal: boolean, result?: AgentRunResult,
+  ): Promise<void> {
     const entry = this.state.running.get(issueId)
     if (!entry) return
     this.state.running.delete(issueId)
@@ -389,6 +391,18 @@ export class SymphonyOrchestrator {
       getLogger().warn({ issueId, identifier: entry.identifier, state: targetState, error: String(stateErr) }, 'exit_state_transition_failed')
     }
 
+    // Exhausting the turn budget lands on the same state as finishing, so the
+    // board cannot tell "the agent said it was done" from "we ran out of
+    // road". Only `stopReason` distinguishes them, and it lives in a container
+    // log nobody triaging a queue is reading. Say it where the work is.
+    if (result?.stopReason === 'max_turns') {
+      await this.annotate(issueId, entry.identifier,
+        `**Symphony: this run ended by exhausting its turn budget**, not because the agent `
+        + `reported it was finished (\`stopReason: max_turns\`, ${result.turnsCompleted} turns used).\n\n`
+        + 'Whatever is here may be partial — the agent was still being asked to continue when '
+        + 'the budget ran out. Review before treating it as complete.')
+    }
+
     if (normal) {
       this.state.completed.add(issueId)
     } else if (!recorded) {
@@ -399,6 +413,20 @@ export class SymphonyOrchestrator {
       this.state.claimed.add(issueId)
     }
     this.notifyObservers()
+  }
+
+  /**
+   * Commentary, never load-bearing: a tracker that cannot take notes, or one
+   * whose instance rejects this call, must not turn a finished run into a
+   * failed one. Swallow and log.
+   */
+  private async annotate(issueId: string, identifier: string, note: string): Promise<void> {
+    if (!this.tracker.annotateIssue) return
+    try {
+      await this.tracker.annotateIssue(issueId, note)
+    } catch (err) {
+      getLogger().warn({ issueId, identifier, error: String(err) }, 'issue_annotation_failed')
+    }
   }
 
   addObserver(callback: (state: OrchestratorState) => void): void { this.observers.push(callback) }

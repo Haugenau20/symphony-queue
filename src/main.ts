@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { makeOpencodeClientFactory } from './opencode_client.js'
 import { WorkflowStore } from './workflow_store.js'
-import { validateDispatchConfig } from './config.js'
+import { validateCompletionSignal, validateDispatchConfig } from './config.js'
 import { configureLogging, getLogger } from './log.js'
 import { SymphonyOrchestrator } from './orchestrator.js'
 import { AgentRunner } from './agent_runner.js'
@@ -39,7 +39,11 @@ async function main(): Promise<void> {
   }
   const config = store.config!
 
-  const errors = validateDispatchConfig(config)
+  const errors = [
+    ...validateDispatchConfig(config),
+    // Needs the prompt body, which `config` alone does not carry.
+    ...validateCompletionSignal(config, store.workflow.promptTemplate),
+  ]
   if (errors.length > 0) {
     for (const err of errors) log.error({ error: err }, 'config_validation_failed')
     process.exit(1)

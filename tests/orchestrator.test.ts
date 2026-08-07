@@ -444,3 +444,73 @@ describe('orchestrator tick against MemoryTracker', () => {
     expect(orch.state.running.size).toBe(0)
   })
 })
+
+describe('exit annotation', () => {
+  // Exhausting the turn budget lands on the same state as finishing cleanly,
+  // so the board cannot tell them apart. `stopReason` is the only thing that
+  // can, and it lives in a container log nobody triaging a queue reads.
+  function harness(annotateIssue?: (id: string, note: string) => Promise<void>) {
+    const tracker: Record<string, unknown> = { updateIssueState: vi.fn(async () => {}) }
+    if (annotateIssue) tracker.annotateIssue = vi.fn(annotateIssue)
+    const orch = new SymphonyOrchestrator({
+      tracker: tracker as any, agentRunner: { run: vi.fn() } as any,
+    })
+    ;(orch as any).state.running.set('issue-5', {
+      issueId: 'issue-5', identifier: 'TICKET-5', startedAt: new Date(),
+      totalTokens: 0, inputTokens: 0, outputTokens: 0, retryAttempt: 0,
+    })
+    return { tracker, orch }
+  }
+
+  const exit = (orch: any, result: unknown) =>
+    orch.onWorkerExit('issue-5', true, result)
+
+  it('annotates a run that ran out of turns', async () => {
+    const { tracker, orch } = harness(async () => {})
+    await exit(orch, { success: true, turnsCompleted: 10, stopReason: 'max_turns' })
+
+    const note = (tracker.annotateIssue as any).mock.calls[0][1] as string
+    expect(note).toContain('max_turns')
+    expect(note).toContain('10 turns')
+  })
+
+  it('says nothing about a run that reported itself complete', async () => {
+    const { tracker, orch } = harness(async () => {})
+    await exit(orch, { success: true, turnsCompleted: 1, stopReason: 'completed' })
+    expect(tracker.annotateIssue).not.toHaveBeenCalled()
+  })
+
+  it('says nothing when the run was cut short by the issue leaving its states', async () => {
+    const { tracker, orch } = harness(async () => {})
+    await exit(orch, { success: true, turnsCompleted: 2, stopReason: 'issue_inactive' })
+    expect(tracker.annotateIssue).not.toHaveBeenCalled()
+  })
+
+  it('still transitions the state on a tracker that cannot take notes', async () => {
+    // The file queue has no annotateIssue at all; the exit path must not
+    // assume one exists.
+    const { tracker, orch } = harness()
+    await expect(exit(orch, { success: true, turnsCompleted: 10, stopReason: 'max_turns' }))
+      .resolves.toBeUndefined()
+    expect(tracker.updateIssueState).toHaveBeenCalledWith('issue-5', 'In Review')
+  })
+
+  it('treats a failed note as commentary, not as a failed run', async () => {
+    // Annotation is the last thing to happen and the least important. A
+    // GitLab instance that rejects the note must not turn a finished run into
+    // one that looks abnormal.
+    const { tracker, orch } = harness(async () => { throw new Error('403 Forbidden') })
+    await expect(exit(orch, { success: true, turnsCompleted: 10, stopReason: 'max_turns' }))
+      .resolves.toBeUndefined()
+    expect(tracker.updateIssueState).toHaveBeenCalledWith('issue-5', 'In Review')
+    expect((orch as any).state.completed.has('issue-5')).toBe(true)
+  })
+
+  it('does not annotate when there is no run result at all', async () => {
+    // The crash path calls onWorkerExit with no result; there is no stopReason
+    // to report and the state already says Failed.
+    const { tracker, orch } = harness(async () => {})
+    await (orch as any).onWorkerExit('issue-5', false)
+    expect(tracker.annotateIssue).not.toHaveBeenCalled()
+  })
+})
