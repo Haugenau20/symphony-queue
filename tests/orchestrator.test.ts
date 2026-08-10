@@ -174,6 +174,37 @@ describe('dispatch hands the workspace to the runner', () => {
       expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
       expect.any(AbortSignal),
     )
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledTimes(1)
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/workspaces/SYM-001' }),
+    )
+    expect(agentRunner.run.mock.invocationCallOrder[0]).toBeLessThan(
+      workspaceManager.runAfterRun.mock.invocationCallOrder[0]!,
+    )
+  })
+
+  it('runs after_run when the agent runner throws', async () => {
+    const tracker = new MemoryTracker(['Todo', 'In Progress'])
+    tracker.addIssue(makeIssue({ id: 'q-2', identifier: 'SYM-002', state: 'Todo' }))
+    const agentRunner = { run: vi.fn().mockRejectedValue(new Error('runner crashed')) }
+    const workspaceManager = stubWorkspaceManager()
+    workspaceManager.createForIssue.mockReturnValue({
+      path: '/workspaces/SYM-002', workspaceKey: 'SYM-002', createdNow: false,
+    })
+
+    const orch = new SymphonyOrchestrator({
+      tracker, agentRunner: agentRunner as any,
+      workspaceManager: workspaceManager as any, promptTemplate: 'go',
+    })
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledTimes(1)
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/workspaces/SYM-002' }),
+    )
+    const [afterExit] = await tracker.fetchIssueStatesByIds(['q-2'])
+    expect(afterExit!.state).toBe('Failed')
   })
 })
 

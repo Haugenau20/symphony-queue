@@ -345,7 +345,25 @@ export class SymphonyOrchestrator {
         // the stall detector's only lever — aborted an AbortController nobody
         // listened to. The run it "killed" carried on, evicted from `running`
         // but still holding the workspace and still talking to the model.
-        const result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
+        let result: AgentRunResult
+        try {
+          result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
+        } finally {
+          // after_run is paired with the agent invocation, not with a
+          // successful result. Cleanup and publication hooks still need to run
+          // when the runner throws or returns an abnormal outcome. The hook is
+          // advisory: a broken implementation must not replace the agent's
+          // actual result with a hook failure.
+          if (ws && this.workspaceManager) {
+            try {
+              await this.workspaceManager.runAfterRun(ws)
+            } catch (hookErr) {
+              getLogger().warn({
+                issueId: issue.id, identifier: issue.identifier, error: String(hookErr),
+              }, 'after_run_hook_failed')
+            }
+          }
+        }
         await this.onWorkerExit(issue.id, result.success, result)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')
