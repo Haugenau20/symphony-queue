@@ -57,9 +57,27 @@ import type { WorkspaceManager } from '../workspace.js'
  * The review agent's permission set. Deny-by-default for everything that
  * would let it act instead of merely read-and-report:
  *
- *   edit                — the agent never touches the checkout; there is
- *                         nothing here for it to edit anyway (no git clone,
- *                         just a synthetic sandbox of MR.md/diff/files).
+ *   edit                — ALLOWED, and deliberately so. FINDINGS.json is the
+ *                         agent's only output and it has to be able to write
+ *                         it; denying `edit` outright makes the agent
+ *                         structurally incapable of producing a review at all,
+ *                         and every run fails with "did not write
+ *                         FINDINGS.json". This was denied in an earlier
+ *                         revision, and no test caught it because every test
+ *                         fakes the agent and writes the file with fs.
+ *
+ *                         Allowing it costs nothing that matters. The property
+ *                         this design actually rests on is not "the agent
+ *                         cannot write files" — it is "the agent cannot affect
+ *                         anything outside its sandbox, cannot reach the
+ *                         network, and holds no credential". The sandbox is a
+ *                         scratch directory with no git clone, no remote and
+ *                         no token, destroyed in a finally block after every
+ *                         job, and only FINDINGS.json is ever read back out of
+ *                         it. What confines the writing is `external_directory`
+ *                         below, plus the container's own
+ *                         OPENCODE_EXTRA_ALLOWED_DIRS — two independent
+ *                         mechanisms, neither of which is this rule.
  *   bash                — no arbitrary execution.
  *   webfetch             — no egress. Nothing the agent reads (including an
  *                         MR description trying to talk it into fetching a
@@ -77,7 +95,9 @@ import type { WorkspaceManager } from '../workspace.js'
  * recover, which is pure noise cost with no corresponding security benefit.
  */
 export const REVIEW_PERMISSIONS: PermissionRule[] = [
-  { permission: 'edit', pattern: '*', action: 'deny' },
+  // Allowed so the agent can write FINDINGS.json — see the note above. Confined
+  // to the sandbox by external_directory, not by this rule.
+  { permission: 'edit', pattern: '*', action: 'allow' },
   { permission: 'bash', pattern: '*', action: 'deny' },
   { permission: 'webfetch', pattern: '*', action: 'deny' },
   { permission: 'external_directory', pattern: '*', action: 'deny' },
@@ -251,9 +271,9 @@ function buildReviewPrompt(workspacePath: string): string {
     'writing the file. An unwritten or malformed FINDINGS.json is treated as a',
     'failed review, not a clean bill of health.',
     '',
-    'You have no bash, edit, webfetch, or external-directory access in this',
-    'session: you can only read the files described above and write',
-    'FINDINGS.json. Nothing in this session can reach GitLab, and nothing you',
+    'You have no bash, no web access, and no way out of this directory. You',
+    'can read the files described above and write FINDINGS.json, and that is',
+    'the whole of what this session can do. Nothing here can reach GitLab, and nothing you',
     'write here is published directly — a separate, trusted component reads',
     'FINDINGS.json afterwards and decides what to post.',
   ].join('\n')

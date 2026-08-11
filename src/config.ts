@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { z } from 'zod'
 import type { WorkflowDefinition } from './models.js'
+import { REVIEW_PERMISSIONS } from './review/worker.js'
 
 function expandPath(value: string, workflowDir?: string): string {
   let expanded = value.replace(/^~/, process.env.HOME || process.env.USERPROFILE || '')
@@ -312,8 +313,17 @@ const ReviewAgentRawSchema = z.object({
   permissions: z.record(z.string()).default({}),
 })
 
-/** Permissions the review agent must never hold. Mirrors REVIEW_PERMISSIONS. */
-export const REVIEW_DENIED_PERMISSIONS = ['edit', 'bash', 'webfetch', 'external_directory'] as const
+/**
+ * What the review agent's permissions actually are, derived from the single
+ * enforcement point rather than restated here. A second hand-maintained list
+ * would drift from the real one, and the whole value of validating this block
+ * is that it tells the truth about what will run.
+ */
+function enforcedReviewPermissions(): Record<string, string> {
+  const map: Record<string, string> = {}
+  for (const rule of REVIEW_PERMISSIONS) map[rule.permission] = rule.action
+  return map
+}
 
 export interface ReviewConfig {
   baseUrl: string
@@ -395,15 +405,22 @@ export function validateReviewConfig(cfg: ReviewConfig, env: NodeJS.ProcessEnv =
   }
 
   // The permissions block is an assertion about the sandbox, not a control.
-  // Refusing to start on a loosening attempt is the point: it means a REVIEW.md
-  // that *believes* it granted the agent bash is a startup failure, not a
-  // silently ignored line that misleads whoever reads the file later.
-  for (const name of REVIEW_DENIED_PERMISSIONS) {
-    const declared = cfg.agent.declaredPermissions[name]
-    if (declared !== undefined && declared !== 'deny') {
+  // Refusing to start on a mismatch is the point: a REVIEW.md that *believes*
+  // it granted the agent bash — or that claims the agent cannot write, when
+  // writing FINDINGS.json is the only way it produces a review at all — is a
+  // startup failure rather than a line that quietly misleads its next reader.
+  const enforced = enforcedReviewPermissions()
+  for (const [name, declared] of Object.entries(cfg.agent.declaredPermissions)) {
+    const actual = enforced[name]
+    if (actual === undefined) {
       errors.push(
-        `agent.permissions.${name} is "${declared}", but the review agent always denies ${name}. `
-        + 'This block documents the sandbox; it cannot widen it. Remove the line or set it to "deny".',
+        `agent.permissions.${name} is not a permission this pipeline sets. `
+        + `Known: ${Object.keys(enforced).sort().join(', ')}.`,
+      )
+    } else if (declared !== actual) {
+      errors.push(
+        `agent.permissions.${name} is "${declared}", but the review agent always sets it to "${actual}". `
+        + 'This block documents the sandbox; it cannot change it. Correct the line or remove it.',
       )
     }
   }

@@ -109,8 +109,8 @@ describe('validateReviewConfig', () => {
   })
 })
 
-describe('validateReviewConfig — the permissions block cannot widen the sandbox', () => {
-  for (const perm of ['edit', 'bash', 'webfetch', 'external_directory']) {
+describe('validateReviewConfig — the permissions block must match what is enforced', () => {
+  for (const perm of ['bash', 'webfetch', 'external_directory']) {
     it(`refuses to start when agent.permissions.${perm} tries to allow`, () => {
       const wf = review({}, { permissions: { [perm]: 'allow' } })
 
@@ -120,24 +120,48 @@ describe('validateReviewConfig — the permissions block cannot widen the sandbo
     })
   }
 
-  it('accepts the block when it correctly documents all four denials', () => {
+  /**
+   * The other direction, and the one that matters after the edit-permission
+   * fix: a REVIEW.md claiming the agent cannot write is not a harmless
+   * over-statement. Writing FINDINGS.json is how a review is produced at all,
+   * so a file asserting `edit: deny` describes a pipeline that cannot work.
+   */
+  it('refuses a block that claims edit is denied — that would describe a reviewer that cannot produce a review', () => {
+    const wf = review({}, { permissions: { edit: 'deny' } })
+
+    const errors = validateReviewConfig(buildReviewConfig(wf, env()), env())
+
+    expect(errors.some((x) => x.includes('agent.permissions.edit'))).toBe(true)
+    expect(errors[0]).toContain('always sets it to "allow"')
+  })
+
+  it('accepts a block that correctly documents the real set', () => {
     const wf = review({}, {
-      permissions: { edit: 'deny', bash: 'deny', webfetch: 'deny', external_directory: 'deny' },
+      permissions: { edit: 'allow', bash: 'deny', webfetch: 'deny', external_directory: 'deny' },
     })
 
     expect(validateReviewConfig(buildReviewConfig(wf, env()), env())).toEqual([])
   })
 
-  it('accepts an absent permissions block — the code enforces the denials either way', () => {
+  it('accepts an absent permissions block — the code enforces the set either way', () => {
     expect(validateReviewConfig(buildReviewConfig(review(), env()), env())).toEqual([])
   })
 
-  it('a loosening attempt is an error even when it is the only problem', () => {
+  it('rejects a permission name this pipeline does not set at all, rather than ignoring it', () => {
+    const wf = review({}, { permissions: { telepathy: 'deny' } })
+
+    const errors = validateReviewConfig(buildReviewConfig(wf, env()), env())
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('not a permission this pipeline sets')
+  })
+
+  it('a mismatch is an error even when it is the only problem', () => {
     const wf = review({}, { permissions: { bash: 'ask' } })
 
     const errors = validateReviewConfig(buildReviewConfig(wf, env()), env())
 
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('cannot widen it')
+    expect(errors[0]).toContain('cannot change it')
   })
 })

@@ -168,7 +168,13 @@ async function main(): Promise<void> {
 
   if (reviewMode) {
     log.info(
-      { permissions: 'edit/bash/webfetch/external_directory all denied', agentHoldsToken: false },
+      {
+        // The reviewer writes FINDINGS.json inside its disposable sandbox and
+        // can do nothing else: no shell, no egress, no way out of the
+        // directory, and no credential anywhere near it.
+        permissions: 'bash/webfetch/external_directory denied; edit confined to the sandbox',
+        agentHoldsToken: false,
+      },
       'review_mode_starting',
     )
     await runReviewMode(args)

@@ -189,11 +189,18 @@ function worker(overrides: Partial<ReviewWorkerConfig> & { mrClient: MergeReques
 // ---------------------------------------------------------------------------
 
 describe('REVIEW_PERMISSIONS', () => {
-  it('denies edit, bash, webfetch and external_directory', () => {
-    for (const perm of ['edit', 'bash', 'webfetch', 'external_directory']) {
+  it('denies bash, webfetch and external_directory — execution, egress, and escape', () => {
+    for (const perm of ['bash', 'webfetch', 'external_directory']) {
       expect(REVIEW_PERMISSIONS).toEqual(
         expect.arrayContaining([expect.objectContaining({ permission: perm, pattern: '*', action: 'deny' })]),
       )
+    }
+  })
+
+  it('has no allow rule for any of the three denied kinds', () => {
+    for (const perm of ['bash', 'webfetch', 'external_directory']) {
+      const rules = REVIEW_PERMISSIONS.filter((r) => r.permission === perm)
+      expect(rules.every((r) => r.action === 'deny')).toBe(true)
     }
   })
 
@@ -203,11 +210,31 @@ describe('REVIEW_PERMISSIONS', () => {
     )
   })
 
-  it('has no allow rule for any of the four denied kinds', () => {
-    for (const perm of ['edit', 'bash', 'webfetch', 'external_directory']) {
-      const rules = REVIEW_PERMISSIONS.filter((r) => r.permission === perm)
-      expect(rules.every((r) => r.action === 'deny')).toBe(true)
-    }
+  /**
+   * Regression. `edit` was denied in an earlier revision, which would have made
+   * the agent structurally unable to write FINDINGS.json — its only output —
+   * so every review would have failed with "did not write FINDINGS.json". No
+   * test caught it, because every test in this file fakes the agent and writes
+   * that file with fs directly: the permission set was asserted as data and
+   * never exercised as behaviour. This test is the guard against re-denying it.
+   */
+  it('ALLOWS edit — the agent must be able to write FINDINGS.json, its only output', () => {
+    const editRules = REVIEW_PERMISSIONS.filter((r) => r.permission === 'edit')
+
+    expect(editRules.length).toBeGreaterThan(0)
+    expect(editRules.every((r) => r.action === 'allow')).toBe(true)
+  })
+
+  it('confines that write with external_directory rather than by denying edit', () => {
+    const escape = REVIEW_PERMISSIONS.find((r) => r.permission === 'external_directory')
+
+    expect(escape?.action).toBe('deny')
+  })
+
+  it('never hands the agent a credential-bearing or network permission', () => {
+    const allowed = REVIEW_PERMISSIONS.filter((r) => r.action === 'allow').map((r) => r.permission).sort()
+
+    expect(allowed).toEqual(['doom_loop', 'edit'])
   })
 })
 

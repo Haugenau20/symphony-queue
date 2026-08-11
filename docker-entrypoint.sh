@@ -48,9 +48,11 @@ wait_for_opencode() {
 wait_for_opencode
 
 if [ "${SYMPHONY_MODE:-}" = "review" ]; then
-  # The review agent denies edit, bash, webfetch and external_directory, holds
-  # no credential and has no egress, so the guardrails acknowledgement — which
-  # is about an agent that has all four granted — does not apply to this mode.
+  # The review agent denies bash, webfetch and external_directory, holds no
+  # credential and has no egress; the one thing it can write is FINDINGS.json
+  # inside a sandbox that is destroyed after every job. The guardrails
+  # acknowledgement is about an agent that has all four granted, so it does not
+  # apply to this mode.
   exec node dist/main.js "${SYMPHONY_REVIEW_WORKFLOW:-/config/REVIEW.md}" "$@"
 fi
 
