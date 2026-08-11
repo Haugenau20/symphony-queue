@@ -1,0 +1,13 @@
+# Keep the build context to what the image actually needs. node_modules is the
+# big one: the build installs its own from the lockfile, and copying a host
+# tree in would both slow the build and risk shipping a platform-mismatched
+# native dependency.
+node_modules
+dist
+.git
+.github
+tests
+coverage
+*.log
+.env
+.env.*

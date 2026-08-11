@@ -163,6 +163,38 @@ npm test
 npm run build
 ```
 
+## Building the deployment image
+
+Symphony-Launcher is pull-only by contract — it assembles compose files and
+starts what the image store already has, and it will never build this for you.
+This repository is the other half of that interface:
+
+```bash
+npm run image:build            # opencode-workplace-symphony:local
+```
+
+or, for a real registry:
+
+```bash
+IMAGE_REGISTRY=registry.example.com/team/opencode-workplace \
+IMAGE_TAG=2026-08-11 \
+  ./scripts/build-image.sh --push
+```
+
+The name matters. Both `docker-compose.symphony.yml` and
+`docker-compose.review.yml` resolve
+`${IMAGE_REGISTRY:-opencode-workplace}-symphony:${IMAGE_TAG:-local}`, so use
+the same two values here as in the launcher's `.env` or `symphony up` will
+look for an image this build did not produce.
+
+One image, two modes: `SYMPHONY_MODE=review` starts the merge-request review
+controller instead of the issue orchestrator. They share the agent runner, so
+shipping one image is what stops the two pipelines drifting to different builds
+of it.
+
+This does **not** build the agent image (`${IMAGE_REGISTRY}:${IMAGE_TAG}`, run
+by the `opencode` and `opencode-review` services). That is a separate artifact.
+
 ## OpenCode SDK version
 
 `@opencode-ai/sdk` is pinned to **exactly `1.17.15`** — not a caret range.
