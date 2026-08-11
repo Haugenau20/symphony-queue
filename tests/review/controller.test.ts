@@ -369,6 +369,54 @@ describe('ReviewController discovery — cursor overlap window', () => {
     await controller.poll()
     expect(store.cursor?.getTime()).toBe(updatedAt.getTime())
   })
+
+  it('a not-ready MR (headSha === "") is never lost: the cursor must not advance past it, and it is rediscovered once ready even with updated_at UNCHANGED', async () => {
+    // This is the invariant, not the mechanism: the requeue promise in
+    // processSummary ("a later poll's overlap window will pick it up") only
+    // holds if the persisted cursor never moves past this MR's updated_at.
+    // GitLab tracks diff preparation as a distinct async step (`prepared_at`
+    // exists precisely because it is not folded into `updated_at`), so this
+    // test deliberately does NOT bump updated_at between polls — that is
+    // exactly the assumption under test, not a detail to wave away.
+    const notReadyUpdatedAt = new Date('2026-08-10T09:30:00.000Z')
+    let call = 0
+    const client = new FakeClient(async () => {
+      call++
+      if (call === 1) {
+        // Poll 1: GitLab has not finished preparing the diff yet.
+        return [summary({ mrIid: 7, headSha: '', updatedAt: notReadyUpdatedAt })]
+      }
+      // Poll 2: same MR, now ready, with the SAME updated_at as poll 1.
+      return [summary({ mrIid: 7, headSha: 'sha7', updatedAt: notReadyUpdatedAt })]
+    })
+    const { store, controller } = controllerWith({
+      client,
+      pollIntervalMs: 60000,
+      // Isolates discovery from dispatch: without this, poll 2's dispatch()
+      // would claim the freshly discovered record in the same tick, and the
+      // state assertion below would see 'claimed' rather than 'discovered'.
+      perProjectMaxInFlight: 0,
+    })
+
+    // Poll 1: nothing is recorded for this MR — correct, it is not skipped.
+    await controller.poll()
+    const allAfterPoll1 = Array.from(store.records.values())
+    expect(allAfterPoll1.find((j) => j.key.mrIid === 7)).toBeUndefined()
+
+    // The load-bearing assertion: the persisted cursor must NOT have
+    // advanced to or past this MR's updated_at. If it did, the MR could
+    // fall outside the (finite) overlap window on some later poll and never
+    // be seen again — with nothing anywhere reporting the loss, since no
+    // skipped record was ever written for it either.
+    expect(store.cursor).not.toBeNull()
+    expect(store.cursor!.getTime()).toBeLessThan(notReadyUpdatedAt.getTime())
+
+    // Poll 2: the MR is ready now, reported with the identical updated_at.
+    // Rediscovery must not depend on updated_at having moved.
+    await controller.poll()
+    const afterPoll2 = await store.get({ projectId: 'my-org/service-a', mrIid: 7, headSha: 'sha7' })
+    expect(afterPoll2?.state).toBe('discovered')
+  })
 })
 
 // ---------------------------------------------------------------------------

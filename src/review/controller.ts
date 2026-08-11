@@ -236,15 +236,36 @@ export class ReviewController {
     const summaries = await this.client.listOpenMergeRequests({ updatedAfter: queryCursor })
 
     let maxUpdatedAt = storedCursor
+    // The earliest updated_at among candidates this poll deliberately did
+    // NOT record (headSha === '', diff not ready — see processSummary). The
+    // persisted cursor must never advance to or past this, or the requeue
+    // promise breaks: a later poll's overlap window is finite, and GitLab is
+    // not guaranteed to bump updated_at when async diff preparation finishes
+    // (prepared_at is tracked separately precisely because it is a distinct
+    // step). Without this clamp the MR could silently never be reviewed —
+    // worse than a noisy skip, because nothing records that it happened.
+    let earliestNotReady: Date | null = null
     for (const summary of summaries) {
       if (!maxUpdatedAt || summary.updatedAt.getTime() > maxUpdatedAt.getTime()) maxUpdatedAt = summary.updatedAt
+      if (summary.headSha === '' && (!earliestNotReady || summary.updatedAt.getTime() < earliestNotReady.getTime())) {
+        earliestNotReady = summary.updatedAt
+      }
       await this.processSummary(summary)
     }
 
     // The cursor we persist is the true high-water mark, not the overlapped
-    // query bound — the overlap is applied only when reading it back.
-    if (maxUpdatedAt && (!storedCursor || maxUpdatedAt.getTime() > storedCursor.getTime())) {
-      await this.store.writeCursor(maxUpdatedAt)
+    // query bound — the overlap is applied only when reading it back. But it
+    // is clamped to strictly before any not-ready candidate in this batch,
+    // so that candidate remains within a future query's window regardless of
+    // how the cursor advances afterward.
+    let cursorToWrite = maxUpdatedAt
+    if (earliestNotReady) {
+      const clamp = new Date(earliestNotReady.getTime() - 1)
+      if (!cursorToWrite || clamp.getTime() < cursorToWrite.getTime()) cursorToWrite = clamp
+    }
+
+    if (cursorToWrite && (!storedCursor || cursorToWrite.getTime() > storedCursor.getTime())) {
+      await this.store.writeCursor(cursorToWrite)
     }
   }
 
