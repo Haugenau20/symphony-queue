@@ -113,7 +113,6 @@ async function main(): Promise<void> {
   let orch: SymphonyOrchestrator | undefined
   const agentRunner = new AgentRunner(clientFor, {
     maxTurns: config.agent.maxTurns,
-    issueStateFetcher: (ids) => tracker.fetchIssueStatesByIds(ids),
     onActivity: (activity) => orch?.recordAgentActivity(activity),
     continuationGuidance: config.agent.continuationGuidance,
     completionMarker: config.agent.completionMarker,
