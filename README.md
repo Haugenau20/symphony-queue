@@ -195,6 +195,19 @@ of it.
 This does **not** build the agent image (`${IMAGE_REGISTRY}:${IMAGE_TAG}`, run
 by the `opencode` and `opencode-review` services). That is a separate artifact.
 
+### An internal GitLab, or a proxy that re-signs TLS
+
+Put the root certificate in `ca/` as a `*.crt` file and rebuild — see
+[`ca/README.md`](ca/README.md). It is trusted in both the build and runtime
+stages, because behind a TLS-intercepting proxy it is `npm ci` that fails first
+and the error does not obviously point at a missing root.
+
+Node ignores the operating system's trust store by default, so a certificate
+that `curl` accepts inside the container will still fail in the orchestrator
+unless `NODE_EXTRA_CA_CERTS` is set. The image sets it to the system bundle
+that `update-ca-certificates` rebuilds, so public roots and your private ones
+both work, and nothing breaks when `ca/` is empty.
+
 ## OpenCode SDK version
 
 `@opencode-ai/sdk` is pinned to **exactly `1.17.15`** — not a caret range.

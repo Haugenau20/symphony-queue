@@ -414,3 +414,144 @@ describe('pure mapping helpers', () => {
     expect(file.collapsed).toBe(true)
   })
 })
+
+describe('listDiffs — /diffs is not reliable everywhere', () => {
+  const diffFile = (path: string, diff = '@@ -1 +1 @@\n+x\n') => ({
+    old_path: path, new_path: path, diff, new_file: false, renamed_file: false, deleted_file: false,
+  })
+
+  it('uses /diffs when the instance serves it, and never calls /changes', async () => {
+    route('GET', '/merge_requests/6/diffs', [diffFile('a.ts')])
+
+    const files = await client().listDiffs('grp/svc', 6)
+
+    expect(files.map((f) => f.newPath)).toEqual(['a.ts'])
+    expect(calls.some((c) => c.url.includes('/changes'))).toBe(false)
+  })
+
+  /** The real failure: GitLab 17.5.1 answers 500 on /diffs for an MR /changes returns fine. */
+  it('falls back to /changes when /diffs answers 500', async () => {
+    route('GET', '/merge_requests/6/diffs', {}, 500)
+    route('GET', '/merge_requests/6/changes', { changes: [diffFile('a.ts'), diffFile('b.ts')] })
+
+    const files = await client().listDiffs('grp/svc', 6)
+
+    expect(files.map((f) => f.newPath)).toEqual(['a.ts', 'b.ts'])
+    expect(files[0]!.collapsed).toBe(false)
+  })
+
+  it('falls back when /diffs is absent entirely (404 on an older instance)', async () => {
+    route('GET', '/merge_requests/6/diffs', {}, 404)
+    route('GET', '/merge_requests/6/changes', { changes: [diffFile('a.ts')] })
+
+    expect((await client().listDiffs('grp/svc', 6)).map((f) => f.newPath)).toEqual(['a.ts'])
+  })
+
+  it('does NOT fall back on 401 — a token problem must surface, not be papered over', async () => {
+    route('GET', '/merge_requests/6/diffs', {}, 401)
+    route('GET', '/merge_requests/6/changes', { changes: [diffFile('a.ts')] })
+
+    await expect(client().listDiffs('grp/svc', 6)).rejects.toThrow(/401/)
+    expect(calls.some((c) => c.url.includes('/changes'))).toBe(false)
+  })
+
+  it('does NOT fall back on 403 or 429 either', async () => {
+    for (const status of [403, 429]) {
+      calls = []
+      routes = []
+      route('GET', '/merge_requests/6/diffs', {}, status)
+      route('GET', '/merge_requests/6/changes', { changes: [diffFile('a.ts')] })
+
+      await expect(client().listDiffs('grp/svc', 6)).rejects.toThrow(String(status))
+      expect(calls.some((c) => c.url.includes('/changes'))).toBe(false)
+    }
+  })
+
+  it('the fallback is STICKY: /diffs is probed once per client, not once per merge request', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [diffFile('a.ts')] })
+    const c = client()
+
+    await c.listDiffs('grp/svc', 6)
+    await c.listDiffs('grp/svc', 7)
+    await c.listDiffs('grp/svc', 8)
+
+    expect(calls.filter((x) => x.url.includes('/diffs')).length).toBe(1)
+    expect(calls.filter((x) => x.url.includes('/changes')).length).toBe(3)
+  })
+
+  it('diffEndpoint: "changes" skips the probe entirely', async () => {
+    route('GET', '/changes', { changes: [diffFile('a.ts')] })
+
+    await client({ diffEndpoint: 'changes' }).listDiffs('grp/svc', 6)
+
+    expect(calls.some((x) => x.url.includes('/diffs'))).toBe(false)
+  })
+
+  it('diffEndpoint: "diffs" surfaces the 500 instead of falling back', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [diffFile('a.ts')] })
+
+    await expect(client({ diffEndpoint: 'diffs' }).listDiffs('grp/svc', 6)).rejects.toThrow(/500/)
+    expect(calls.some((x) => x.url.includes('/changes'))).toBe(false)
+  })
+
+  it('never puts a response body in the fallback error', async () => {
+    route('GET', '/diffs', { message: 'glpat-should-never-appear' }, 401)
+
+    await expect(client().listDiffs('grp/svc', 6)).rejects.toThrow(
+      expect.not.stringContaining('glpat-should-never-appear') as unknown as string,
+    )
+  })
+})
+
+describe('listDiffs — externally stored diffs come back empty without access_raw_diffs', () => {
+  const empty = (path: string) => ({ old_path: path, new_path: path, diff: '', deleted_file: false })
+  const full = (path: string) => ({ old_path: path, new_path: path, diff: '@@ -1 +1 @@\n+x\n', deleted_file: false })
+
+  it('retries with access_raw_diffs=true when EVERY file body is empty, and uses the real diffs', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [empty('a.ts')] })
+    // Registered last so it is matched first — the harness checks newest route
+    // first, and this one is the more specific of the two /changes matchers.
+    routes.unshift({
+      match: (m, u) => m === 'GET' && u.includes('/changes') && u.includes('access_raw_diffs=true'),
+      status: 200,
+      json: { changes: [full('a.ts')] },
+    })
+
+    const files = await client().listDiffs('grp/svc', 6)
+
+    expect(files[0]!.diff).toContain('+x')
+    expect(files[0]!.collapsed).toBe(false)
+    expect(calls.some((c) => c.url.includes('access_raw_diffs=true'))).toBe(true)
+  })
+
+  it('does NOT spend the extra request when the bodies are already present', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [full('a.ts')] })
+
+    await client().listDiffs('grp/svc', 6)
+
+    expect(calls.some((c) => c.url.includes('access_raw_diffs=true'))).toBe(false)
+  })
+
+  it('keeps the genuinely collapsed result when the retry also comes back empty', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [empty('big.bin')] })
+
+    const files = await client().listDiffs('grp/svc', 6)
+
+    expect(files[0]!.collapsed).toBe(true)
+  })
+
+  it('a deleted file with an empty body is not mistaken for an offloaded diff', async () => {
+    route('GET', '/diffs', {}, 500)
+    route('GET', '/changes', { changes: [{ old_path: 'gone.ts', new_path: 'gone.ts', diff: '', deleted_file: true }] })
+
+    const files = await client().listDiffs('grp/svc', 6)
+
+    expect(files[0]!.collapsed).toBe(false)
+    expect(calls.some((c) => c.url.includes('access_raw_diffs=true'))).toBe(false)
+  })
+})

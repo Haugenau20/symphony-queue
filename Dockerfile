@@ -26,6 +26,22 @@ FROM node:22-slim AS build
 
 WORKDIR /app
 
+# The private CA has to be trusted here too, not just at runtime: behind a
+# TLS-intercepting corporate proxy it is `npm ci` that fails first, and the
+# error ("unable to get local issuer certificate") does not obviously point at
+# a missing root. See the note above the runtime stage's copy for why the whole
+# directory is copied rather than a named file.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY ca/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+# NOTE: deliberately no `ENV NODE_ENV=production` in this stage. It would make
+# `npm ci` skip devDependencies, and TypeScript is a devDependency — the build
+# would fail at `tsc`. NODE_ENV is set in the runtime stage, where it belongs.
+
 # Deps first, so a source-only change does not re-resolve the tree. The lockfile
 # is copied with package.json because `npm ci` requires both and fails loudly if
 # they disagree — which is the behaviour we want in a build.
@@ -48,9 +64,31 @@ FROM node:22-slim AS runtime
 # tini reaps zombies and forwards signals. The orchestrator installs SIGINT and
 # SIGTERM handlers to stop its poll loop and let in-flight work settle, so the
 # signal actually has to arrive as a signal rather than being swallowed by PID 1.
+#
+# ca-certificates is installed explicitly rather than relied on from the base
+# image, because `update-ca-certificates` below is what makes the optional
+# private CA take effect.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
+
+# Optional private CA, for an internal GitLab or a TLS-intercepting proxy whose
+# root neither Debian nor Node ships.
+#
+# The whole DIRECTORY is copied rather than a named file on purpose: `COPY
+# ca/company-ca.crt ...` makes the build fail for anyone who does not have that
+# exact file, which is most people. ca/ is committed containing only .gitkeep,
+# so this is a no-op by default — update-ca-certificates does nothing when it
+# finds no .crt — and drops in as many roots as you like when you need them.
+COPY ca/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
+# Node ships its own CA bundle and ignores the system store, so a certificate
+# that curl accepts inside this container would still fail here. Pointed at the
+# bundle update-ca-certificates just rebuilt rather than at one named file: that
+# is public roots PLUS every private root in ca/, so it keeps working with more
+# than one CA and does not break if ca/ is empty.
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
 ENV NODE_ENV=production
 
