@@ -91,6 +91,7 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     workspaceManager: wsManager,
     excludePaths: config.excludePaths,
     maxDiffBytes: config.maxDiffBytes,
+    keepFailedWorkspaces: config.keepFailedWorkspaces,
     // REVIEW.md's body is the prompt, exactly as WORKFLOW.md's is. It is
     // TRUSTED operator text and is passed through verbatim — deliberately not
     // rendered against merge-request fields, so no MR-authored string can ever
@@ -150,11 +151,12 @@ async function main(): Promise<void> {
   const reviewMode = process.env.SYMPHONY_MODE === 'review'
 
   // The guardrails acknowledgement exists because the implementation agent runs
-  // with edit, bash, webfetch and external_directory GRANTED. None of that is
-  // true of the reviewer: it denies all four, holds no credential, and has no
-  // network egress, so demanding the same acknowledgement would be asking the
-  // operator to agree to something that is not happening. Review mode states
-  // its posture in the log instead.
+  // with edit, bash, webfetch and external_directory GRANTED, on a real
+  // checkout, holding a token that can push. The reviewer has none of that: no
+  // shell, no egress, no way out of a disposable directory, and no credential
+  // anywhere near it. Demanding the same acknowledgement would be asking the
+  // operator to agree to something that is not happening, so review mode states
+  // its actual posture in the log instead.
   if (!reviewMode && !args.acknowledged) {
     console.error(guardrailsBanner())
     process.exit(1)

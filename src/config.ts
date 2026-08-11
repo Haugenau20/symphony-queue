@@ -295,6 +295,14 @@ const ReviewRawSchema = z.object({
   exclude_paths: z.array(z.string()).default([]),
   max_diff_bytes: z.number().int().positive().default(400000),
   per_project_max_in_flight: z.number().int().positive().default(1),
+  /**
+   * Leave the sandbox on disk when a review does not produce findings, so it can
+   * be inspected. A diagnostic, not a normal setting: they accumulate, and they
+   * contain the merge request's own content. Also settable per-run with
+   * SYMPHONY_REVIEW_KEEP_FAILED_WORKSPACES=1, which is the form you want when
+   * chasing a failure on a running deployment.
+   */
+  keep_failed_workspaces: z.boolean().default(false),
   max_concurrent_reviews: z.number().int().positive().default(2),
   reserved_review_slots: z.number().int().nonnegative().default(1),
 })
@@ -319,6 +327,12 @@ const ReviewAgentRawSchema = z.object({
  * would drift from the real one, and the whole value of validating this block
  * is that it tells the truth about what will run.
  */
+/** `1`, `true` or `yes`, case-insensitive. Anything else — including unset — is false. */
+function truthyEnv(value: string | undefined): boolean {
+  if (value === undefined) return false
+  return ['1', 'true', 'yes'].includes(value.trim().toLowerCase())
+}
+
 function enforcedReviewPermissions(): Record<string, string> {
   const map: Record<string, string> = {}
   for (const rule of REVIEW_PERMISSIONS) map[rule.permission] = rule.action
@@ -337,6 +351,7 @@ export interface ReviewConfig {
   excludePaths: string[]
   maxDiffBytes: number
   perProjectMaxInFlight: number
+  keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
   reservedReviewSlots: number
   agent: { maxTurns: number; completionMarker: string; declaredPermissions: Record<string, string> }
@@ -362,6 +377,9 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     excludePaths: rRaw.exclude_paths,
     maxDiffBytes: rRaw.max_diff_bytes,
     perProjectMaxInFlight: rRaw.per_project_max_in_flight,
+    // The environment wins, so this can be turned on for one restart without
+    // editing (and later forgetting to un-edit) a config file.
+    keepFailedWorkspaces: truthyEnv(env.SYMPHONY_REVIEW_KEEP_FAILED_WORKSPACES) || rRaw.keep_failed_workspaces,
     maxConcurrentReviews: rRaw.max_concurrent_reviews,
     reservedReviewSlots: rRaw.reserved_review_slots,
     agent: {

@@ -34,7 +34,7 @@
  * switches on `.kind`.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { PermissionRule } from '@opencode-ai/sdk/v2'
 import { getLogger } from '../log.js'
@@ -50,6 +50,9 @@ import type {
 import type { AgentRunner, RunTarget } from '../agent_runner.js'
 import type { Workspace } from '../models.js'
 import type { WorkspaceManager } from '../workspace.js'
+
+/** The one file the agent's whole session exists to produce. */
+const FINDINGS_FILENAME = 'FINDINGS.json'
 
 // --- permissions --------------------------------------------------------------
 
@@ -133,6 +136,13 @@ export interface ReviewWorkerConfig {
   maxDiffBytes?: number
   /** Overrides the built-in prompt. Trusted, operator-supplied text only — never derived from MR content. */
   promptOverride?: string
+  /**
+   * Leave the sandbox on disk when a run does NOT produce a review, so an
+   * operator can see what the agent actually wrote. Off by default: these
+   * accumulate, and they hold the merge request's own content. Turn it on while
+   * diagnosing "the agent reported complete and wrote no FINDINGS.json".
+   */
+  keepFailedWorkspaces?: boolean
 }
 
 export interface ReviewedOutcome {
@@ -342,6 +352,7 @@ export class ReviewWorker {
   private readonly excludePaths: string[]
   private readonly maxDiffBytes: number
   private readonly promptOverride: string | null
+  private readonly keepFailedWorkspaces: boolean
 
   constructor(config: ReviewWorkerConfig) {
     this.mrClient = config.mrClient
@@ -350,11 +361,15 @@ export class ReviewWorker {
     this.excludePaths = config.excludePaths ?? []
     this.maxDiffBytes = config.maxDiffBytes ?? DEFAULT_MAX_DIFF_BYTES
     this.promptOverride = config.promptOverride ?? null
+    this.keepFailedWorkspaces = config.keepFailedWorkspaces ?? false
   }
 
   async run(job: ReviewJob, signal?: AbortSignal): Promise<ReviewWorkOutcome> {
     const log = getLogger()
     const { projectId, mrIid, headSha } = job.key
+    // Drives whether the sandbox is preserved for inspection in the finally
+    // block: only a run that produced a findings document counts as succeeded.
+    let succeeded = false
 
     let summary: MergeRequestSummary | null
     try {
@@ -472,6 +487,20 @@ export class ReviewWorker {
 
       const raw = await this.readFindingsFile(ws.path)
       if (raw === null) {
+        // The single most confusing failure this pipeline has, because the run
+        // itself looks fine: the agent finished, reported completion, and left
+        // no output. Say what WAS in the workspace, so the difference between
+        // "wrote nothing at all", "wrote it under another name" and "wrote it
+        // in a subdirectory" is visible from the log instead of requiring a
+        // rerun with the sandbox preserved.
+        log.warn(
+          {
+            workspaceKey,
+            workspaceEntries: await this.describeWorkspace(ws.path),
+            keptForInspection: this.keepFailedWorkspaces,
+          },
+          'review_worker_findings_missing',
+        )
         return { kind: 'failed', reason: 'agent did not write FINDINGS.json' }
       }
 
@@ -487,18 +516,62 @@ export class ReviewWorker {
         return { kind: 'failed', reason: `FINDINGS.json failed validation: ${parsed.error}` }
       }
 
+      succeeded = true
       return {
         kind: 'reviewed',
         findings: parsed.data,
         diffFiles: reviewable.map((f) => ({ oldPath: f.oldPath, newPath: f.newPath })),
       }
     } finally {
-      // Always — success, a failed/malformed run, or the agent throwing.
-      try {
-        this.workspaceManager.removeForIssue(workspaceKey)
-      } catch (err) {
-        log.warn({ workspaceKey, error: errMsg(err) }, 'review_worker_workspace_cleanup_failed')
+      // Always — success, a failed/malformed run, or the agent throwing — with
+      // one deliberate exception. When `keepFailedWorkspaces` is on and the
+      // outcome was not a review, the sandbox is left on disk so an operator can
+      // see exactly what the agent did. Debugging "it said it was done and wrote
+      // nothing" from logs alone is close to impossible, and a disposable
+      // directory is a cheap thing to keep for a run that already failed.
+      //
+      // Off by default: these accumulate, and they contain the merge request's
+      // own content.
+      const keep = this.keepFailedWorkspaces && !succeeded
+      if (keep) {
+        log.warn({ workspaceKey, path: ws.path }, 'review_worker_workspace_kept_for_inspection')
+      } else {
+        try {
+          this.workspaceManager.removeForIssue(workspaceKey)
+        } catch (err) {
+          log.warn({ workspaceKey, error: errMsg(err) }, 'review_worker_workspace_cleanup_failed')
+        }
       }
+    }
+  }
+
+  /**
+   * What the agent actually left behind, for the log line above. Names and
+   * sizes only — never contents, which would put merge-request text and the
+   * agent's own output into the operator's log.
+   */
+  private async describeWorkspace(wsPath: string): Promise<string[]> {
+    try {
+      const entries = await readdir(wsPath, { withFileTypes: true })
+      const described: string[] = []
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          let count = 0
+          try {
+            count = (await readdir(resolve(join(wsPath, entry.name)))).length
+          } catch { /* unreadable is itself worth seeing as 0 */ }
+          described.push(`${entry.name}/ (${count} entries)`)
+        } else {
+          let size = -1
+          try {
+            size = (await stat(resolve(join(wsPath, entry.name)))).size
+          } catch { /* ditto */ }
+          described.push(`${entry.name} (${size} bytes)`)
+        }
+      }
+      return described.sort()
+    } catch (err) {
+      return [`<could not read workspace: ${errMsg(err)}>`]
     }
   }
 
@@ -549,11 +622,43 @@ export class ReviewWorker {
     await writeFile(target, content, 'utf8')
   }
 
+  /**
+   * Reads the agent's output.
+   *
+   * The exact name is asked for in the prompt, but a review that is otherwise
+   * complete should not be thrown away over the case of a filename — that is
+   * pure waste, and waste is what this pipeline is trying not to produce. So a
+   * case-insensitive match in the workspace root is accepted as a fallback, and
+   * logged rather than accepted silently, because the prompt asking for one
+   * thing and the agent doing another is worth knowing about.
+   */
   private async readFindingsFile(wsPath: string): Promise<string | null> {
+    const exact = resolve(join(wsPath, FINDINGS_FILENAME))
     try {
-      return await readFile(resolve(join(wsPath, 'FINDINGS.json')), 'utf8')
+      return await readFile(exact, 'utf8')
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        getLogger().warn({ wsPath, error: errMsg(err) }, 'review_worker_findings_read_failed')
+        return null
+      }
+    }
+
+    let variant: string | null = null
+    try {
+      const entries = await readdir(wsPath)
+      variant = entries.find((n) => n.toLowerCase() === FINDINGS_FILENAME.toLowerCase()) ?? null
+    } catch {
+      return null
+    }
+    if (variant === null) return null
+
+    const path = resolve(join(wsPath, variant))
+    checkContainment(path, wsPath)
+    try {
+      const body = await readFile(path, 'utf8')
+      getLogger().warn({ wsPath, found: variant, expected: FINDINGS_FILENAME }, 'review_worker_findings_name_mismatch')
+      return body
+    } catch (err) {
       getLogger().warn({ wsPath, error: errMsg(err) }, 'review_worker_findings_read_failed')
       return null
     }
