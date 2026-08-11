@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { shouldDispatch, dispatchKey, availableSlots, backoffDelay, SymphonyOrchestrator } from '../src/orchestrator.js'
 import { createOrchestratorState } from '../src/models.js'
 import { MemoryTracker } from '../src/tracker/memory.js'
+import { IMPLEMENTATION_PERMISSIONS } from '../src/agent_runner.js'
 import type { Issue } from '../src/models.js'
 
 function makeIssue(overrides?: Partial<Issue>): Issue {
@@ -153,6 +154,60 @@ describe('terminal workspace sweep', () => {
   })
 })
 
+describe('dispatchIssue shouldContinue', () => {
+  // AgentRunner no longer fetches issue state itself; dispatchIssue now
+  // supplies that as a shouldContinue predicate. These pin down that it
+  // reproduces refreshIssueState + isActiveState's semantics exactly,
+  // including the two "stop" paths that used to be implicit in a caught
+  // exception: no issue found, and the fetch itself failing.
+  function harness(fetchIssueStatesByIds: (ids: string[]) => Promise<Issue[]>) {
+    const tracker = {
+      fetchCandidateIssues: vi.fn().mockResolvedValue([]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue([]),
+      updateIssueState: vi.fn(async () => {}),
+      fetchIssueStatesByIds: vi.fn(fetchIssueStatesByIds),
+    }
+    const agentRunner = { run: vi.fn().mockResolvedValue({ success: true, sessionId: 's', turnsCompleted: 1 }) }
+    const orch = new SymphonyOrchestrator({ tracker: tracker as any, agentRunner: agentRunner as any })
+    return { tracker, agentRunner, orch }
+  }
+
+  async function capturedShouldContinue(orch: any, agentRunner: { run: ReturnType<typeof vi.fn> }, issue: Issue) {
+    ;(orch as any).dispatchIssue(issue)
+    await Promise.all(Array.from((orch as any).state.running.values()).map((e: any) => e.task))
+    return agentRunner.run.mock.calls[0][4].shouldContinue as () => Promise<boolean>
+  }
+
+  it('continues while the tracker still reports the issue active', async () => {
+    const { agentRunner, orch } = harness(async () => [makeIssue({ id: 'q-1', state: 'In Progress' })])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(true)
+  })
+
+  it('stops when the tracker reports a terminal state', async () => {
+    const { agentRunner, orch } = harness(async () => [makeIssue({ id: 'q-1', state: 'Done' })])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(false)
+  })
+
+  it('stops when the issue is no longer found at all', async () => {
+    // Mirrors refreshIssueState's `issues[0] ?? null` — an empty result reads
+    // as "stop", the same as a fetch error.
+    const { agentRunner, orch } = harness(async () => [])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(false)
+  })
+
+  it('stops, not throws, when the fetch itself fails', async () => {
+    // refreshIssueState's catch block returned null on error, and the loop
+    // read that as inactive. A fetch failure here must behave identically:
+    // shouldContinue resolves false rather than rejecting.
+    const { agentRunner, orch } = harness(async () => { throw new Error('tracker unreachable') })
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    await expect(shouldContinue()).resolves.toBe(false)
+  })
+})
+
 describe('dispatch hands the workspace to the runner', () => {
   it('passes the workspace path so the session is rooted there', async () => {
     // Without this the agent's session roots at the server default while its
@@ -173,6 +228,10 @@ describe('dispatch hands the workspace to the runner', () => {
     expect(agentRunner.run).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
       expect.any(AbortSignal),
+      // dispatchIssue passes the implementation pipeline's permission set
+      // explicitly now, plus a shouldContinue predicate the runner calls
+      // instead of fetching issue state itself.
+      { permissions: IMPLEMENTATION_PERMISSIONS, shouldContinue: expect.any(Function) },
     )
     expect(workspaceManager.runAfterRun).toHaveBeenCalledTimes(1)
     expect(workspaceManager.runAfterRun).toHaveBeenCalledWith(

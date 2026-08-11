@@ -3,6 +3,7 @@ import type { OrchestratorState, Issue } from './models.js'
 import { createOrchestratorState } from './models.js'
 import type { TrackerAdapter } from './tracker/base.js'
 import type { AgentRunner, AgentActivity, AgentRunResult } from './agent_runner.js'
+import { IMPLEMENTATION_PERMISSIONS } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
 
@@ -20,6 +21,18 @@ export const EXIT_STATE_NORMAL = 'In Review'
  * returns the item to todo/ when due (docs/DESIGN.md §4).
  */
 export const EXIT_STATE_ABNORMAL = 'Failed'
+
+/**
+ * The terminal states a run's `shouldContinue` check treats as "stop". This is
+ * the list AgentRunner's now-removed `isActiveState` used to hard-code
+ * in-module; it moves here with dispatchIssue, which now owns the liveness
+ * check the runner used to make on its behalf. Deliberately its own list
+ * rather than a reuse of `terminalStates` above (the configurable, exact-case
+ * list `reconcileTrackerStates` compares against) — that field can be
+ * reconfigured per-workflow, and swapping it in here would change today's
+ * dispatch behaviour instead of preserving it.
+ */
+const TERMINAL = ['closed', 'cancelled', 'canceled', 'duplicate', 'done']
 
 export function dispatchKey(issue: Issue): [number, number, string] {
   const prio = issue.priority ?? 9999
@@ -347,7 +360,21 @@ export class SymphonyOrchestrator {
         // but still holding the workspace and still talking to the model.
         let result: AgentRunResult
         try {
-          result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
+          result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal, {
+            permissions: IMPLEMENTATION_PERMISSIONS,
+            // Mirrors what the runner used to do internally via
+            // issueStateFetcher + isActiveState: a fetch failure must behave
+            // exactly as it did before, i.e. as "stop" — refreshIssueState's
+            // catch block returned null on error, which read as inactive.
+            shouldContinue: async () => {
+              try {
+                const [fresh] = await this.tracker.fetchIssueStatesByIds([issue.id])
+                return fresh !== undefined && !TERMINAL.includes(fresh.state.toLowerCase())
+              } catch {
+                return false
+              }
+            },
+          })
         } finally {
           // after_run is paired with the agent invocation, not with a
           // successful result. Cleanup and publication hooks still need to run
