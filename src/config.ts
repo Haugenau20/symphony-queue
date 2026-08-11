@@ -271,3 +271,142 @@ export function validateCompletionSignal(cfg: ServiceConfig, promptTemplate: str
     + 'to accept that runs always use every turn.',
   ]
 }
+
+// --- review pipeline configuration -------------------------------------------
+//
+// REVIEW.md is a second, independent config file (design §13): same
+// front-matter-plus-prompt shape as WORKFLOW.md, parsed by the same loader,
+// but describing the merge-request review pipeline instead of issue dispatch.
+// A review-only deployment ships REVIEW.md and NO WORKFLOW.md at all, which is
+// why this lives beside `buildServiceConfig` rather than inside it.
+
+const ReviewRawSchema = z.object({
+  base_url: z.string().default(''),
+  /** Whole-group coverage: one API call per poll regardless of project count. */
+  group_id: z.string().optional(),
+  /** Staged rollout: an explicit list, so adding a repository is a deliberate act. */
+  projects: z.array(z.string()).default([]),
+  poll_interval_ms: z.number().int().positive().default(60000),
+  include_drafts: z.boolean().default(false),
+  skip_forks: z.boolean().default(true),
+  rereview_on_new_head: z.boolean().default(true),
+  max_attempts: z.number().int().positive().default(3),
+  exclude_paths: z.array(z.string()).default([]),
+  max_diff_bytes: z.number().int().positive().default(400000),
+  per_project_max_in_flight: z.number().int().positive().default(1),
+  max_concurrent_reviews: z.number().int().positive().default(2),
+  reserved_review_slots: z.number().int().nonnegative().default(1),
+})
+
+const ReviewAgentRawSchema = z.object({
+  max_turns: z.number().int().positive().default(10),
+  completion_marker: z.string().default('SYMPHONY_REVIEW_DONE'),
+  /**
+   * Documentation of what the code already enforces, not a control surface.
+   * `REVIEW_PERMISSIONS` in review/worker.ts is the enforcement point and is
+   * deliberately not configurable — a config file that could grant the review
+   * agent `edit` or `bash` would dissolve the sandbox the whole design rests
+   * on. Validation below REJECTS any attempt to loosen these, so the block
+   * behaves as a checked assertion rather than decoration.
+   */
+  permissions: z.record(z.string()).default({}),
+})
+
+/** Permissions the review agent must never hold. Mirrors REVIEW_PERMISSIONS. */
+export const REVIEW_DENIED_PERMISSIONS = ['edit', 'bash', 'webfetch', 'external_directory'] as const
+
+export interface ReviewConfig {
+  baseUrl: string
+  groupId: string | null
+  projects: string[]
+  pollIntervalMs: number
+  includeDrafts: boolean
+  skipForks: boolean
+  rereviewOnNewHead: boolean
+  maxAttempts: number
+  excludePaths: string[]
+  maxDiffBytes: number
+  perProjectMaxInFlight: number
+  maxConcurrentReviews: number
+  reservedReviewSlots: number
+  agent: { maxTurns: number; completionMarker: string; declaredPermissions: Record<string, string> }
+  /** From the environment, never the file — these are deployment paths, not workflow content. */
+  storeRoot: string
+  workspacesRoot: string
+}
+
+export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv = process.env): ReviewConfig {
+  const root = wf.config as Record<string, unknown>
+  const rRaw = ReviewRawSchema.parse((root.review as object) ?? {})
+  const aRaw = ReviewAgentRawSchema.parse((root.agent as object) ?? {})
+
+  return {
+    baseUrl: rRaw.base_url,
+    groupId: rRaw.group_id ?? null,
+    projects: rRaw.projects,
+    pollIntervalMs: rRaw.poll_interval_ms,
+    includeDrafts: rRaw.include_drafts,
+    skipForks: rRaw.skip_forks,
+    rereviewOnNewHead: rRaw.rereview_on_new_head,
+    maxAttempts: rRaw.max_attempts,
+    excludePaths: rRaw.exclude_paths,
+    maxDiffBytes: rRaw.max_diff_bytes,
+    perProjectMaxInFlight: rRaw.per_project_max_in_flight,
+    maxConcurrentReviews: rRaw.max_concurrent_reviews,
+    reservedReviewSlots: rRaw.reserved_review_slots,
+    agent: {
+      maxTurns: aRaw.max_turns,
+      completionMarker: aRaw.completion_marker,
+      declaredPermissions: aRaw.permissions,
+    },
+    storeRoot: env.SYMPHONY_REVIEW_STORE_ROOT ?? '',
+    workspacesRoot: env.SYMPHONY_REVIEW_WORKSPACES_ROOT ?? '',
+  }
+}
+
+/**
+ * Every way a review deployment can be misconfigured such that it would start
+ * and then do something unintended. Checked before anything is dispatched, for
+ * the same reason `validateDispatchConfig` is: an unattended misconfiguration
+ * surfaces hours later as strange behaviour, not as an error at a prompt.
+ */
+export function validateReviewConfig(cfg: ReviewConfig, env: NodeJS.ProcessEnv = process.env): string[] {
+  const errors: string[] = []
+
+  if (!cfg.baseUrl) errors.push('review.base_url is required')
+  if (!cfg.groupId && cfg.projects.length === 0) {
+    errors.push('review.group_id or a non-empty review.projects list is required — otherwise the reviewer watches nothing')
+  }
+
+  // Same rule as the tracker token (DESIGN.md §10): from the environment only.
+  // There is deliberately no config key that could hold it.
+  if (!env.SYMPHONY_REVIEW_GITLAB_TOKEN) {
+    errors.push('SYMPHONY_REVIEW_GITLAB_TOKEN must be set in the environment for the review pipeline')
+  }
+
+  if (!cfg.storeRoot) errors.push('SYMPHONY_REVIEW_STORE_ROOT must be set in the environment')
+  if (!cfg.workspacesRoot) errors.push('SYMPHONY_REVIEW_WORKSPACES_ROOT must be set in the environment')
+  if (cfg.storeRoot && cfg.workspacesRoot && cfg.storeRoot === cfg.workspacesRoot) {
+    errors.push('SYMPHONY_REVIEW_STORE_ROOT and SYMPHONY_REVIEW_WORKSPACES_ROOT must differ — durable job state must not share a directory with disposable sandboxes')
+  }
+
+  if (cfg.reservedReviewSlots > cfg.maxConcurrentReviews) {
+    errors.push('review.reserved_review_slots cannot exceed review.max_concurrent_reviews')
+  }
+
+  // The permissions block is an assertion about the sandbox, not a control.
+  // Refusing to start on a loosening attempt is the point: it means a REVIEW.md
+  // that *believes* it granted the agent bash is a startup failure, not a
+  // silently ignored line that misleads whoever reads the file later.
+  for (const name of REVIEW_DENIED_PERMISSIONS) {
+    const declared = cfg.agent.declaredPermissions[name]
+    if (declared !== undefined && declared !== 'deny') {
+      errors.push(
+        `agent.permissions.${name} is "${declared}", but the review agent always denies ${name}. `
+        + 'This block documents the sandbox; it cannot widen it. Remove the line or set it to "deny".',
+      )
+    }
+  }
+
+  return errors
+}
