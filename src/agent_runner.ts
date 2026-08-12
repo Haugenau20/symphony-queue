@@ -41,6 +41,17 @@ export interface AgentRunResult {
    * that finished and one that ran out of runway looked identical.
    */
   stopReason?: 'completed' | 'max_turns' | 'issue_inactive'
+  /**
+   * The agent's last reply, verbatim. Nothing acts on it — it exists so a caller
+   * can say what the agent claimed when the run produced no usable artefact.
+   * The review pipeline's worst failure ("reported complete, wrote no
+   * FINDINGS.json") is otherwise invisible: the run looks like a success and
+   * leaves nothing behind to explain itself.
+   *
+   * Treat it as UNTRUSTED. It is model output over merge-request content, so it
+   * belongs in a diagnostic log line and nowhere near a published artefact.
+   */
+  finalText?: string
 }
 
 /** One observed sign of life from a running agent. */
@@ -220,9 +231,10 @@ export class AgentRunner {
       let turnsCompleted = 1
       this.reportActivity(target.id, sessionId, 'turn_completed')
       const marker = this.config.completionMarker ?? ''
-      if (declaresCompletion(promptText(result.data), marker)) {
+      let finalText = promptText(result.data)
+      if (declaresCompletion(finalText, marker)) {
         log.info({ issueId: target.id, turnsCompleted }, 'agent_reported_complete')
-        return { sessionId, success: true, turnsCompleted, stopReason: 'completed' }
+        return { sessionId, success: true, turnsCompleted, stopReason: 'completed', finalText }
       }
 
       let stopReason: AgentRunResult['stopReason'] = 'max_turns'
@@ -258,7 +270,8 @@ export class AgentRunner {
         // owns that label and only moves it afterwards), so shouldContinue is
         // true every time, and an agent that finished at turn 3 gets told
         // "the work is not finished" for every remaining turn.
-        if (declaresCompletion(promptText(contResult.data), marker)) {
+        finalText = promptText(contResult.data)
+        if (declaresCompletion(finalText, marker)) {
           log.info({ issueId: target.id, turnsCompleted }, 'agent_reported_complete')
           stopReason = 'completed'
           break
@@ -271,7 +284,7 @@ export class AgentRunner {
         log.warn({ issueId: target.id, turnsCompleted }, 'agent_run_hit_max_turns')
       }
       log.info({ issueId: target.id, turnsCompleted, stopReason }, 'agent_run_completed')
-      return { sessionId, success: true, turnsCompleted, stopReason }
+      return { sessionId, success: true, turnsCompleted, stopReason, finalText }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error({ issueId: target.id, error: message }, 'agent_run_failed')

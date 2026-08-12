@@ -232,9 +232,30 @@ describe('REVIEW_PERMISSIONS', () => {
   })
 
   it('never hands the agent a credential-bearing or network permission', () => {
-    const allowed = REVIEW_PERMISSIONS.filter((r) => r.action === 'allow').map((r) => r.permission).sort()
+    const allowed = REVIEW_PERMISSIONS.filter((r) => r.action === 'allow').map((r) => r.permission)
 
-    expect(allowed).toEqual(['doom_loop', 'edit'])
+    // Everything granted is a local read, a local write, or the SDK's own
+    // loop-recovery. Nothing here can execute, reach the network, or escape.
+    expect(allowed.sort()).toEqual(
+      ['doom_loop', 'edit', 'glob', 'grep', 'list', 'patch', 'read', 'write'],
+    )
+    for (const denied of ['bash', 'webfetch', 'external_directory']) {
+      expect(allowed).not.toContain(denied)
+    }
+  })
+
+  /**
+   * Regression for the first real deployment's failure: the agent reported
+   * completion in under a minute having written nothing. If a supplied ruleset
+   * is exhaustive rather than additive, granting only `edit` leaves the agent
+   * unable to READ its own material, which looks exactly like that.
+   */
+  it('grants the read side too, not just the write — an agent that cannot read reviews nothing', () => {
+    for (const perm of ['read', 'list', 'glob', 'grep']) {
+      const rules = REVIEW_PERMISSIONS.filter((r) => r.permission === perm)
+      expect(rules.length, `${perm} must be granted explicitly`).toBeGreaterThan(0)
+      expect(rules.every((r) => r.action === 'allow')).toBe(true)
+    }
   })
 })
 
@@ -303,7 +324,9 @@ describe('ReviewWorker — happy path', () => {
       expect.anything(),
       expect.any(String),
       expect.any(String),
-      undefined,
+      // Always a signal, even with no external one: the worker adds its own
+      // deadline so a hung session cannot hold a slot indefinitely.
+      expect.any(AbortSignal),
       expect.objectContaining({ permissions: REVIEW_PERMISSIONS }),
     )
   })
@@ -775,5 +798,103 @@ describe('ReviewWorker — diagnosing a run that produced no findings', () => {
     }
 
     expect((await worker({ mrClient: client, agentRunner: agent }).run(job())).kind).toBe('failed')
+  })
+})
+
+describe('ReviewWorker — a hung agent cannot hold its slot forever', () => {
+  /**
+   * The ten-hour hang, as a test. Review mode was constructed without
+   * `sessionTimeoutMs`, so AgentRunner applied no deadline to session.prompt —
+   * and this lane has no stall detector either. A session that never settled
+   * pinned its concurrency slot indefinitely, with nothing logged after
+   * `session_created`. The worker now enforces its own deadline regardless of
+   * how the runner was configured.
+   */
+  it('gives up on an agent run that never settles, instead of awaiting it forever', async () => {
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    const neverSettles = {
+      run: (_t: unknown, _p: string, _ws?: string | null, signal?: AbortSignal) =>
+        new Promise<never>((_resolve, reject) => {
+          // What the SDK does on abort: reject the in-flight call.
+          signal?.addEventListener('abort', () => reject(new Error('aborted')))
+        }),
+    }
+
+    // Settles rather than hanging. The worker surfaces the abort as a rejection
+    // and ReviewJobRunner records it as a retryable failure — which is what
+    // releases the concurrency slot. Before the deadline existed, this promise
+    // never settled at all.
+    await expect(
+      worker({ mrClient: client, agentRunner: neverSettles as never, agentTimeoutMs: 60 }).run(job()),
+    ).rejects.toThrow()
+  })
+
+  it('passes a signal that is already aborted through as a failure, not a hang', async () => {
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    const ac = new AbortController()
+    ac.abort()
+    const respectsSignal = {
+      run: async (_t: unknown, _p: string, _ws?: string | null, signal?: AbortSignal) => {
+        if (signal?.aborted) throw new Error('aborted before start')
+        return { sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+      },
+    }
+
+    await expect(
+      worker({ mrClient: client, agentRunner: respectsSignal as never }).run(job(), ac.signal),
+    ).rejects.toThrow()
+  })
+
+  it('reports what the agent said when it finished without writing findings', async () => {
+    const logged: Array<Record<string, unknown>> = []
+    const spy = vi.spyOn(getLogger(), 'warn').mockImplementation(((obj: unknown) => {
+      logged.push(obj as Record<string, unknown>)
+      return undefined
+    }) as never)
+
+    try {
+      const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+      const chatty = {
+        run: async () => ({
+          sessionId: 's',
+          success: true,
+          turnsCompleted: 1,
+          stopReason: 'completed' as const,
+          finalText: '### Findings\n- nothing to report here\nSYMPHONY_REVIEW_DONE',
+        }),
+      }
+
+      await worker({ mrClient: client, agentRunner: chatty as never }).run(job())
+
+      const entry = logged.find((l) => 'agentSaid' in l)
+      expect(entry).toBeDefined()
+      // This is what tells an operator the agent answered in prose instead of
+      // writing the file — the difference between a prompt bug and a tool bug.
+      expect(String(entry!.agentSaid)).toContain('nothing to report here')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('says so explicitly when the agent produced no text at all', async () => {
+    const logged: Array<Record<string, unknown>> = []
+    const spy = vi.spyOn(getLogger(), 'warn').mockImplementation(((obj: unknown) => {
+      logged.push(obj as Record<string, unknown>)
+      return undefined
+    }) as never)
+
+    try {
+      const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+      const silent = {
+        run: async () => ({ sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }),
+      }
+
+      await worker({ mrClient: client, agentRunner: silent as never }).run(job())
+
+      const entry = logged.find((l) => 'agentSaid' in l)
+      expect(String(entry!.agentSaid)).toContain('said nothing at all')
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

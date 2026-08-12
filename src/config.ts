@@ -309,6 +309,13 @@ const ReviewRawSchema = z.object({
 
 const ReviewAgentRawSchema = z.object({
   max_turns: z.number().int().positive().default(10),
+  /**
+   * Ceiling on one agent run. Review mode originally passed no timeout at all,
+   * and a hung OpenCode session held its slot for ten hours without so much as
+   * a warning — there is no stall detector on this lane to catch it either.
+   * 15 minutes is generous for reading one diff.
+   */
+  session_timeout_ms: z.number().int().positive().default(900_000),
   completion_marker: z.string().default('SYMPHONY_REVIEW_DONE'),
   /**
    * Documentation of what the code already enforces, not a control surface.
@@ -354,7 +361,12 @@ export interface ReviewConfig {
   keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
   reservedReviewSlots: number
-  agent: { maxTurns: number; completionMarker: string; declaredPermissions: Record<string, string> }
+  agent: {
+    maxTurns: number
+    completionMarker: string
+    sessionTimeoutMs: number
+    declaredPermissions: Record<string, string>
+  }
   /** From the environment, never the file — these are deployment paths, not workflow content. */
   storeRoot: string
   workspacesRoot: string
@@ -385,6 +397,7 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     agent: {
       maxTurns: aRaw.max_turns,
       completionMarker: aRaw.completion_marker,
+      sessionTimeoutMs: aRaw.session_timeout_ms,
       declaredPermissions: aRaw.permissions,
     },
     storeRoot: env.SYMPHONY_REVIEW_STORE_ROOT ?? '',

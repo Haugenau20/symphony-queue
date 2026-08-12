@@ -83,6 +83,10 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
   const agentRunner = new AgentRunner(clientFor, {
     maxTurns: config.agent.maxTurns,
     completionMarker: config.agent.completionMarker,
+    // Not optional in practice: without it the runner applies no deadline to
+    // session.prompt, and this lane has no stall detector to notice. A hung
+    // session otherwise holds its concurrency slot indefinitely.
+    sessionTimeoutMs: config.agent.sessionTimeoutMs,
   })
 
   const worker = new ReviewWorker({
@@ -92,6 +96,9 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     excludePaths: config.excludePaths,
     maxDiffBytes: config.maxDiffBytes,
     keepFailedWorkspaces: config.keepFailedWorkspaces,
+    // Slightly beyond the runner's own deadline, so the runner's cleaner error
+    // normally wins and this stays a backstop rather than the usual path.
+    agentTimeoutMs: config.agent.sessionTimeoutMs + 60_000,
     // REVIEW.md's body is the prompt, exactly as WORKFLOW.md's is. It is
     // TRUSTED operator text and is passed through verbatim — deliberately not
     // rendered against merge-request fields, so no MR-authored string can ever

@@ -51,6 +51,13 @@ import type { AgentRunner, RunTarget } from '../agent_runner.js'
 import type { Workspace } from '../models.js'
 import type { WorkspaceManager } from '../workspace.js'
 
+/** First `limit` characters, with an explicit marker when there was more. */
+function truncate(text: string, limit: number): string {
+  const clean = text.trim()
+  if (clean.length === 0) return '<the agent said nothing at all>'
+  return clean.length > limit ? `${clean.slice(0, limit)}… [${clean.length} chars total]` : clean
+}
+
 /** The one file the agent's whole session exists to produce. */
 const FINDINGS_FILENAME = 'FINDINGS.json'
 
@@ -101,6 +108,25 @@ export const REVIEW_PERMISSIONS: PermissionRule[] = [
   // Allowed so the agent can write FINDINGS.json — see the note above. Confined
   // to the sandbox by external_directory, not by this rule.
   { permission: 'edit', pattern: '*', action: 'allow' },
+  // The rest of the read-and-write-one-file family, named explicitly.
+  //
+  // The SDK types `permission` as a bare `string` and enumerate nothing, so
+  // which tool each name gates — and whether a supplied ruleset is additive or
+  // exhaustive — is not knowable from this side. If it is EXHAUSTIVE, then
+  // listing only `edit` denies the agent `read`, and an agent that can read
+  // nothing and write nothing reports back in seconds having done nothing:
+  // exactly the failure this pipeline hit on its first real run.
+  //
+  // So the tools a reviewer legitimately needs are granted by name. Every one of
+  // these is a local read or a local write inside a disposable directory; none
+  // grants execution, egress, or a way out. The three that would are denied
+  // below, and those are the boundary.
+  { permission: 'read', pattern: '*', action: 'allow' },
+  { permission: 'write', pattern: '*', action: 'allow' },
+  { permission: 'patch', pattern: '*', action: 'allow' },
+  { permission: 'list', pattern: '*', action: 'allow' },
+  { permission: 'glob', pattern: '*', action: 'allow' },
+  { permission: 'grep', pattern: '*', action: 'allow' },
   { permission: 'bash', pattern: '*', action: 'deny' },
   { permission: 'webfetch', pattern: '*', action: 'deny' },
   { permission: 'external_directory', pattern: '*', action: 'deny' },
@@ -143,6 +169,15 @@ export interface ReviewWorkerConfig {
    * diagnosing "the agent reported complete and wrote no FINDINGS.json".
    */
   keepFailedWorkspaces?: boolean
+  /**
+   * Hard ceiling on one agent run, enforced here rather than trusted to the
+   * caller. AgentRunner applies its own `sessionTimeoutMs` when it is given one
+   * — and review mode originally was not, so a hung session held its
+   * concurrency slot for ten hours with no timeout and no stall detector. This
+   * is the backstop that makes that impossible regardless of how the runner is
+   * configured. Defaults to 15 minutes.
+   */
+  agentTimeoutMs?: number
 }
 
 export interface ReviewedOutcome {
@@ -353,6 +388,7 @@ export class ReviewWorker {
   private readonly maxDiffBytes: number
   private readonly promptOverride: string | null
   private readonly keepFailedWorkspaces: boolean
+  private readonly agentTimeoutMs: number
 
   constructor(config: ReviewWorkerConfig) {
     this.mrClient = config.mrClient
@@ -362,6 +398,7 @@ export class ReviewWorker {
     this.maxDiffBytes = config.maxDiffBytes ?? DEFAULT_MAX_DIFF_BYTES
     this.promptOverride = config.promptOverride ?? null
     this.keepFailedWorkspaces = config.keepFailedWorkspaces ?? false
+    this.agentTimeoutMs = config.agentTimeoutMs ?? 900_000
   }
 
   async run(job: ReviewJob, signal?: AbortSignal): Promise<ReviewWorkOutcome> {
@@ -466,7 +503,12 @@ export class ReviewWorker {
       }
       const prompt = this.promptOverride ?? buildReviewPrompt(ws.path)
 
-      const result = await this.agentRunner.run(target, prompt, ws.path, signal, {
+      // The external signal cancels on stop(); the timeout guarantees the run
+      // ends even if the SDK call never settles.
+      const deadline = AbortSignal.timeout(this.agentTimeoutMs)
+      const runSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+
+      const result = await this.agentRunner.run(target, prompt, ws.path, runSignal, {
         permissions: REVIEW_PERMISSIONS,
         // A new commit mid-review ends the run: the material the agent is
         // looking at is now stale, and the publisher will refuse to post
@@ -498,6 +540,11 @@ export class ReviewWorker {
             workspaceKey,
             workspaceEntries: await this.describeWorkspace(ws.path),
             keptForInspection: this.keepFailedWorkspaces,
+            // What the agent SAID it did, truncated. This is the line that
+            // separates "wrote its findings into the reply instead of the file"
+            // from "could not read anything" from "decided there was nothing to
+            // report". Untrusted model output, so it is logged and nothing more.
+            agentSaid: truncate(result.finalText ?? '', 1200),
           },
           'review_worker_findings_missing',
         )
