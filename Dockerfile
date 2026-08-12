@@ -68,8 +68,14 @@ FROM node:22-slim AS runtime
 # ca-certificates is installed explicitly rather than relied on from the base
 # image, because `update-ca-certificates` below is what makes the optional
 # private CA take effect.
+#
+# gosu drops privileges to `dev` in the entrypoint. That matters more than it
+# looks: the agent container runs as uid 1000, and it has to WRITE into the same
+# bind-mounted workspace this process creates. A root-owned 0755 directory is
+# readable by the agent and not writable, which surfaces as the agent reading its
+# material happily and then failing every write.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tini \
+ && apt-get install -y --no-install-recommends ca-certificates gosu tini \
  && rm -rf /var/lib/apt/lists/*
 
 # Optional private CA, for an internal GitLab or a TLS-intercepting proxy whose
@@ -101,12 +107,13 @@ COPY docker-entrypoint.sh /usr/local/bin/symphony-entrypoint
 
 RUN chmod +x /usr/local/bin/symphony-entrypoint
 
-# Runs as root by default, matching the rest of this stack: every persistent
-# path is a host bind mount (/queue, /workspaces, /review-store,
-# /review-workspaces) created by the launcher, and a fixed non-root UID inside
-# the container would have to match whatever owns those directories on the host
-# to be able to write to them. Override with `--user` (or compose's `user:`) if
-# your host directories are owned by a known UID and you want the container to
-# drop privileges — nothing in the orchestrator needs root.
+# `dev` at uid 1000, matching the agent image's own user. The entrypoint remaps
+# it to HOST_UID/HOST_GID when those are set (the launcher always sets them) and
+# then executes as that user via gosu.
+#
+# Starting as root is deliberate and temporary: the entrypoint needs root to
+# usermod and to chown the bind-mounted volumes, and drops privileges before the
+# orchestrator itself ever runs. Nothing in the orchestrator needs root.
+RUN useradd -m -u 1000 -s /bin/bash dev
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/symphony-entrypoint"]
