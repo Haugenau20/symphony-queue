@@ -107,13 +107,33 @@ COPY docker-entrypoint.sh /usr/local/bin/symphony-entrypoint
 
 RUN chmod +x /usr/local/bin/symphony-entrypoint
 
-# `dev` at uid 1000, matching the agent image's own user. The entrypoint remaps
-# it to HOST_UID/HOST_GID when those are set (the launcher always sets them) and
-# then executes as that user via gosu.
+# A `dev` user at uid 1000, matching the agent image's own user. The entrypoint
+# remaps it to HOST_UID/HOST_GID when those are set (the launcher always sets
+# them) and then executes as that user via gosu.
 #
 # Starting as root is deliberate and temporary: the entrypoint needs root to
 # usermod and to chown the bind-mounted volumes, and drops privileges before the
 # orchestrator itself ever runs. Nothing in the orchestrator needs root.
-RUN useradd -m -u 1000 -s /bin/bash dev
+#
+# node:22-slim already ships a `node` user AT uid 1000, so `useradd -u 1000`
+# fails with "UID 1000 is not unique". Rename that user rather than fight it:
+# the uid is what has to match the agent container, and the name is internal to
+# this image's entrypoint. The else branch keeps this working on a base image
+# that has no such user (the agent image builds from debian:bookworm-slim, where
+# 1000 is free).
+RUN if id -u node >/dev/null 2>&1; then \
+      usermod -l dev -d /home/dev -m node \
+      && groupmod -n dev node; \
+    else \
+      groupadd -g 1000 dev \
+      && useradd -m -u 1000 -g 1000 -s /bin/bash dev; \
+    fi \
+ && id dev
+
+# gosu preserves the environment, so without this HOME would still be /root
+# after dropping privileges — and anything that writes a cache under ~ would
+# fail on a directory it cannot touch. Nothing here does today; this is one line
+# against a class of confusing failure rather than a fix for a known one.
+ENV HOME=/home/dev
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/symphony-entrypoint"]
