@@ -312,7 +312,7 @@ describe('ReviewWorker — happy path', () => {
     expect(existsSync(join(root, 'mr-412-deadbeef'))).toBe(false)
   })
 
-  it('uses a workspace key of mr-<iid>-<short-sha>, which cannot collide with issue-<n> keys', async () => {
+  it('uses a workspace key of mr-<project>-<iid>-<short-sha>, which cannot collide with issue-<n> keys', async () => {
     const client = fakeClient({ summaries: [summary({ headSha: 'abcdef0123456789' })] })
     let seenPath: string | null = null
     const agent = agentWritingFindings(validFindings(), { captureWorkspace: (p) => { seenPath = p } })
@@ -320,7 +320,9 @@ describe('ReviewWorker — happy path', () => {
 
     await w.run(job({ key: key({ mrIid: 999, headSha: 'abcdef0123456789' }) }))
 
-    expect(seenPath).toBe(join(root, 'mr-999-abcdef01'))
+    // Project-qualified, so the same iid in two repositories cannot share a
+    // directory. Still `mr-`-prefixed, so it cannot collide with `issue-<n>`.
+    expect(seenPath).toBe(join(root, 'mr-my-org_service-a-999-abcdef01'))
   })
 
   it('passes REVIEW_PERMISSIONS to the agent runner, not some other set', async () => {
@@ -905,6 +907,130 @@ describe('ReviewWorker — a hung agent cannot hold its slot forever', () => {
       expect(String(entry!.agentSaid)).toContain('said nothing at all')
     } finally {
       spy.mockRestore()
+    }
+  })
+})
+
+describe('ReviewWorker — one sandbox per job, and nothing left over in it', () => {
+  /**
+   * The concurrency question. Every review writes a file called FINDINGS.json,
+   * so the isolation has to come from the DIRECTORY. Two merge requests being
+   * reviewed at the same time must not be able to see each other's output.
+   */
+  it('gives two concurrent merge requests different workspaces', async () => {
+    const seen: string[] = []
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    const agent = agentWritingFindings(validFindings(), { captureWorkspace: (p) => { seen.push(p) } })
+    const w = worker({ mrClient: client, agentRunner: agent })
+
+    await w.run(job({ key: key({ mrIid: 7 }) }))
+    await w.run(job({ key: key({ mrIid: 8 }) }))
+
+    expect(seen).toHaveLength(2)
+    expect(seen[0]).not.toBe(seen[1])
+  })
+
+  /**
+   * And the case that made the key project-qualified: watching a whole group
+   * means iids repeat across projects, so `!7` in two repositories is ordinary.
+   * Keyed on iid and short sha alone, those two shared a directory whenever the
+   * short shas coincided.
+   */
+  it('gives the same iid in two different projects different workspaces', async () => {
+    const seen: string[] = []
+    const HEAD = 'cafe1234beef'
+    // The summary's head sha must match the job key, or the worker correctly
+    // refuses the job as stale and the agent never runs at all.
+    const client = fakeClient({
+      summaries: [summary({ headSha: HEAD })],
+      diffs: [diffFile({ newPath: 'a.ts' })],
+    })
+    const agent = agentWritingFindings(validFindings(), { captureWorkspace: (p) => { seen.push(p) } })
+    const w = worker({ mrClient: client, agentRunner: agent })
+
+    // Same iid AND the same head sha — the worst case, and the pair the old key
+    // could not tell apart.
+    await w.run(job({ key: key({ projectId: 'grp/service-a', mrIid: 7, headSha: HEAD }) }))
+    await w.run(job({ key: key({ projectId: 'grp/service-b', mrIid: 7, headSha: HEAD }) }))
+
+    expect(seen).toHaveLength(2)
+    expect(seen[0]).not.toBe(seen[1])
+  })
+
+  /**
+   * A retry reuses the workspace, because createForIssue reuses an existing
+   * directory and removal is best-effort (and deliberately skipped entirely by
+   * keepFailedWorkspaces). So a findings file from the previous attempt can still
+   * be sitting there — and if this attempt's agent writes nothing, reading it
+   * would publish the OLD document as though it were fresh.
+   */
+  it('does not read a findings file left behind by a previous attempt', async () => {
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    let captured = ''
+
+    // Attempt 1: writes findings, and the sandbox is deliberately preserved.
+    const writing = agentWritingFindings(validFindings(), { captureWorkspace: (p) => { captured = p } })
+    const first = await worker({
+      mrClient: client, agentRunner: writing, keepFailedWorkspaces: true,
+    }).run(job())
+    expect(first.kind).toBe('reviewed')
+
+    // Put the file back, standing in for an attempt that failed AFTER writing it
+    // (a rejected document, say) with the workspace kept for inspection.
+    mkdirSync(captured, { recursive: true })
+    writeFileSync(join(captured, 'FINDINGS.json'), JSON.stringify(validFindings()), 'utf8')
+
+    // Attempt 2: the agent writes NOTHING. The stale file must not be adopted.
+    const silent = {
+      run: async () => ({ sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }),
+    }
+    const second = await worker({
+      mrClient: client, agentRunner: silent as never, keepFailedWorkspaces: true,
+    }).run(job())
+
+    expect(second.kind).toBe('failed')
+    if (second.kind === 'failed') expect(second.reason).toContain('did not write FINDINGS.json')
+  })
+
+  it('clears a case-variant leftover too, since the reader would accept one', async () => {
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    let captured = ''
+
+    const writing = agentWritingFindings(validFindings(), { captureWorkspace: (p) => { captured = p } })
+    await worker({ mrClient: client, agentRunner: writing, keepFailedWorkspaces: true }).run(job())
+
+    mkdirSync(captured, { recursive: true })
+    writeFileSync(join(captured, 'findings.json'), JSON.stringify(validFindings()), 'utf8')
+
+    const silent = {
+      run: async () => ({ sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }),
+    }
+    const outcome = await worker({
+      mrClient: client, agentRunner: silent as never, keepFailedWorkspaces: true,
+    }).run(job())
+
+    expect(outcome.kind).toBe('failed')
+  })
+
+  it('a fresh run in a reused workspace still publishes THIS run findings', async () => {
+    const client = fakeClient({ diffs: [diffFile({ newPath: 'a.ts' })] })
+    let captured = ''
+
+    const stale = { summary: 'STALE FROM THE PREVIOUS ATTEMPT', findings: [] }
+    const firstAgent = agentWritingFindings(stale, { captureWorkspace: (p) => { captured = p } })
+    await worker({ mrClient: client, agentRunner: firstAgent, keepFailedWorkspaces: true }).run(job())
+    mkdirSync(captured, { recursive: true })
+    writeFileSync(join(captured, 'FINDINGS.json'), JSON.stringify(stale), 'utf8')
+
+    const fresh = agentWritingFindings({ summary: 'FRESH THIS ATTEMPT', findings: [] })
+    const outcome = await worker({
+      mrClient: client, agentRunner: fresh, keepFailedWorkspaces: true,
+    }).run(job())
+
+    expect(outcome.kind).toBe('reviewed')
+    if (outcome.kind === 'reviewed') {
+      expect(outcome.findings.summary).toBe('FRESH THIS ATTEMPT')
+      expect(outcome.findings.summary).not.toContain('STALE')
     }
   })
 })

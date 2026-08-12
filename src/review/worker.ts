@@ -35,7 +35,7 @@
  * switches on `.kind`.
  */
 
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { PermissionRule } from '@opencode-ai/sdk/v2'
 import { getLogger } from '../log.js'
@@ -482,7 +482,16 @@ export class ReviewWorker {
     }
 
     const shortSha = headSha.slice(0, 8)
-    const workspaceKey = `mr-${mrIid}-${shortSha}`
+    // Project-qualified on purpose. The primary deployment watches a whole
+    // GROUP, so merge-request iids repeat across projects constantly: `!7` in
+    // two repositories is ordinary, not exotic. Keying on iid and short sha
+    // alone left one directory shared between them whenever the two short shas
+    // happened to agree — a 1-in-4-billion coincidence, but the failure it
+    // produces is two concurrent reviews writing each other's FINDINGS.json,
+    // which is the worst possible way to find out. The `mr-` prefix still keeps
+    // these clear of the implementation lane's `issue-<n>` keys, and
+    // sanitizeWorkspaceKey flattens the slashes in the project path.
+    const workspaceKey = `mr-${projectId}-${mrIid}-${shortSha}`
     const ws = this.workspaceManager.createForIssue(workspaceKey)
     try {
       await this.writeSandbox(ws, job, summary, reviewable, excludedPaths, collapsedPaths, fileContents)
@@ -493,6 +502,15 @@ export class ReviewWorker {
         title: summary.title,
       }
       const prompt = this.promptOverride ?? buildReviewPrompt(ws.path)
+
+      // A workspace can outlive an attempt: removal is best-effort, and
+      // keepFailedWorkspaces preserves it deliberately. createForIssue then
+      // REUSES that directory on the retry, so a findings file from the previous
+      // attempt would still be sitting there — and if this attempt's agent
+      // writes nothing, the worker would read the old document and publish it as
+      // though it were fresh. Clear it first, so anything read afterwards can
+      // only have come from this run.
+      await this.clearStaleFindings(ws.path)
 
       // The external signal cancels on stop(); the timeout guarantees the run
       // ends even if the SDK call never settles.
@@ -658,6 +676,33 @@ export class ReviewWorker {
     }
     await mkdir(dirname(target), { recursive: true })
     await writeFile(target, content, 'utf8')
+  }
+
+  /**
+   * Removes any findings file left over from an earlier attempt, including the
+   * case variants {@link readFindingsFile} is willing to accept — otherwise
+   * clearing only the exact name would leave a `findings.json` the reader would
+   * happily pick up.
+   */
+  private async clearStaleFindings(wsPath: string): Promise<void> {
+    let entries: string[]
+    try {
+      entries = await readdir(wsPath)
+    } catch {
+      return
+    }
+
+    for (const name of entries) {
+      if (name.toLowerCase() !== FINDINGS_FILENAME.toLowerCase()) continue
+      const path = resolve(join(wsPath, name))
+      checkContainment(path, wsPath)
+      try {
+        await unlink(path)
+        getLogger().warn({ wsPath, removed: name }, 'review_worker_stale_findings_removed')
+      } catch (err) {
+        getLogger().warn({ wsPath, name, error: errMsg(err) }, 'review_worker_stale_findings_not_removed')
+      }
+    }
   }
 
   /**
