@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { shouldDispatch, dispatchKey, availableSlots, backoffDelay, SymphonyOrchestrator } from '../src/orchestrator.js'
 import { createOrchestratorState } from '../src/models.js'
 import { MemoryTracker } from '../src/tracker/memory.js'
@@ -567,6 +570,60 @@ describe('exit annotation', () => {
   it('says nothing about a run that reported itself complete', async () => {
     const { tracker, orch } = harness(async () => {})
     await exit(orch, { success: true, turnsCompleted: 1, stopReason: 'completed' })
+    expect(tracker.annotateIssue).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The failure this pipeline was least equipped to notice, seen for real: the
+   * agent emitted the completion marker, the issue moved to In Review, and no
+   * branch was ever pushed. The log was indistinguishable from a success.
+   */
+  it('annotates a completed run whose workspace shows nothing was pushed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-evidence-'))
+    try {
+      const { tracker, orch } = harness(async () => {})
+      // An empty workspace: the agent never cloned.
+      await (orch as any).onWorkerExit('issue-5', true,
+        { success: true, turnsCompleted: 1, stopReason: 'completed' }, dir)
+
+      const note = (tracker.annotateIssue as any).mock.calls[0][1] as string
+      expect(note).toContain('no pushed branch')
+      expect(note).toContain('never cloned')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('says nothing when the workspace shows the branch DID reach the remote', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-evidence-'))
+    try {
+      const git = join(dir, '.git', 'refs', 'remotes', 'origin')
+      mkdirSync(git, { recursive: true })
+      writeFileSync(join(dir, '.git', 'HEAD'), 'ref: refs/heads/work\n')
+      writeFileSync(join(git, 'work'), 'a'.repeat(40))
+      mkdirSync(join(dir, '.git', 'refs', 'heads'), { recursive: true })
+      writeFileSync(join(dir, '.git', 'refs', 'heads', 'work'), 'a'.repeat(40))
+
+      const { tracker, orch } = harness(async () => {})
+      await (orch as any).onWorkerExit('issue-5', true,
+        { success: true, turnsCompleted: 1, stopReason: 'completed' }, dir)
+
+      expect(tracker.annotateIssue).not.toHaveBeenCalled()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * Running with no workspace manager is a legitimate configuration, and the
+   * work may have happened somewhere this cannot see. Absence of evidence must
+   * not become a note on someone's issue.
+   */
+  it('says nothing when there is no workspace to inspect at all', async () => {
+    const { tracker, orch } = harness(async () => {})
+    await (orch as any).onWorkerExit('issue-5', true,
+      { success: true, turnsCompleted: 1, stopReason: 'completed' }, null)
+
     expect(tracker.annotateIssue).not.toHaveBeenCalled()
   })
 
