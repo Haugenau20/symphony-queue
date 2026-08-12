@@ -2,9 +2,10 @@
  * Builds a per-review sandbox, runs the review agent inside it, and returns a
  * structured outcome. This is the ONLY place that constructs the material the
  * agent sees — the agent itself fetches nothing from GitLab: it has no token,
- * no `webfetch`, no `bash`, no `external_directory` access (see
- * REVIEW_PERMISSIONS below), and its session is rooted at the sandbox
- * directory (design §9, §10).
+ * no `webfetch` and no `bash` (see REVIEW_PERMISSIONS below), and its session is
+ * rooted at the sandbox directory (design §9, §10). It is confined to that
+ * sandbox by the opencode-review container's OPENCODE_EXTRA_ALLOWED_DIRS, not by
+ * a permission rule — see the note on external_directory below.
  *
  * The sandbox is three things, written by trusted code before the agent's
  * session is ever created:
@@ -64,73 +65,63 @@ const FINDINGS_FILENAME = 'FINDINGS.json'
 // --- permissions --------------------------------------------------------------
 
 /**
- * The review agent's permission set. Deny-by-default for everything that
- * would let it act instead of merely read-and-report:
+ * The review agent's permission set.
  *
- *   edit                — ALLOWED, and deliberately so. FINDINGS.json is the
- *                         agent's only output and it has to be able to write
- *                         it; denying `edit` outright makes the agent
- *                         structurally incapable of producing a review at all,
- *                         and every run fails with "did not write
- *                         FINDINGS.json". This was denied in an earlier
- *                         revision, and no test caught it because every test
- *                         fakes the agent and writes the file with fs.
+ * This is IMPLEMENTATION_PERMISSIONS with execution and egress removed, and it
+ * is deliberately expressed that way: the implementation lane is a validated,
+ * working configuration, so "the same, minus the two capabilities a reviewer
+ * must not have" is a far safer thing to reason about than a set assembled from
+ * first principles. Two earlier attempts at the latter each produced a reviewer
+ * that could not produce a review.
  *
- *                         Allowing it costs nothing that matters. The property
- *                         this design actually rests on is not "the agent
- *                         cannot write files" — it is "the agent cannot affect
- *                         anything outside its sandbox, cannot reach the
- *                         network, and holds no credential". The sandbox is a
- *                         scratch directory with no git clone, no remote and
- *                         no token, destroyed in a finally block after every
- *                         job, and only FINDINGS.json is ever read back out of
- *                         it. What confines the writing is `external_directory`
- *                         below, plus the container's own
- *                         OPENCODE_EXTRA_ALLOWED_DIRS — two independent
- *                         mechanisms, neither of which is this rule.
- *   bash                — no arbitrary execution.
- *   webfetch             — no egress. Nothing the agent reads (including an
- *                         MR description trying to talk it into fetching a
- *                         URL) can reach the network.
- *   external_directory   — cannot leave the sandbox root it was given.
+ *   edit                 ALLOW. FINDINGS.json is the agent's only output; an
+ *                        agent that cannot write cannot review. Denying this
+ *                        made every run fail with "did not write FINDINGS.json".
+ *   external_directory   ALLOW, and this one is counter-intuitive enough to be
+ *                        worth spelling out. The sandbox lives at
+ *                        /review-workspaces/<key>, which is OUTSIDE the
+ *                        OpenCode server's own project root — so from the
+ *                        server's point of view the agent's entire workspace is
+ *                        an external directory. Denying this does not confine
+ *                        the agent to its sandbox; it locks the agent out of the
+ *                        sandbox. That is exactly what happened: reads slipped
+ *                        through, every write came back "permission denied", and
+ *                        the agent spent its whole turn arguing with the error.
  *
- * `doom_loop` is deliberately left ALLOWED, matching IMPLEMENTATION_PERMISSIONS,
- * rather than denied alongside the other four. The other four gate a
- * *capability* this pipeline's whole design depends on the agent not having
- * (write access, execution, egress, filesystem escape) — doom_loop gates a
- * *behavioural* safety net (the SDK's own stuck-loop detection/recovery) that
- * touches none of those. Denying it would not close any hole the credential-
- * and-egress invariants care about; it would only make a confused review
- * agent spend its whole turn budget looping instead of getting a chance to
- * recover, which is pure noise cost with no corresponding security benefit.
+ *                        The confinement is OPENCODE_EXTRA_ALLOWED_DIRS, fixed
+ *                        at /review-workspaces/** in the opencode-review
+ *                        service's own `environment:` block. IMAGE_CONTRACT.md
+ *                        describes that variable as precisely this: "opencode's
+ *                        permission.external_directory gate". The permission has
+ *                        to be ALLOW for that allowlist to be consulted at all —
+ *                        deny is not a narrower allow, it is a wall.
+ *   doom_loop            ALLOW, matching the implementation lane. It gates the
+ *                        SDK's own stuck-loop recovery, not a capability.
+ *   bash                 DENY. No execution — a real restriction the
+ *                        implementation lane does not have.
+ *   webfetch             DENY. No egress. Nothing the agent reads, including a
+ *                        merge request description trying to talk it into
+ *                        fetching a URL, can reach the network.
+ *
+ * What actually keeps this agent harmless is not this list. It is: no credential
+ * in its container, no network route out, no shell, and a workspace that is a
+ * synthetic copy of a diff rather than a git checkout, deleted after every job.
+ * Those are the properties worth defending; this list only has to avoid
+ * contradicting them.
+ *
+ * Nothing else is enumerated. An earlier revision added explicit read/write/
+ * list/glob/grep grants, on the theory that a supplied ruleset might be
+ * exhaustive rather than additive. It is not: the failing run had every one of
+ * them granted and still could not write, because the block was
+ * external_directory. The implementation lane names none of them and reads and
+ * writes freely, so they were noise pretending to be caution.
  */
 export const REVIEW_PERMISSIONS: PermissionRule[] = [
-  // Allowed so the agent can write FINDINGS.json — see the note above. Confined
-  // to the sandbox by external_directory, not by this rule.
-  { permission: 'edit', pattern: '*', action: 'allow' },
-  // The rest of the read-and-write-one-file family, named explicitly.
-  //
-  // The SDK types `permission` as a bare `string` and enumerate nothing, so
-  // which tool each name gates — and whether a supplied ruleset is additive or
-  // exhaustive — is not knowable from this side. If it is EXHAUSTIVE, then
-  // listing only `edit` denies the agent `read`, and an agent that can read
-  // nothing and write nothing reports back in seconds having done nothing:
-  // exactly the failure this pipeline hit on its first real run.
-  //
-  // So the tools a reviewer legitimately needs are granted by name. Every one of
-  // these is a local read or a local write inside a disposable directory; none
-  // grants execution, egress, or a way out. The three that would are denied
-  // below, and those are the boundary.
-  { permission: 'read', pattern: '*', action: 'allow' },
-  { permission: 'write', pattern: '*', action: 'allow' },
-  { permission: 'patch', pattern: '*', action: 'allow' },
-  { permission: 'list', pattern: '*', action: 'allow' },
-  { permission: 'glob', pattern: '*', action: 'allow' },
-  { permission: 'grep', pattern: '*', action: 'allow' },
-  { permission: 'bash', pattern: '*', action: 'deny' },
-  { permission: 'webfetch', pattern: '*', action: 'deny' },
-  { permission: 'external_directory', pattern: '*', action: 'deny' },
-  { permission: 'doom_loop', pattern: '*', action: 'allow' },
+  { permission: 'edit',               pattern: '*', action: 'allow' },
+  { permission: 'external_directory', pattern: '*', action: 'allow' },
+  { permission: 'doom_loop',          pattern: '*', action: 'allow' },
+  { permission: 'bash',               pattern: '*', action: 'deny' },
+  { permission: 'webfetch',           pattern: '*', action: 'deny' },
 ]
 
 /** Default cap on diff-plus-context bytes shown to the agent. Overridable per deployment. */

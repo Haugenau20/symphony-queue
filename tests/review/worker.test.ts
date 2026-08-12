@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { IMPLEMENTATION_PERMISSIONS } from '../../src/agent_runner.js'
 import {
   ReviewWorker,
   REVIEW_PERMISSIONS,
@@ -189,16 +190,16 @@ function worker(overrides: Partial<ReviewWorkerConfig> & { mrClient: MergeReques
 // ---------------------------------------------------------------------------
 
 describe('REVIEW_PERMISSIONS', () => {
-  it('denies bash, webfetch and external_directory — execution, egress, and escape', () => {
-    for (const perm of ['bash', 'webfetch', 'external_directory']) {
+  it('denies bash and webfetch — no execution, no egress', () => {
+    for (const perm of ['bash', 'webfetch']) {
       expect(REVIEW_PERMISSIONS).toEqual(
         expect.arrayContaining([expect.objectContaining({ permission: perm, pattern: '*', action: 'deny' })]),
       )
     }
   })
 
-  it('has no allow rule for any of the three denied kinds', () => {
-    for (const perm of ['bash', 'webfetch', 'external_directory']) {
+  it('has no allow rule for either denied kind', () => {
+    for (const perm of ['bash', 'webfetch']) {
       const rules = REVIEW_PERMISSIONS.filter((r) => r.permission === perm)
       expect(rules.every((r) => r.action === 'deny')).toBe(true)
     }
@@ -225,36 +226,45 @@ describe('REVIEW_PERMISSIONS', () => {
     expect(editRules.every((r) => r.action === 'allow')).toBe(true)
   })
 
-  it('confines that write with external_directory rather than by denying edit', () => {
-    const escape = REVIEW_PERMISSIONS.find((r) => r.permission === 'external_directory')
+  /**
+   * Regression for the failure that actually stopped the first deployment. The
+   * sandbox lives outside the OpenCode server's project root, so from the
+   * server's side the agent's whole workspace is an "external directory".
+   * Denying this permission does not narrow the agent to its sandbox — it locks
+   * it out of the sandbox: reads slipped through and every write came back
+   * "permission denied". The confinement is the container's
+   * OPENCODE_EXTRA_ALLOWED_DIRS, which this permission has to be ALLOW for the
+   * server to consult at all.
+   */
+  it('ALLOWS external_directory — the sandbox is outside the server root, so denying it locks the agent out', () => {
+    const escape = REVIEW_PERMISSIONS.filter((r) => r.permission === 'external_directory')
 
-    expect(escape?.action).toBe('deny')
-  })
-
-  it('never hands the agent a credential-bearing or network permission', () => {
-    const allowed = REVIEW_PERMISSIONS.filter((r) => r.action === 'allow').map((r) => r.permission)
-
-    // Everything granted is a local read, a local write, or the SDK's own
-    // loop-recovery. Nothing here can execute, reach the network, or escape.
-    expect(allowed.sort()).toEqual(
-      ['doom_loop', 'edit', 'glob', 'grep', 'list', 'patch', 'read', 'write'],
-    )
-    for (const denied of ['bash', 'webfetch', 'external_directory']) {
-      expect(allowed).not.toContain(denied)
-    }
+    expect(escape.length).toBeGreaterThan(0)
+    expect(escape.every((r) => r.action === 'allow')).toBe(true)
   })
 
   /**
-   * Regression for the first real deployment's failure: the agent reported
-   * completion in under a minute having written nothing. If a supplied ruleset
-   * is exhaustive rather than additive, granting only `edit` leaves the agent
-   * unable to READ its own material, which looks exactly like that.
+   * The set is defined as "the working lane, minus execution and egress".
+   * Stating that as a test keeps the two from drifting apart for reasons nobody
+   * recorded — every previous divergence here was a bug.
    */
-  it('grants the read side too, not just the write — an agent that cannot read reviews nothing', () => {
-    for (const perm of ['read', 'list', 'glob', 'grep']) {
-      const rules = REVIEW_PERMISSIONS.filter((r) => r.permission === perm)
-      expect(rules.length, `${perm} must be granted explicitly`).toBeGreaterThan(0)
-      expect(rules.every((r) => r.action === 'allow')).toBe(true)
+  it('differs from IMPLEMENTATION_PERMISSIONS in exactly two entries: bash and webfetch', () => {
+    const asMap = (rules: typeof REVIEW_PERMISSIONS) =>
+      Object.fromEntries(rules.map((r) => [r.permission, r.action]))
+    const impl = asMap(IMPLEMENTATION_PERMISSIONS)
+    const review = asMap(REVIEW_PERMISSIONS)
+
+    expect(Object.keys(review).sort()).toEqual(Object.keys(impl).sort())
+    const differing = Object.keys(impl).filter((k) => impl[k] !== review[k]).sort()
+    expect(differing).toEqual(['bash', 'webfetch'])
+  })
+
+  it('never grants execution or egress, whatever else it grants', () => {
+    const allowed = REVIEW_PERMISSIONS.filter((r) => r.action === 'allow').map((r) => r.permission)
+
+    expect(allowed.sort()).toEqual(['doom_loop', 'edit', 'external_directory'])
+    for (const forbidden of ['bash', 'webfetch']) {
+      expect(allowed).not.toContain(forbidden)
     }
   })
 })

@@ -321,9 +321,10 @@ const ReviewAgentRawSchema = z.object({
    * Documentation of what the code already enforces, not a control surface.
    * `REVIEW_PERMISSIONS` in review/worker.ts is the enforcement point and is
    * deliberately not configurable — a config file that could grant the review
-   * agent `edit` or `bash` would dissolve the sandbox the whole design rests
-   * on. Validation below REJECTS any attempt to loosen these, so the block
-   * behaves as a checked assertion rather than decoration.
+   * agent `bash` or `webfetch` would dissolve the boundary the whole design
+   * rests on. Validation below rejects any line that disagrees with what is
+   * actually enforced, in either direction, so the block behaves as a checked
+   * assertion rather than decoration.
    */
   permissions: z.record(z.string()).default({}),
 })

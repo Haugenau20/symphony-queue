@@ -158,12 +158,11 @@ async function main(): Promise<void> {
   const reviewMode = process.env.SYMPHONY_MODE === 'review'
 
   // The guardrails acknowledgement exists because the implementation agent runs
-  // with edit, bash, webfetch and external_directory GRANTED, on a real
-  // checkout, holding a token that can push. The reviewer has none of that: no
-  // shell, no egress, no way out of a disposable directory, and no credential
-  // anywhere near it. Demanding the same acknowledgement would be asking the
-  // operator to agree to something that is not happening, so review mode states
-  // its actual posture in the log instead.
+  // with bash and webfetch GRANTED, on a real checkout, holding a token that can
+  // push. The reviewer has none of that: no shell, no egress, no credential, and
+  // a synthetic sandbox instead of a checkout. Demanding the same
+  // acknowledgement would be asking the operator to agree to something that is
+  // not happening, so review mode states its actual posture in the log instead.
   if (!reviewMode && !args.acknowledged) {
     console.error(guardrailsBanner())
     process.exit(1)
@@ -178,10 +177,9 @@ async function main(): Promise<void> {
   if (reviewMode) {
     log.info(
       {
-        // The reviewer writes FINDINGS.json inside its disposable sandbox and
-        // can do nothing else: no shell, no egress, no way out of the
-        // directory, and no credential anywhere near it.
-        permissions: 'bash/webfetch/external_directory denied; edit confined to the sandbox',
+        // No shell, no egress, no credential. The sandbox itself is what the
+        // agent is confined to, via the container's OPENCODE_EXTRA_ALLOWED_DIRS.
+        permissions: 'bash and webfetch denied; reads and writes confined to the sandbox',
         agentHoldsToken: false,
       },
       'review_mode_starting',

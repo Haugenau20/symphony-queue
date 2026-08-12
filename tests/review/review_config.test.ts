@@ -110,7 +110,7 @@ describe('validateReviewConfig', () => {
 })
 
 describe('validateReviewConfig — the permissions block must match what is enforced', () => {
-  for (const perm of ['bash', 'webfetch', 'external_directory']) {
+  for (const perm of ['bash', 'webfetch']) {
     it(`refuses to start when agent.permissions.${perm} tries to allow`, () => {
       const wf = review({}, { permissions: { [perm]: 'allow' } })
 
@@ -137,10 +137,26 @@ describe('validateReviewConfig — the permissions block must match what is enfo
 
   it('accepts a block that correctly documents the real set', () => {
     const wf = review({}, {
-      permissions: { edit: 'allow', bash: 'deny', webfetch: 'deny', external_directory: 'deny' },
+      permissions: { edit: 'allow', external_directory: 'allow', bash: 'deny', webfetch: 'deny' },
     })
 
     expect(validateReviewConfig(buildReviewConfig(wf, env()), env())).toEqual([])
+  })
+
+  /**
+   * The other half of the same lesson as the `edit: deny` case. The sandbox sits
+   * outside the OpenCode server's project root, so denying external_directory
+   * locks the agent out of its own workspace — reads slipped through and every
+   * write was refused. A REVIEW.md asserting that denial describes a reviewer
+   * that cannot work, so it is a startup error rather than a reassuring line.
+   */
+  it('refuses a block claiming external_directory is denied — that locks the agent out of its sandbox', () => {
+    const wf = review({}, { permissions: { external_directory: 'deny' } })
+
+    const errors = validateReviewConfig(buildReviewConfig(wf, env()), env())
+
+    expect(errors.some((x) => x.includes('agent.permissions.external_directory'))).toBe(true)
+    expect(errors[0]).toContain('always sets it to "allow"')
   })
 
   it('accepts an absent permissions block — the code enforces the set either way', () => {
