@@ -1,15 +1,15 @@
 # symphony-queue
 
 An implementation of [Symphony](https://github.com/openai/symphony) that turns tracked work
-items into isolated, autonomous coding-agent runs — with two deliberate departures from
-upstream:
+items into isolated, autonomous coding-agent runs. It deliberately uses
+[OpenCode](https://opencode.ai) rather than Codex, and supports two tracker backends:
 
-1. **The tracker is a directory tree on disk.** No Linear, no Jira, no API tokens. State is
-   the folder a file sits in.
-2. **The coding agent is [OpenCode](https://opencode.ai), not Codex.** Runs are driven over
-   the `@opencode-ai/sdk` HTTP API against an OpenCode server.
+- **A directory tree on disk.** No service or token is required; the folder containing a
+  markdown file is its state.
+- **GitLab Issues.** Workflow state is represented by namespaced labels, while the GitLab
+  token comes from the environment rather than the workflow file.
 
-It is a library plus a service: a poll loop that scans a queue directory, dispatches an agent
+It is a library plus a service: a poll loop reads the selected tracker, dispatches an agent
 per eligible item into its own workspace, and drives the item through a state machine until a
 human accepts it.
 
@@ -37,8 +37,9 @@ Three properties fall out of this, and they are the whole point:
 
 - **`ls` tells you the state.** No dashboard, no database, no query language. That is why
   this repo ships no terminal UI and no HTTP status server.
-- **`rename(2)` is the claim.** Moving `todo/X.md` → `in-progress/X.md` is atomic within a
-  filesystem, so the move itself is the lock. No lockfiles, no coordination service.
+- **State transitions use `rename(2)`.** Moving `todo/X.md` → `in-progress/X.md` is atomic
+  within a filesystem, so readers never observe a half-transition. The scheduler is still a
+  single-process service: run only one orchestrator against a queue root.
 - **Crash recovery is free.** Whatever is sitting in `in-progress/` when the process starts is
   exactly the recovery set (SPEC §14.3).
 
@@ -46,6 +47,18 @@ Front matter must **not** carry a `state:` field — the directory is the single
 truth, and a `state:` key found in a file is ignored with a warning. See
 [`docs/DESIGN.md`](docs/DESIGN.md) for the full rules, including how queue files are treated
 as untrusted input.
+
+## The GitLab model
+
+GitLab Issues use one label under a configurable namespace for workflow state. With the
+default `symphony` prefix, the labels are `symphony::todo`, `symphony::in-progress`,
+`symphony::review`, `symphony::done`, `symphony::failed` and `symphony::cancelled`.
+Transitions replace the complete set of Symphony state labels in one API request while
+preserving unrelated labels.
+
+GitLab does not provide the filesystem's atomic rename operation. As with the file queue, only
+one orchestrator should poll a given tracker. Failed GitLab items also require a human to
+relabel them; the automatic retry sweep is currently specific to the file queue.
 
 ## Provenance
 
@@ -98,16 +111,41 @@ workspace:
 agent:
   max_concurrent_agents: 4
   max_turns: 20
+  completion_marker: SYMPHONY_DONE
 opencode:
   server_url: http://localhost:4096
 ---
 
 Work on {{ issue.identifier }}: {{ issue.title }}.
+When the work is complete, end your reply with SYMPHONY_DONE on a line of its own.
 ```
 
-No secret can enter this config: there is no API key, endpoint or credential field anywhere in
-the schema, and the `$VAR` environment-variable resolver the seed project used to read a Linear
-token is gone.
+For GitLab, replace the tracker block with:
+
+```yaml
+tracker:
+  kind: gitlab
+  base_url: https://gitlab.example.com
+  project_id: group/project
+  label_prefix: symphony
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Cancelled]
+```
+
+Set `SYMPHONY_GITLAB_TOKEN` in the process environment. There is deliberately no token or
+generic environment-variable resolver in the workflow schema, so credentials cannot be read
+from `WORKFLOW.md`.
+
+Workspace hooks are optional trusted shell commands:
+
+```yaml
+hooks:
+  after_create: null  # once, after a workspace is first created
+  before_run: null    # before each agent run
+  after_run: null     # after every attempted agent run, including failures
+  before_remove: null # before a terminal workspace is removed
+  timeout_ms: 60000
+```
 
 ```bash
 node dist/main.js ./WORKFLOW.md --i-understand-that-this-will-be-running-without-the-usual-guardrails
@@ -124,6 +162,51 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+## Building the deployment image
+
+Symphony-Launcher is pull-only by contract — it assembles compose files and
+starts what the image store already has, and it will never build this for you.
+This repository is the other half of that interface:
+
+```bash
+npm run image:build            # opencode-workplace-symphony:local
+```
+
+or, for a real registry:
+
+```bash
+IMAGE_REGISTRY=registry.example.com/team/opencode-workplace \
+IMAGE_TAG=2026-08-11 \
+  ./scripts/build-image.sh --push
+```
+
+The name matters. Both `docker-compose.symphony.yml` and
+`docker-compose.review.yml` resolve
+`${IMAGE_REGISTRY:-opencode-workplace}-symphony:${IMAGE_TAG:-local}`, so use
+the same two values here as in the launcher's `.env` or `symphony up` will
+look for an image this build did not produce.
+
+One image, two modes: `SYMPHONY_MODE=review` starts the merge-request review
+controller instead of the issue orchestrator. They share the agent runner, so
+shipping one image is what stops the two pipelines drifting to different builds
+of it.
+
+This does **not** build the agent image (`${IMAGE_REGISTRY}:${IMAGE_TAG}`, run
+by the `opencode` and `opencode-review` services). That is a separate artifact.
+
+### An internal GitLab, or a proxy that re-signs TLS
+
+Put the root certificate in `ca/` as a `*.crt` file and rebuild — see
+[`ca/README.md`](ca/README.md). It is trusted in both the build and runtime
+stages, because behind a TLS-intercepting proxy it is `npm ci` that fails first
+and the error does not obviously point at a missing root.
+
+Node ignores the operating system's trust store by default, so a certificate
+that `curl` accepts inside the container will still fail in the orchestrator
+unless `NODE_EXTRA_CA_CERTS` is set. The image sets it to the system bundle
+that `update-ca-certificates` rebuilds, so public roots and your private ones
+both work, and nothing breaks when `ca/` is empty.
 
 ## OpenCode SDK version
 
@@ -147,10 +230,11 @@ structurally re-declared.
 
 ## Scope
 
-Implemented: the file queue tracker, the orchestrator poll/dispatch/reconcile loop, workspace
-management with hooks, the OpenCode agent runner, workflow/config loading, prompt rendering.
+Implemented: file queue and GitLab Issues trackers, the orchestrator
+poll/dispatch/reconcile loop, workspace management with hooks, the OpenCode agent runner,
+workflow/config loading, prompt rendering, completion markers, stall detection and structured
+logging.
 
-Deliberately absent: any Linear/Jira/GitHub/GitLab/Bitbucket integration, the terminal
-dashboard, the HTTP status server, the interactive setup wizard, and any container or CI
-configuration. A project's real `WORKFLOW.md` is per-project config and lives in the consuming
-repository, not here.
+Deliberately absent: Linear/Jira/GitHub/Bitbucket trackers, a terminal dashboard, an HTTP status
+server, an interactive setup wizard, and container or CI configuration. A project's real
+`WORKFLOW.md` is per-project config and lives in the consuming repository, not here.

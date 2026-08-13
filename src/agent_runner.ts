@@ -1,7 +1,19 @@
-import type { Issue } from './models.js'
 import { getLogger } from './log.js'
 import { renderContinuation } from './prompt_builder.js'
 import type { OpencodeClient, PermissionRule } from '@opencode-ai/sdk/v2'
+
+/**
+ * What a run needs from the thing it is working on. `Issue` already satisfies
+ * this structurally, so an issue can be passed straight through — no
+ * conversion function, no coupling from this module back to the tracker's
+ * model. A second pipeline (e.g. merge-request review) can pass anything with
+ * these three fields.
+ */
+export interface RunTarget {
+  id: string
+  identifier: string
+  title: string
+}
 
 /**
  * Builds a client rooted at a given directory, or at the server's default when
@@ -29,6 +41,17 @@ export interface AgentRunResult {
    * that finished and one that ran out of runway looked identical.
    */
   stopReason?: 'completed' | 'max_turns' | 'issue_inactive'
+  /**
+   * The agent's last reply, verbatim. Nothing acts on it — it exists so a caller
+   * can say what the agent claimed when the run produced no usable artefact.
+   * The review pipeline's worst failure ("reported complete, wrote no
+   * FINDINGS.json") is otherwise invisible: the run looks like a success and
+   * leaves nothing behind to explain itself.
+   *
+   * Treat it as UNTRUSTED. It is model output over merge-request content, so it
+   * belongs in a diagnostic log line and nowhere near a published artefact.
+   */
+  finalText?: string
 }
 
 /** One observed sign of life from a running agent. */
@@ -42,7 +65,6 @@ export interface AgentActivity {
 
 export interface AgentRunnerConfig {
   maxTurns: number
-  issueStateFetcher: (issueIds: string[]) => Promise<Issue[]>
   /**
    * Called whenever the agent shows a sign of life. This is the input the
    * stall detector was missing: without it `stall_timeout_ms` can only be
@@ -71,7 +93,13 @@ export interface AgentRunnerConfig {
   sessionTimeoutMs?: number
 }
 
-const PERMISSIONS: PermissionRule[] = [
+/**
+ * The permission set the implementation pipeline (issue dispatch) has always
+ * used. Exported so `orchestrator.ts` can pass it explicitly — the runner
+ * itself no longer hardcodes a permission set, since a second pipeline (MR
+ * review) needs a different one.
+ */
+export const IMPLEMENTATION_PERMISSIONS: PermissionRule[] = [
   { permission: 'edit',               pattern: '*', action: 'allow' },
   { permission: 'bash',               pattern: '*', action: 'allow' },
   { permission: 'webfetch',           pattern: '*', action: 'allow' },
@@ -150,7 +178,14 @@ export class AgentRunner {
   }
 
   async run(
-    issue: Issue, prompt: string, workspacePath?: string | null, signal?: AbortSignal,
+    target: RunTarget,
+    prompt: string,
+    workspacePath: string | null | undefined,
+    signal: AbortSignal | undefined,
+    options: {
+      permissions: PermissionRule[]
+      shouldContinue: () => Promise<boolean>
+    },
   ): Promise<AgentRunResult> {
     const log = getLogger()
     let sessionId: string | null = null
@@ -162,14 +197,14 @@ export class AgentRunner {
     const client = this.clientFor(workspacePath ?? null)
     try {
       const created = await client.session.create({
-        title: `${issue.identifier}: ${issue.title}`,
-        permission: PERMISSIONS,
+        title: `${target.identifier}: ${target.title}`,
+        permission: options.permissions,
       })
       sessionId = created.data!.id
-      log.info({ issueId: issue.id, sessionId }, 'session_created')
-      this.reportActivity(issue.id, sessionId, 'session_created')
+      log.info({ issueId: target.id, sessionId }, 'session_created')
+      this.reportActivity(target.id, sessionId, 'session_created')
       // Deliberately not awaited: it runs for as long as the session does.
-      void this.pumpSessionEvents(client, issue.id, sessionId, pumpStop.signal)
+      void this.pumpSessionEvents(client, target.id, sessionId, pumpStop.signal)
 
       const startedAt = Date.now()
       const result = await client.session.prompt(
@@ -184,7 +219,7 @@ export class AgentRunner {
         // much as the message: a failure at exactly 300s is a timeout
         // somewhere downstream, not a rejected request.
         log.warn({
-          issueId: issue.id, sessionId, durationMs: Date.now() - startedAt,
+          issueId: target.id, sessionId, durationMs: Date.now() - startedAt,
           error: describeApiError(result.error),
         }, 'initial_prompt_failed')
         return {
@@ -194,18 +229,19 @@ export class AgentRunner {
       }
 
       let turnsCompleted = 1
-      this.reportActivity(issue.id, sessionId, 'turn_completed')
+      this.reportActivity(target.id, sessionId, 'turn_completed')
       const marker = this.config.completionMarker ?? ''
-      if (declaresCompletion(promptText(result.data), marker)) {
-        log.info({ issueId: issue.id, turnsCompleted }, 'agent_reported_complete')
-        return { sessionId, success: true, turnsCompleted, stopReason: 'completed' }
+      let finalText = promptText(result.data)
+      if (declaresCompletion(finalText, marker)) {
+        log.info({ issueId: target.id, turnsCompleted }, 'agent_reported_complete')
+        return { sessionId, success: true, turnsCompleted, stopReason: 'completed', finalText }
       }
 
       let stopReason: AgentRunResult['stopReason'] = 'max_turns'
       for (let turn = 2; turn <= this.config.maxTurns; turn++) {
-        const refreshedIssue = await this.refreshIssueState(issue.id)
-        if (!refreshedIssue || !this.isActiveState(refreshedIssue.state)) {
-          log.info({ issueId: issue.id, turnsCompleted: turn - 1 }, 'issue_no_longer_active')
+        const active = await options.shouldContinue()
+        if (!active) {
+          log.info({ issueId: target.id, turnsCompleted: turn - 1 }, 'issue_no_longer_active')
           stopReason = 'issue_inactive'
           break
         }
@@ -217,7 +253,7 @@ export class AgentRunner {
         )
         if (contResult.error) {
           log.warn({
-            issueId: issue.id, sessionId, turn, durationMs: Date.now() - turnStartedAt,
+            issueId: target.id, sessionId, turn, durationMs: Date.now() - turnStartedAt,
             error: describeApiError(contResult.error),
           }, 'continuation_turn_failed')
           return {
@@ -227,15 +263,16 @@ export class AgentRunner {
         }
 
         turnsCompleted = turn
-        this.reportActivity(issue.id, sessionId, 'turn_completed')
+        this.reportActivity(target.id, sessionId, 'turn_completed')
 
         // The agent's own "I am finished". Without it the loop has no exit but
         // max_turns: the issue stays In Progress for the whole run (symphony
-        // owns that label and only moves it afterwards), so isActiveState is
+        // owns that label and only moves it afterwards), so shouldContinue is
         // true every time, and an agent that finished at turn 3 gets told
         // "the work is not finished" for every remaining turn.
-        if (declaresCompletion(promptText(contResult.data), marker)) {
-          log.info({ issueId: issue.id, turnsCompleted }, 'agent_reported_complete')
+        finalText = promptText(contResult.data)
+        if (declaresCompletion(finalText, marker)) {
+          log.info({ issueId: target.id, turnsCompleted }, 'agent_reported_complete')
           stopReason = 'completed'
           break
         }
@@ -244,13 +281,13 @@ export class AgentRunner {
       if (stopReason === 'max_turns') {
         // Not a failure, but not a finish either: the agent was interrupted
         // mid-task and whatever it had is about to be filed as reviewable.
-        log.warn({ issueId: issue.id, turnsCompleted }, 'agent_run_hit_max_turns')
+        log.warn({ issueId: target.id, turnsCompleted }, 'agent_run_hit_max_turns')
       }
-      log.info({ issueId: issue.id, turnsCompleted, stopReason }, 'agent_run_completed')
-      return { sessionId, success: true, turnsCompleted, stopReason }
+      log.info({ issueId: target.id, turnsCompleted, stopReason }, 'agent_run_completed')
+      return { sessionId, success: true, turnsCompleted, stopReason, finalText }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      log.error({ issueId: issue.id, error: message }, 'agent_run_failed')
+      log.error({ issueId: target.id, error: message }, 'agent_run_failed')
       return { sessionId: null, success: false, error: message, turnsCompleted: 0 }
     } finally {
       pumpStop.abort()
@@ -329,19 +366,5 @@ export class AgentRunner {
     } catch (err) {
       getLogger().warn({ issueId, error: String(err) }, 'activity_callback_failed')
     }
-  }
-
-  private async refreshIssueState(issueId: string): Promise<Issue | null> {
-    try {
-      const issues = await this.config.issueStateFetcher([issueId])
-      return issues[0] ?? null
-    } catch {
-      return null
-    }
-  }
-
-  private isActiveState(state: string): boolean {
-    const terminalStates = ['closed', 'cancelled', 'canceled', 'duplicate', 'done']
-    return !terminalStates.includes(state.toLowerCase())
   }
 }

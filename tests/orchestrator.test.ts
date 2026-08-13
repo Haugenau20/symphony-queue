@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from 'vitest'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { shouldDispatch, dispatchKey, availableSlots, backoffDelay, SymphonyOrchestrator } from '../src/orchestrator.js'
 import { createOrchestratorState } from '../src/models.js'
 import { MemoryTracker } from '../src/tracker/memory.js'
+import { IMPLEMENTATION_PERMISSIONS } from '../src/agent_runner.js'
 import type { Issue } from '../src/models.js'
 
 function makeIssue(overrides?: Partial<Issue>): Issue {
@@ -153,6 +157,60 @@ describe('terminal workspace sweep', () => {
   })
 })
 
+describe('dispatchIssue shouldContinue', () => {
+  // AgentRunner no longer fetches issue state itself; dispatchIssue now
+  // supplies that as a shouldContinue predicate. These pin down that it
+  // reproduces refreshIssueState + isActiveState's semantics exactly,
+  // including the two "stop" paths that used to be implicit in a caught
+  // exception: no issue found, and the fetch itself failing.
+  function harness(fetchIssueStatesByIds: (ids: string[]) => Promise<Issue[]>) {
+    const tracker = {
+      fetchCandidateIssues: vi.fn().mockResolvedValue([]),
+      fetchIssuesByStates: vi.fn().mockResolvedValue([]),
+      updateIssueState: vi.fn(async () => {}),
+      fetchIssueStatesByIds: vi.fn(fetchIssueStatesByIds),
+    }
+    const agentRunner = { run: vi.fn().mockResolvedValue({ success: true, sessionId: 's', turnsCompleted: 1 }) }
+    const orch = new SymphonyOrchestrator({ tracker: tracker as any, agentRunner: agentRunner as any })
+    return { tracker, agentRunner, orch }
+  }
+
+  async function capturedShouldContinue(orch: any, agentRunner: { run: ReturnType<typeof vi.fn> }, issue: Issue) {
+    ;(orch as any).dispatchIssue(issue)
+    await Promise.all(Array.from((orch as any).state.running.values()).map((e: any) => e.task))
+    return agentRunner.run.mock.calls[0][4].shouldContinue as () => Promise<boolean>
+  }
+
+  it('continues while the tracker still reports the issue active', async () => {
+    const { agentRunner, orch } = harness(async () => [makeIssue({ id: 'q-1', state: 'In Progress' })])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(true)
+  })
+
+  it('stops when the tracker reports a terminal state', async () => {
+    const { agentRunner, orch } = harness(async () => [makeIssue({ id: 'q-1', state: 'Done' })])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(false)
+  })
+
+  it('stops when the issue is no longer found at all', async () => {
+    // Mirrors refreshIssueState's `issues[0] ?? null` — an empty result reads
+    // as "stop", the same as a fetch error.
+    const { agentRunner, orch } = harness(async () => [])
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    expect(await shouldContinue()).toBe(false)
+  })
+
+  it('stops, not throws, when the fetch itself fails', async () => {
+    // refreshIssueState's catch block returned null on error, and the loop
+    // read that as inactive. A fetch failure here must behave identically:
+    // shouldContinue resolves false rather than rejecting.
+    const { agentRunner, orch } = harness(async () => { throw new Error('tracker unreachable') })
+    const shouldContinue = await capturedShouldContinue(orch, agentRunner, makeIssue({ id: 'q-1', state: 'In Progress' }))
+    await expect(shouldContinue()).resolves.toBe(false)
+  })
+})
+
 describe('dispatch hands the workspace to the runner', () => {
   it('passes the workspace path so the session is rooted there', async () => {
     // Without this the agent's session roots at the server default while its
@@ -173,7 +231,42 @@ describe('dispatch hands the workspace to the runner', () => {
     expect(agentRunner.run).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'q-1' }), expect.any(String), '/workspaces/SYM-001',
       expect.any(AbortSignal),
+      // dispatchIssue passes the implementation pipeline's permission set
+      // explicitly now, plus a shouldContinue predicate the runner calls
+      // instead of fetching issue state itself.
+      { permissions: IMPLEMENTATION_PERMISSIONS, shouldContinue: expect.any(Function) },
     )
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledTimes(1)
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/workspaces/SYM-001' }),
+    )
+    expect(agentRunner.run.mock.invocationCallOrder[0]).toBeLessThan(
+      workspaceManager.runAfterRun.mock.invocationCallOrder[0]!,
+    )
+  })
+
+  it('runs after_run when the agent runner throws', async () => {
+    const tracker = new MemoryTracker(['Todo', 'In Progress'])
+    tracker.addIssue(makeIssue({ id: 'q-2', identifier: 'SYM-002', state: 'Todo' }))
+    const agentRunner = { run: vi.fn().mockRejectedValue(new Error('runner crashed')) }
+    const workspaceManager = stubWorkspaceManager()
+    workspaceManager.createForIssue.mockReturnValue({
+      path: '/workspaces/SYM-002', workspaceKey: 'SYM-002', createdNow: false,
+    })
+
+    const orch = new SymphonyOrchestrator({
+      tracker, agentRunner: agentRunner as any,
+      workspaceManager: workspaceManager as any, promptTemplate: 'go',
+    })
+    await (orch as any).tick()
+    await Promise.all(Array.from(orch.state.running.values()).map((e) => e.task))
+
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledTimes(1)
+    expect(workspaceManager.runAfterRun).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/workspaces/SYM-002' }),
+    )
+    const [afterExit] = await tracker.fetchIssueStatesByIds(['q-2'])
+    expect(afterExit!.state).toBe('Failed')
   })
 })
 
@@ -477,6 +570,60 @@ describe('exit annotation', () => {
   it('says nothing about a run that reported itself complete', async () => {
     const { tracker, orch } = harness(async () => {})
     await exit(orch, { success: true, turnsCompleted: 1, stopReason: 'completed' })
+    expect(tracker.annotateIssue).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The failure this pipeline was least equipped to notice, seen for real: the
+   * agent emitted the completion marker, the issue moved to In Review, and no
+   * branch was ever pushed. The log was indistinguishable from a success.
+   */
+  it('annotates a completed run whose workspace shows nothing was pushed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-evidence-'))
+    try {
+      const { tracker, orch } = harness(async () => {})
+      // An empty workspace: the agent never cloned.
+      await (orch as any).onWorkerExit('issue-5', true,
+        { success: true, turnsCompleted: 1, stopReason: 'completed' }, dir)
+
+      const note = (tracker.annotateIssue as any).mock.calls[0][1] as string
+      expect(note).toContain('no pushed branch')
+      expect(note).toContain('never cloned')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('says nothing when the workspace shows the branch DID reach the remote', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orch-evidence-'))
+    try {
+      const git = join(dir, '.git', 'refs', 'remotes', 'origin')
+      mkdirSync(git, { recursive: true })
+      writeFileSync(join(dir, '.git', 'HEAD'), 'ref: refs/heads/work\n')
+      writeFileSync(join(git, 'work'), 'a'.repeat(40))
+      mkdirSync(join(dir, '.git', 'refs', 'heads'), { recursive: true })
+      writeFileSync(join(dir, '.git', 'refs', 'heads', 'work'), 'a'.repeat(40))
+
+      const { tracker, orch } = harness(async () => {})
+      await (orch as any).onWorkerExit('issue-5', true,
+        { success: true, turnsCompleted: 1, stopReason: 'completed' }, dir)
+
+      expect(tracker.annotateIssue).not.toHaveBeenCalled()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * Running with no workspace manager is a legitimate configuration, and the
+   * work may have happened somewhere this cannot see. Absence of evidence must
+   * not become a note on someone's issue.
+   */
+  it('says nothing when there is no workspace to inspect at all', async () => {
+    const { tracker, orch } = harness(async () => {})
+    await (orch as any).onWorkerExit('issue-5', true,
+      { success: true, turnsCompleted: 1, stopReason: 'completed' }, null)
+
     expect(tracker.annotateIssue).not.toHaveBeenCalled()
   })
 
