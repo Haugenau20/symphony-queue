@@ -41,6 +41,7 @@ import type { PermissionRule } from '@opencode-ai/sdk/v2'
 import { getLogger } from '../log.js'
 import { checkContainment } from '../path_safety.js'
 import { safeParseFindingsDocument } from './findings.js'
+import { isExcludedPath } from './material.js'
 import type {
   MergeRequestClient,
   MergeRequestDiffFile,
@@ -193,38 +194,11 @@ export type {
 } from './types.js'
 
 // --- glob matching for exclude_paths ------------------------------------------
-
-/** Converts a `*`/`**` glob into an anchored RegExp. `**` matches across `/`; a lone `*` does not. */
-export function globToRegExp(pattern: string): RegExp {
-  let body = ''
-  let i = 0
-  while (i < pattern.length) {
-    const c = pattern[i]
-    if (c === '*') {
-      if (pattern[i + 1] === '*') {
-        body += '.*'
-        i += 2
-        continue
-      }
-      body += '[^/]*'
-      i += 1
-      continue
-    }
-    if (c === '?') {
-      body += '[^/]'
-      i += 1
-      continue
-    }
-    body += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    i += 1
-  }
-  return new RegExp(`^${body}$`)
-}
-
-export function isExcludedPath(path: string, patterns: string[]): boolean {
-  if (patterns.length === 0) return false
-  return patterns.some((p) => globToRegExp(p).test(path))
-}
+//
+// MOVED to material.ts, which is pure glob code and belongs beside the rest of
+// the material planner rather than in this I/O-heavy file. Re-exported here so
+// every existing `from './worker.js'` import keeps compiling unchanged.
+export { globToRegExp, isExcludedPath } from './material.js'
 
 // --- helpers ----------------------------------------------------------------
 
