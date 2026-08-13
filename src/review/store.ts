@@ -225,6 +225,44 @@ export class DirectoryReviewStore implements ReviewStore {
 
   // --- location -----------------------------------------------------------------
 
+  /**
+   * Every record for one merge request, at any head SHA, in any state.
+   *
+   * Three locations have to be consulted, and only one of them can be reached
+   * by deriving a path: `projects/<project>/<iid>/` is a directory that can be
+   * listed, but `claimed/` and `failed/` are keyed by a hash of the FULL job
+   * key — head SHA included — which is precisely the component this lookup does
+   * not have. So those two are scanned and filtered on the record's own
+   * contents.
+   *
+   * A head SHA present in more than one location resolves the same way
+   * {@link locate} does: the more "live" copy wins, claimed over failed over
+   * discovered. Reads reuse {@link readRecord}, so a malformed record is logged
+   * and skipped rather than thrown or repaired.
+   */
+  async listForMergeRequest(projectId: string, mrIid: number): Promise<ReviewJob[]> {
+    if (!Number.isInteger(mrIid)) throw new Error(`review store: invalid mrIid: ${String(mrIid)}`)
+
+    const matches = (job: ReviewJob): boolean =>
+      job.key.projectId === projectId && job.key.mrIid === mrIid
+
+    // Ordered least-live first, so a later assignment overwrites an earlier one
+    // and the most authoritative copy of a head SHA is the one that survives.
+    const bySha = new Map<string, ReviewJob>()
+
+    for (const job of await this.readAllIn(this.mrDirFor(projectId, mrIid))) {
+      if (matches(job)) bySha.set(job.key.headSha, job)
+    }
+    for (const job of await this.readAllIn(this.failedRoot())) {
+      if (matches(job)) bySha.set(job.key.headSha, job)
+    }
+    for (const job of await this.readAllIn(this.claimedRoot())) {
+      if (matches(job)) bySha.set(job.key.headSha, job)
+    }
+
+    return Array.from(bySha.values()).sort((a, b) => b.discoveredAt.getTime() - a.discoveredAt.getTime())
+  }
+
   private locationFor(job: ReviewJob): string {
     if (IN_FLIGHT.has(job.state)) return this.claimedPath(job.key)
     if (job.state === 'failed') return this.failedPath(job.key)
@@ -258,9 +296,19 @@ export class DirectoryReviewStore implements ReviewStore {
   }
 
   private mrDir(key: ReviewJobKey): string {
-    if (!Number.isInteger(key.mrIid)) throw new Error(`review store: invalid mrIid: ${String(key.mrIid)}`)
-    const project = this.projectDir(key.projectId)
-    const dir = resolve(join(project, String(key.mrIid)))
+    return this.mrDirFor(key.projectId, key.mrIid)
+  }
+
+  /**
+   * Split out from {@link mrDir} because supersession needs this directory
+   * without holding a head SHA, and therefore without a full {@link ReviewJobKey}.
+   * The containment checks are the point of the function and apply either way:
+   * `projectId` reaches the filesystem here and is attacker-influenced.
+   */
+  private mrDirFor(projectId: string, mrIid: number): string {
+    if (!Number.isInteger(mrIid)) throw new Error(`review store: invalid mrIid: ${String(mrIid)}`)
+    const project = this.projectDir(projectId)
+    const dir = resolve(join(project, String(mrIid)))
     checkContainment(dir, project)
     checkContainment(dir, this.root)
     return dir

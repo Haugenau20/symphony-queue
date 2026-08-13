@@ -73,6 +73,12 @@ class FakeReviewStore implements ReviewStore {
   async writeCursor(at: Date): Promise<void> {
     this.cursor = at
   }
+
+  async listForMergeRequest(projectId: string, mrIid: number): Promise<ReviewJob[]> {
+    return Array.from(this.records.values())
+      .filter((j) => j.key.projectId === projectId && j.key.mrIid === mrIid)
+      .sort((a, b) => b.discoveredAt.getTime() - a.discoveredAt.getTime())
+  }
 }
 
 class FakeClient implements MergeRequestClient {

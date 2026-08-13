@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { ReviewJobRunner } from '../../src/review/job_runner.js'
 import type { FindingsProducer, FindingsPublisher } from '../../src/review/job_runner.js'
 import type { ReviewJob, ReviewJobState, FindingsDocument } from '../../src/review/types.js'
+import { UNCHUNKED_PROVENANCE } from '../../src/review/types.js'
 import type { ReviewWorkOutcome } from '../../src/review/worker.js'
 import type { PublishResult } from '../../src/review/publisher.js'
 
@@ -35,6 +36,7 @@ function fakeStore() {
       recoverInFlight: async () => [],
       readCursor: async () => null,
       writeCursor: async () => {},
+      listForMergeRequest: async () => [],
     },
   }
 }
@@ -50,7 +52,7 @@ function runner(opts: {
   const outcome = opts.outcome
   const run: FindingsProducer['run'] = typeof outcome === 'function'
     ? async () => outcome()
-    : async () => outcome ?? { kind: 'reviewed', findings, diffFiles }
+    : async () => outcome ?? { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } }
   const worker: FindingsProducer = { run }
   const publishFn: FindingsPublisher['publish'] = opts.publishFn
     ?? vi.fn(async (): Promise<PublishResult> => opts.publish ?? { status: 'published', noteId: 'n1', body: 'b' })
@@ -168,7 +170,7 @@ describe('ReviewJobRunner — failure and retry', () => {
 
   it('never leaves the job in running or publishing — every path reaches a settled state', async () => {
     for (const outcome of [
-      { kind: 'reviewed', findings, diffFiles } as ReviewWorkOutcome,
+      { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } as ReviewWorkOutcome,
       { kind: 'stale', reason: 'r' } as ReviewWorkOutcome,
       { kind: 'failed', reason: 'r' } as ReviewWorkOutcome,
       { kind: 'too_large', reason: 'exceeds_cap', filesConsidered: 1, totalBytes: 9, maxDiffBytes: 1 } as ReviewWorkOutcome,
@@ -186,7 +188,7 @@ describe('ReviewJobRunner — the credential boundary', () => {
     let seen: AbortSignal | undefined
     const s = fakeStore()
     const r = new ReviewJobRunner({
-      worker: { run: async (_j, sig) => { seen = sig; return { kind: 'reviewed', findings, diffFiles } } },
+      worker: { run: async (_j, sig) => { seen = sig; return { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } } },
       publisher: { publish: async () => ({ status: 'published', noteId: 'n', body: 'b' }) },
       store: s.store,
     })
