@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { ReviewJobRunner } from '../../src/review/job_runner.js'
 import type { FindingsProducer, FindingsPublisher } from '../../src/review/job_runner.js'
-import type { ReviewJob, ReviewJobState, FindingsDocument } from '../../src/review/types.js'
+import type { ReviewJob, ReviewJobKey, ReviewJobState, ReviewStore, FindingsDocument } from '../../src/review/types.js'
+import { UNCHUNKED_PROVENANCE } from '../../src/review/types.js'
 import type { ReviewWorkOutcome } from '../../src/review/worker.js'
 import type { PublishResult } from '../../src/review/publisher.js'
 
@@ -35,6 +36,7 @@ function fakeStore() {
       recoverInFlight: async () => [],
       readCursor: async () => null,
       writeCursor: async () => {},
+      listForMergeRequest: async () => [],
     },
   }
 }
@@ -50,7 +52,7 @@ function runner(opts: {
   const outcome = opts.outcome
   const run: FindingsProducer['run'] = typeof outcome === 'function'
     ? async () => outcome()
-    : async () => outcome ?? { kind: 'reviewed', findings, diffFiles }
+    : async () => outcome ?? { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } }
   const worker: FindingsProducer = { run }
   const publishFn: FindingsPublisher['publish'] = opts.publishFn
     ?? vi.fn(async (): Promise<PublishResult> => opts.publish ?? { status: 'published', noteId: 'n1', body: 'b' })
@@ -168,7 +170,7 @@ describe('ReviewJobRunner — failure and retry', () => {
 
   it('never leaves the job in running or publishing — every path reaches a settled state', async () => {
     for (const outcome of [
-      { kind: 'reviewed', findings, diffFiles } as ReviewWorkOutcome,
+      { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } as ReviewWorkOutcome,
       { kind: 'stale', reason: 'r' } as ReviewWorkOutcome,
       { kind: 'failed', reason: 'r' } as ReviewWorkOutcome,
       { kind: 'too_large', reason: 'exceeds_cap', filesConsidered: 1, totalBytes: 9, maxDiffBytes: 1 } as ReviewWorkOutcome,
@@ -186,7 +188,7 @@ describe('ReviewJobRunner — the credential boundary', () => {
     let seen: AbortSignal | undefined
     const s = fakeStore()
     const r = new ReviewJobRunner({
-      worker: { run: async (_j, sig) => { seen = sig; return { kind: 'reviewed', findings, diffFiles } } },
+      worker: { run: async (_j, sig) => { seen = sig; return { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } } },
       publisher: { publish: async () => ({ status: 'published', noteId: 'n', body: 'b' }) },
       store: s.store,
     })
@@ -209,5 +211,100 @@ describe('ReviewJobRunner — the credential boundary', () => {
     const request = seen[0]!
     expect(Object.keys(request).sort()).toEqual(['diffFiles', 'findings', 'job'])
     expect(JSON.stringify(request.findings)).not.toContain('ignore your instructions')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Supersession vs stop(): both abort the same way, but must settle
+// differently, distinguished by re-reading the record — not by inspecting
+// the abort reason (design §12, slice A).
+// ---------------------------------------------------------------------------
+
+describe('ReviewJobRunner — an aborted run distinguishes supersession from stop()', () => {
+  it('a run aborted by supersession settles \'superseded\' WITHOUT consuming a retry attempt', async () => {
+    const updates: ReviewJob[] = []
+    // Simulates the controller's own write: supersedeOlderRevisions() marks
+    // the record 'superseded' in the store the moment it aborts the
+    // controller — which happens BEFORE the worker's promise actually
+    // rejects. So by the time job_runner's catch block re-reads the record,
+    // the store already reports 'superseded'.
+    let currentState: ReviewJobState = 'claimed'
+    const store: ReviewStore = {
+      get: async (k: ReviewJobKey) => ({ ...job(), key: k, state: currentState, attempts: 0 }),
+      put: async () => {},
+      update: async (j: ReviewJob) => { updates.push({ ...j }) },
+      claim: async () => true,
+      listClaimable: async () => [],
+      recoverInFlight: async () => [],
+      readCursor: async () => null,
+      writeCursor: async () => {},
+      listForMergeRequest: async () => [],
+    }
+
+    const ac = new AbortController()
+    const worker: FindingsProducer = {
+      run: async () => {
+        // The controller's supersedeOlderRevisions writes 'superseded' to
+        // the store and THEN aborts — this ordering is the whole point.
+        currentState = 'superseded'
+        ac.abort()
+        throw new Error('The operation was aborted')
+      },
+    }
+    const publisher: FindingsPublisher = { publish: async () => ({ status: 'published', noteId: 'n', body: 'b' }) }
+    const r = new ReviewJobRunner({ worker, publisher, store, now: () => new Date('2026-01-01T12:00:00Z') })
+
+    await expect(r.runJob(job({ attempts: 0 }), ac.signal)).resolves.toBeUndefined()
+
+    // No 'failed' transition, and attempts is never bumped by job_runner.
+    expect(updates.some((u) => u.state === 'failed')).toBe(false)
+    expect(updates.every((u) => u.attempts === 0)).toBe(true)
+
+    // The authoritative record (as re-read from the store) is 'superseded',
+    // not 'failed' — job_runner must not have clobbered it.
+    const final = await store.get(job().key)
+    expect(final?.state).toBe('superseded')
+  })
+
+  it('a run aborted by stop() (not supersession) still records a retryable failure — the existing behaviour, unregressed', async () => {
+    const { s, runner: r } = runner({
+      outcome: async () => { throw new Error('The operation was aborted') },
+    })
+    // stop() never touches the store (see controller.ts's stop()): the
+    // record is left in whatever pre-abort state it was already in, and
+    // critically is NEVER 'superseded'. fakeStore()'s get() always resolves
+    // null, so job_runner's re-read finds no 'superseded' record — exactly
+    // the stop() case.
+    const ac = new AbortController()
+    ac.abort()
+
+    await r.runJob(job({ attempts: 0 }), ac.signal)
+
+    expect(s.final().state).toBe('failed')
+    expect(s.final().attempts).toBe(1)
+    expect(s.final().nextRetryAt).toBeInstanceOf(Date)
+  })
+
+  it('a re-read that throws (store error) falls back to normal failure handling rather than silently dropping the failure', async () => {
+    const updates: ReviewJob[] = []
+    const store: ReviewStore = {
+      get: async () => { throw new Error('disk exploded') },
+      put: async () => {},
+      update: async (j: ReviewJob) => { updates.push({ ...j }) },
+      claim: async () => true,
+      listClaimable: async () => [],
+      recoverInFlight: async () => [],
+      readCursor: async () => null,
+      writeCursor: async () => {},
+      listForMergeRequest: async () => [],
+    }
+    const worker: FindingsProducer = { run: async () => { throw new Error('aborted') } }
+    const publisher: FindingsPublisher = { publish: async () => ({ status: 'published', noteId: 'n', body: 'b' }) }
+    const r = new ReviewJobRunner({ worker, publisher, store, now: () => new Date('2026-01-01T12:00:00Z') })
+
+    await expect(r.runJob(job({ attempts: 0 }), new AbortController().signal)).resolves.toBeUndefined()
+
+    expect(updates.some((u) => u.state === 'failed')).toBe(true)
+    expect(updates[updates.length - 1]!.attempts).toBe(1)
   })
 })

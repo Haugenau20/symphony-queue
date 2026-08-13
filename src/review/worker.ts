@@ -41,13 +41,15 @@ import type { PermissionRule } from '@opencode-ai/sdk/v2'
 import { getLogger } from '../log.js'
 import { checkContainment } from '../path_safety.js'
 import { safeParseFindingsDocument } from './findings.js'
+import { isExcludedPath } from './material.js'
 import type {
-  FindingsDocument,
   MergeRequestClient,
   MergeRequestDiffFile,
   MergeRequestSummary,
   ReviewJob,
+  ReviewWorkOutcome,
 } from './types.js'
+import { UNCHUNKED_PROVENANCE } from './types.js'
 import type { AgentRunner, RunTarget } from '../agent_runner.js'
 import type { Workspace } from '../models.js'
 import type { WorkspaceManager } from '../workspace.js'
@@ -171,73 +173,32 @@ export interface ReviewWorkerConfig {
   agentTimeoutMs?: number
 }
 
-export interface ReviewedOutcome {
-  kind: 'reviewed'
-  findings: FindingsDocument
-  /** The files the agent was actually shown (post exclude_paths filtering, non-collapsed). The publisher
-   *  uses this to catch a finding naming a file outside what was reviewed. */
-  diffFiles: Array<{ oldPath: string; newPath: string }>
-}
-
-export interface TooLargeOutcome {
-  kind: 'too_large'
-  reason: 'all_collapsed' | 'exceeds_cap'
-  filesConsidered: number
-  totalBytes: number
-  maxDiffBytes: number
-}
-
-/** The merge request's head commit had already moved before the review could start. */
-export interface StaleOutcome {
-  kind: 'stale'
-  reason: string
-}
-
-export interface FailedOutcome {
-  kind: 'failed'
-  reason: string
-}
-
 /**
- * Tagged union, deliberately — Phase 2's chunked multi-pass review adds a
- * `kind: 'chunked'` variant here, and every caller that already switches on
- * `.kind` keeps working unchanged.
+ * The work outcome union now lives in ./types.ts and is re-exported here.
+ *
+ * It moved for a scheduling reason rather than a tidiness one: `job_runner.ts`
+ * switches on this union and `worker.ts` produces it, and phase 2 builds those
+ * two in different waves. Leaving the union in this file would have made
+ * `worker.ts` the shared contract between two slices whose whole safety
+ * property is that they never edit the same file.
+ *
+ * Every existing import of these names from `./worker.js` keeps working.
  */
-export type ReviewWorkOutcome = ReviewedOutcome | TooLargeOutcome | StaleOutcome | FailedOutcome
+export type {
+  ReviewedOutcome,
+  TooLargeOutcome,
+  StaleOutcome,
+  FailedOutcome,
+  ReviewWorkOutcome,
+  ReviewProvenance,
+} from './types.js'
 
 // --- glob matching for exclude_paths ------------------------------------------
-
-/** Converts a `*`/`**` glob into an anchored RegExp. `**` matches across `/`; a lone `*` does not. */
-export function globToRegExp(pattern: string): RegExp {
-  let body = ''
-  let i = 0
-  while (i < pattern.length) {
-    const c = pattern[i]
-    if (c === '*') {
-      if (pattern[i + 1] === '*') {
-        body += '.*'
-        i += 2
-        continue
-      }
-      body += '[^/]*'
-      i += 1
-      continue
-    }
-    if (c === '?') {
-      body += '[^/]'
-      i += 1
-      continue
-    }
-    body += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    i += 1
-  }
-  return new RegExp(`^${body}$`)
-}
-
-export function isExcludedPath(path: string, patterns: string[]): boolean {
-  if (patterns.length === 0) return false
-  return patterns.some((p) => globToRegExp(p).test(path))
-}
+//
+// MOVED to material.ts, which is pure glob code and belongs beside the rest of
+// the material planner rather than in this I/O-heavy file. Re-exported here so
+// every existing `from './worker.js'` import keeps compiling unchanged.
+export { globToRegExp, isExcludedPath } from './material.js'
 
 // --- helpers ----------------------------------------------------------------
 
@@ -577,6 +538,10 @@ export class ReviewWorker {
         kind: 'reviewed',
         findings: parsed.data,
         diffFiles: reviewable.map((f) => ({ oldPath: f.oldPath, newPath: f.newPath })),
+        // Phase 1's shape, stated in phase 2's vocabulary: one chunk, no
+        // critique, no checkout. Slice E replaces this with what actually
+        // happened once there is more than one thing that can happen.
+        provenance: { ...UNCHUNKED_PROVENANCE },
       }
     } finally {
       // Always — success, a failed/malformed run, or the agent throwing — with

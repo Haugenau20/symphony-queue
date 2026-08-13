@@ -446,6 +446,117 @@ describe('path containment — a hostile project id cannot escape the store root
   })
 })
 
+describe('listForMergeRequest — phase 2 supersession lookup', () => {
+  it('finds records physically located in projects/, claimed/ AND failed/ for the same (project, iid), and excludes a record for a different iid', async () => {
+    const s = store()
+    const projectId = 'my-org/service-a'
+    const mrIid = 500
+
+    // Lives under projects/<project>/<iid>/ — a record in a state that has
+    // never moved out of there.
+    await s.put(job({ key: key({ projectId, mrIid, headSha: 'sha-discovered' }), state: 'discovered' }))
+
+    // Lives under claimed/ — keyed by a hash of the full key, not derivable
+    // from (projectId, mrIid) alone.
+    const claimedKey = key({ projectId, mrIid, headSha: 'sha-claimed' })
+    await s.put(job({ key: claimedKey, state: 'discovered' }))
+    await s.claim(claimedKey)
+
+    // Lives under failed/ — likewise keyed by a hash of the full key.
+    const failedKey = key({ projectId, mrIid, headSha: 'sha-failed' })
+    await s.put(job({ key: failedKey, state: 'discovered' }))
+    await s.claim(failedKey)
+    const claimedFailed = await s.get(failedKey)
+    await s.update({ ...claimedFailed!, state: 'failed', attempts: 1, nextRetryAt: new Date(Date.now() + 60000) })
+
+    // A record for a DIFFERENT iid, same project — must not be returned.
+    await s.put(job({ key: key({ projectId, mrIid: mrIid + 1, headSha: 'sha-other-iid' }) }))
+    // A record for a different project, same iid — must not be returned either.
+    await s.put(job({ key: key({ projectId: 'my-org/service-b', mrIid, headSha: 'sha-other-project' }) }))
+
+    const found = await s.listForMergeRequest(projectId, mrIid)
+    expect(found.map((j) => j.key.headSha).sort()).toEqual(['sha-claimed', 'sha-discovered', 'sha-failed'])
+    expect(found.every((j) => j.key.projectId === projectId && j.key.mrIid === mrIid)).toBe(true)
+
+    const states = new Map(found.map((j) => [j.key.headSha, j.state]))
+    expect(states.get('sha-discovered')).toBe('discovered')
+    expect(states.get('sha-claimed')).toBe('claimed')
+    expect(states.get('sha-failed')).toBe('failed')
+  })
+
+  it('skips a malformed record with a warning rather than throwing', async () => {
+    const s = store()
+    const projectId = 'my-org/service-a'
+    const mrIid = 501
+    await s.put(job({ key: key({ projectId, mrIid, headSha: 'sha-good' }) }))
+
+    const dir = join(root, 'projects', encodeURIComponent(projectId), String(mrIid))
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${encodeURIComponent('sha-bad')}.json`), 'not json at all', 'utf-8')
+
+    const found = await s.listForMergeRequest(projectId, mrIid)
+    expect(found.map((j) => j.key.headSha)).toEqual(['sha-good'])
+  })
+
+  it('a malformed record in claimed/ is likewise skipped rather than thrown', async () => {
+    const s = store()
+    const projectId = 'my-org/service-a'
+    const mrIid = 505
+    const goodKey = key({ projectId, mrIid, headSha: 'sha-good' })
+    await s.put(job({ key: goodKey }))
+    await s.claim(goodKey)
+
+    const claimedDir = join(root, 'claimed')
+    mkdirSync(claimedDir, { recursive: true })
+    writeFileSync(join(claimedDir, 'garbage.json'), '{{{not valid', 'utf-8')
+
+    const found = await s.listForMergeRequest(projectId, mrIid)
+    expect(found.map((j) => j.key.headSha)).toEqual(['sha-good'])
+  })
+
+  it('returns records newest-discovered first', async () => {
+    const s = store()
+    const projectId = 'my-org/service-a'
+    const mrIid = 502
+    await s.put(job({ key: key({ projectId, mrIid, headSha: 'older' }), discoveredAt: new Date('2026-08-01T00:00:00Z') }))
+    await s.put(job({ key: key({ projectId, mrIid, headSha: 'newer' }), discoveredAt: new Date('2026-08-10T00:00:00Z') }))
+    const found = await s.listForMergeRequest(projectId, mrIid)
+    expect(found.map((j) => j.key.headSha)).toEqual(['newer', 'older'])
+  })
+
+  it('returns an empty array when nothing exists for the merge request', async () => {
+    const s = store()
+    expect(await s.listForMergeRequest('nope/nope', 9999)).toEqual([])
+  })
+
+  it('when the same head SHA exists in more than one location, the more "live" copy wins: claimed over failed over discovered', async () => {
+    // This can only happen transiently (e.g. mid-transition), but the lookup
+    // must still resolve deterministically rather than returning duplicates.
+    const s = store()
+    const projectId = 'my-org/service-a'
+    const mrIid = 503
+    const k = key({ projectId, mrIid, headSha: 'sha-x' })
+    await s.put(job({ key: k, state: 'discovered' }))
+    await s.claim(k)
+    const claimed = await s.get(k)
+    expect(claimed!.state).toBe('claimed')
+
+    const found = await s.listForMergeRequest(projectId, mrIid)
+    expect(found).toHaveLength(1)
+    expect(found[0].state).toBe('claimed')
+  })
+
+  it('a hostile projectId still goes through checkContainment rather than escaping the store root', async () => {
+    const s = store()
+    await expect(s.listForMergeRequest('..', 1)).rejects.toThrow()
+  })
+
+  it('rejects a non-integer mrIid rather than silently misbehaving', async () => {
+    const s = store()
+    await expect(s.listForMergeRequest('my-org/service-a', 1.5)).rejects.toThrow()
+  })
+})
+
 describe('root validation', () => {
   it('throws when the root does not exist and createIfMissing is not set', () => {
     const missing = join(root, 'does-not-exist')

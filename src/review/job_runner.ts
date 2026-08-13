@@ -125,8 +125,25 @@ export class ReviewJobRunner {
           return
       }
     } catch (err) {
-      // Includes an aborted run: stop() cancels live work, and the record is
-      // meant to come back as claimable rather than stay 'running' forever.
+      // Includes an aborted run: both stop() and supersession abort live
+      // work through the same AbortController, and there is no reliable way
+      // to tell them apart from the thrown error alone (an AbortError looks
+      // the same either way). The two cases need opposite handling —
+      // stop()'s abort must still land as a retryable failure (design §12:
+      // "leave records claimed for the next start"), while a supersession
+      // abort must NOT consume a retry attempt on a revision that is already
+      // pointless — so the record itself, not the abort reason, is the
+      // source of truth: re-read it, and if the controller has already
+      // marked it 'superseded' (which only supersession ever does), there is
+      // nothing left for this run to record.
+      const current = await this.store.get(job.key).catch(() => null)
+      if (current?.state === 'superseded') {
+        log.info(
+          { project: projectId, mrIid, headSha },
+          'review_run_aborted_by_supersession',
+        )
+        return
+      }
       await this.recordFailure(job, describe(err))
     }
   }
