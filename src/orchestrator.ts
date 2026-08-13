@@ -1,10 +1,12 @@
 import { getLogger } from './log.js'
-import type { OrchestratorState, Issue } from './models.js'
+import type { OrchestratorState, Issue, Workspace } from './models.js'
 import { createOrchestratorState } from './models.js'
 import type { TrackerAdapter } from './tracker/base.js'
 import type { AgentRunner, AgentActivity, AgentRunResult } from './agent_runner.js'
+import { IMPLEMENTATION_PERMISSIONS } from './agent_runner.js'
 import type { WorkspaceManager } from './workspace.js'
 import { renderPrompt } from './prompt_builder.js'
+import { describeWorkspaceEvidence, explainVerdict } from './workspace_evidence.js'
 
 /**
  * Where a run lands when the agent's turns finish normally. `In Review` is the
@@ -20,6 +22,41 @@ export const EXIT_STATE_NORMAL = 'In Review'
  * returns the item to todo/ when due (docs/DESIGN.md §4).
  */
 export const EXIT_STATE_ABNORMAL = 'Failed'
+
+/**
+ * The terminal states a run's `shouldContinue` check treats as "stop". This is
+ * the list AgentRunner's now-removed `isActiveState` used to hard-code
+ * in-module; it moves here with dispatchIssue, which now owns the liveness
+ * check the runner used to make on its behalf. Deliberately its own list
+ * rather than a reuse of `terminalStates` above (the configurable, exact-case
+ * list `reconcileTrackerStates` compares against) — that field can be
+ * reconfigured per-workflow, and swapping it in here would change today's
+ * dispatch behaviour instead of preserving it.
+ */
+const TERMINAL = ['closed', 'cancelled', 'canceled', 'duplicate', 'done']
+
+/**
+ * Workspace verdicts that mean "there was a workspace, and no branch reached the
+ * remote from it".
+ *
+ * Two verdicts are deliberately absent, both for the same reason — a note on the
+ * issue has to be worth a person's attention, and a wrong one is worse than
+ * silence:
+ *
+ *   no_workspace  there is nothing to inspect. Running without a workspace
+ *                 manager is a legitimate configuration, and the work may have
+ *                 happened somewhere this cannot see. Absence of evidence is not
+ *                 evidence.
+ *   unknown       the layout could not be interpreted, which is not a finding.
+ */
+const LEFT_NOTHING = ['not_cloned', 'cloned_no_local_branch', 'committed_not_pushed']
+
+/** First `limit` characters, with an explicit marker when there was more. */
+function truncateForLog(text: string, limit: number): string {
+  const clean = text.trim()
+  if (clean.length === 0) return '<the agent said nothing at all>'
+  return clean.length > limit ? `${clean.slice(0, limit)}… [${clean.length} chars total]` : clean
+}
 
 export function dispatchKey(issue: Issue): [number, number, string] {
   const prio = issue.priority ?? 9999
@@ -324,6 +361,10 @@ export class SymphonyOrchestrator {
   private dispatchIssue(issue: Issue, attempt?: number | null): void {
     const abortController = new AbortController()
     const task = (async () => {
+      // Declared outside the try so the catch below can still say WHICH
+      // workspace a failed run was using — that is the one case where the
+      // evidence matters most.
+      let ws: Workspace | undefined
       try {
         if (issue.state === 'Todo') {
           try {
@@ -333,7 +374,7 @@ export class SymphonyOrchestrator {
             getLogger().warn({ issueId: issue.id, identifier: issue.identifier, error: String(stateErr) }, 'state_transition_failed')
           }
         }
-        const ws = this.workspaceManager?.createForIssue(issue.identifier)
+        ws = this.workspaceManager?.createForIssue(issue.identifier)
         if (ws && this.workspaceManager) {
           await this.workspaceManager.runAfterCreate(ws)
           await this.workspaceManager.runBeforeRun(ws)
@@ -347,7 +388,21 @@ export class SymphonyOrchestrator {
         // but still holding the workspace and still talking to the model.
         let result: AgentRunResult
         try {
-          result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal)
+          result = await this.agentRunner.run(issue, prompt, ws?.path ?? null, abortController.signal, {
+            permissions: IMPLEMENTATION_PERMISSIONS,
+            // Mirrors what the runner used to do internally via
+            // issueStateFetcher + isActiveState: a fetch failure must behave
+            // exactly as it did before, i.e. as "stop" — refreshIssueState's
+            // catch block returned null on error, which read as inactive.
+            shouldContinue: async () => {
+              try {
+                const [fresh] = await this.tracker.fetchIssueStatesByIds([issue.id])
+                return fresh !== undefined && !TERMINAL.includes(fresh.state.toLowerCase())
+              } catch {
+                return false
+              }
+            },
+          })
         } finally {
           // after_run is paired with the agent invocation, not with a
           // successful result. Cleanup and publication hooks still need to run
@@ -364,10 +419,10 @@ export class SymphonyOrchestrator {
             }
           }
         }
-        await this.onWorkerExit(issue.id, result.success, result)
+        await this.onWorkerExit(issue.id, result.success, result, ws?.path ?? null)
       } catch (err) {
         getLogger().error({ issueId: issue.id, error: String(err) }, 'worker_failed')
-        await this.onWorkerExit(issue.id, false)
+        await this.onWorkerExit(issue.id, false, undefined, ws?.path ?? null)
       }
     })()
     this.state.running.set(issue.id, {
@@ -384,7 +439,7 @@ export class SymphonyOrchestrator {
   }
 
   private async onWorkerExit(
-    issueId: string, normal: boolean, result?: AgentRunResult,
+    issueId: string, normal: boolean, result?: AgentRunResult, workspacePath?: string | null,
   ): Promise<void> {
     const entry = this.state.running.get(issueId)
     if (!entry) return
@@ -407,6 +462,44 @@ export class SymphonyOrchestrator {
       getLogger().info({ issueId, identifier: entry.identifier, state: targetState }, 'state_transitioned_on_exit')
     } catch (stateErr) {
       getLogger().warn({ issueId, identifier: entry.identifier, state: targetState, error: String(stateErr) }, 'exit_state_transition_failed')
+    }
+
+    // What the agent actually left behind, read off the filesystem rather than
+    // taken from its word. An agent that emits the completion marker having
+    // pushed nothing produces a log identical to one that succeeded: the issue
+    // moves to In Review and nothing anywhere says the branch does not exist.
+    // This is the implementation lane's version of the review lane's
+    // "reported complete, wrote no FINDINGS.json".
+    const evidence = await describeWorkspaceEvidence(workspacePath ?? null)
+    getLogger().info(
+      {
+        issueId,
+        identifier: entry.identifier,
+        stopReason: result?.stopReason ?? null,
+        turnsCompleted: result?.turnsCompleted ?? null,
+        workspace: evidence.verdict,
+        branch: evidence.branch,
+        localBranches: evidence.localBranches,
+        remoteBranches: evidence.remoteBranches,
+        hasRemote: evidence.hasRemote,
+        workspaceEntries: evidence.entries,
+        // The agent's own account, truncated. Untrusted model output: logged as
+        // a diagnostic and nothing else.
+        agentSaid: truncateForLog(result?.finalText ?? '', 1200),
+      },
+      'agent_run_evidence',
+    )
+
+    // An agent that says it finished and left no pushed branch is the failure
+    // this pipeline is least equipped to notice, so say it where the work is —
+    // the same reasoning as the max_turns note below.
+    if (normal && result?.stopReason === 'completed' && LEFT_NOTHING.includes(evidence.verdict)) {
+      await this.annotate(issueId, entry.identifier,
+        '**Symphony: this run reported that it was finished, but its workspace shows no '
+        + `pushed branch** — ${explainVerdict(evidence)}.\n\n`
+        + 'The issue has still been moved on, because the agent declared completion and this '
+        + 'check is an observation rather than a verdict on the work. If a merge request was '
+        + 'expected here, there is not one: look at the run log for what the agent said it did.')
     }
 
     // Exhausting the turn budget lands on the same state as finishing, so the

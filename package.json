@@ -26,7 +26,8 @@
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "image:build": "./scripts/build-image.sh"
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.17.15",

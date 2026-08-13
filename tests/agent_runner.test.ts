@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
-import { AgentRunner, declaresCompletion, promptText, describeApiError } from '../src/agent_runner.js'
+import { AgentRunner, IMPLEMENTATION_PERMISSIONS, declaresCompletion, promptText, describeApiError } from '../src/agent_runner.js'
 import type { Issue } from '../src/models.js'
+import type { PermissionRule } from '@opencode-ai/sdk/v2'
 
 function makeIssue(overrides?: Partial<Issue>): Issue {
   return {
@@ -9,6 +10,25 @@ function makeIssue(overrides?: Partial<Issue>): Issue {
     labels: [], blockedBy: [], createdAt: null, updatedAt: null,
     ...overrides,
   } as Issue
+}
+
+/**
+ * The per-run options `run()` now requires. Defaults `shouldContinue` to
+ * `false` because most of these tests exercise a single-turn run (maxTurns:
+ * 1) where the loop that would call it never runs at all — the value is moot
+ * there and `false` mirrors what an inactive/absent issue used to produce via
+ * the old `issueStateFetcher`. Tests that actually exercise the continuation
+ * loop override it explicitly.
+ */
+function runOpts(overrides?: Partial<{
+  permissions: PermissionRule[]
+  shouldContinue: () => Promise<boolean>
+}>) {
+  return {
+    permissions: IMPLEMENTATION_PERMISSIONS,
+    shouldContinue: async () => false,
+    ...overrides,
+  }
 }
 
 /**
@@ -52,11 +72,8 @@ function mockClient(opts?: {
 describe('AgentRunner (SDK v2)', () => {
   it('creates session and sends prompt', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    const result = await runner.run(makeIssue(), 'Work on this')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    const result = await runner.run(makeIssue(), 'Work on this', null, undefined, runOpts())
     expect(result.success).toBe(true)
     expect(result.sessionId).toBe('session-1')
     expect(result.turnsCompleted).toBe(1)
@@ -73,11 +90,8 @@ describe('AgentRunner (SDK v2)', () => {
 
   it('handles createSession failure', async () => {
     const client = mockClient({ createFail: true })
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [],
-    })
-    const result = await runner.run(makeIssue(), 'Work')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    const result = await runner.run(makeIssue(), 'Work', null, undefined, runOpts())
     expect(result.success).toBe(false)
     expect(result.error).toContain('create failed')
     expect(result.turnsCompleted).toBe(0)
@@ -85,11 +99,8 @@ describe('AgentRunner (SDK v2)', () => {
 
   it('handles initial prompt API error', async () => {
     const client = mockClient({ promptFail: true })
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [],
-    })
-    const result = await runner.run(makeIssue(), 'Work')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    const result = await runner.run(makeIssue(), 'Work', null, undefined, runOpts())
     expect(result.success).toBe(false)
     expect(result.error).toContain('initial_prompt_failed')
   })
@@ -101,22 +112,16 @@ describe('AgentRunner (SDK v2)', () => {
         prompt: vi.fn().mockRejectedValue(new Error('network error')),
       },
     } as any
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [],
-    })
-    const result = await runner.run(makeIssue(), 'Work')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    const result = await runner.run(makeIssue(), 'Work', null, undefined, runOpts())
     expect(result.success).toBe(false)
     expect(result.error).toContain('network error')
   })
 
   it('includes permissions in session create', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(client.session.create).toHaveBeenCalledWith(
       expect.objectContaining({
         permission: expect.arrayContaining([
@@ -140,8 +145,8 @@ describe('AgentRunner failure diagnostics', () => {
     client.session.prompt = vi.fn().mockResolvedValue({
       error: { message: 'upstream timed out after 300s' },
     })
-    const runner = new AgentRunner(client, { maxTurns: 3, issueStateFetcher: async () => [] })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(result.success).toBe(false)
     expect(result.error).toContain('initial_prompt_failed')
     expect(result.error).toContain('upstream timed out')
@@ -153,10 +158,10 @@ describe('AgentRunner failure diagnostics', () => {
     client.session.prompt = vi.fn(async () => (n++ === 0
       ? { data: { parts: [] } }
       : { error: { message: 'model overloaded' } }))
-    const runner = new AgentRunner(client, {
-      maxTurns: 3, issueStateFetcher: async () => [makeIssue()],
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.success).toBe(false)
     expect(result.error).toContain('continuation_turn_failed')
     expect(result.error).toContain('model overloaded')
@@ -168,10 +173,8 @@ describe('AgentRunner failure diagnostics', () => {
     client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
       seen.push(o?.signal); return { data: { parts: [] } }
     })
-    const runner = new AgentRunner(client, {
-      maxTurns: 1, issueStateFetcher: async () => [], sessionTimeoutMs: 60000,
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 1, sessionTimeoutMs: 60000 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(seen[0]).toBeInstanceOf(AbortSignal)
     expect(seen[0]!.aborted).toBe(false)
   })
@@ -186,8 +189,8 @@ describe('AgentRunner failure diagnostics', () => {
     client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
       seen.push(o?.signal); return { data: { parts: [] } }
     })
-    const runner = new AgentRunner(client, { maxTurns: 1, issueStateFetcher: async () => [] })
-    await runner.run(makeIssue(), 'do work', null, controller.signal)
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', null, controller.signal, runOpts())
     expect(seen[0]).toBeInstanceOf(AbortSignal)
     controller.abort()
     expect(seen[0]!.aborted).toBe(true)
@@ -200,10 +203,8 @@ describe('AgentRunner failure diagnostics', () => {
     client.session.prompt = vi.fn(async (_p: unknown, o?: { signal?: AbortSignal }) => {
       seen.push(o?.signal); return { data: { parts: [] } }
     })
-    const runner = new AgentRunner(client, {
-      maxTurns: 1, issueStateFetcher: async () => [], sessionTimeoutMs: 60000,
-    })
-    await runner.run(makeIssue(), 'do work', null, controller.signal)
+    const runner = new AgentRunner(client, { maxTurns: 1, sessionTimeoutMs: 60000 })
+    await runner.run(makeIssue(), 'do work', null, controller.signal, runOpts())
     controller.abort()
     expect(seen[0]!.aborted).toBe(true)
   })
@@ -247,12 +248,10 @@ describe('AgentRunner completion marker', () => {
 
   it('stops as soon as the agent declares itself finished', async () => {
     const client = clientReplying('still working', 'nearly there', 'all done\nSYMPHONY_DONE')
-    const runner = new AgentRunner(client, {
-      maxTurns: 10,
-      issueStateFetcher: async () => [makeIssue()],
-      completionMarker: 'SYMPHONY_DONE',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 10, completionMarker: 'SYMPHONY_DONE' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.turnsCompleted).toBe(3)
     expect(result.stopReason).toBe('completed')
     expect(client.session.prompt).toHaveBeenCalledTimes(3)
@@ -260,12 +259,8 @@ describe('AgentRunner completion marker', () => {
 
   it('can finish on the very first turn', async () => {
     const client = clientReplying('done immediately\nSYMPHONY_DONE')
-    const runner = new AgentRunner(client, {
-      maxTurns: 10,
-      issueStateFetcher: async () => [makeIssue()],
-      completionMarker: 'SYMPHONY_DONE',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 10, completionMarker: 'SYMPHONY_DONE' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(result.turnsCompleted).toBe(1)
     expect(result.stopReason).toBe('completed')
     expect(client.session.prompt).toHaveBeenCalledTimes(1)
@@ -275,12 +270,10 @@ describe('AgentRunner completion marker', () => {
     // The distinction the logs could not previously make: interrupted mid-task
     // looks identical to finished, and both are filed as reviewable.
     const client = clientReplying('working')
-    const runner = new AgentRunner(client, {
-      maxTurns: 4,
-      issueStateFetcher: async () => [makeIssue()],
-      completionMarker: 'SYMPHONY_DONE',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 4, completionMarker: 'SYMPHONY_DONE' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.turnsCompleted).toBe(4)
     expect(result.stopReason).toBe('max_turns')
   })
@@ -290,36 +283,30 @@ describe('AgentRunner completion marker', () => {
     // "I'll reply with SYMPHONY_DONE when the MR is open" as the declaration
     // itself and cut the run off before any work happened.
     const client = clientReplying("I will reply with SYMPHONY_DONE once the MR is open.", 'working', 'working', 'working')
-    const runner = new AgentRunner(client, {
-      maxTurns: 3,
-      issueStateFetcher: async () => [makeIssue()],
-      completionMarker: 'SYMPHONY_DONE',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3, completionMarker: 'SYMPHONY_DONE' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.stopReason).toBe('max_turns')
     expect(result.turnsCompleted).toBe(3)
   })
 
   it('uses every turn when the marker is disabled', async () => {
     const client = clientReplying('SYMPHONY_DONE')
-    const runner = new AgentRunner(client, {
-      maxTurns: 3,
-      issueStateFetcher: async () => [makeIssue()],
-      completionMarker: '',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3, completionMarker: '' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.turnsCompleted).toBe(3)
     expect(result.stopReason).toBe('max_turns')
   })
 
   it('reports issue_inactive when a human ends the item mid-run', async () => {
     const client = clientReplying('working')
-    const runner = new AgentRunner(client, {
-      maxTurns: 5,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-      completionMarker: 'SYMPHONY_DONE',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 5, completionMarker: 'SYMPHONY_DONE' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => false,
+    }))
     expect(result.stopReason).toBe('issue_inactive')
     expect(result.turnsCompleted).toBe(1)
   })
@@ -351,44 +338,32 @@ describe('AgentRunner session working directory', () => {
     // server's default, which on a fresh OpenCode server is `/`.
     const asked: Array<string | null> = []
     const client = mockClient()
-    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1')
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1', undefined, runOpts())
     expect(asked).toEqual(['/workspaces/TICKET-1'])
   })
 
   it('asks for the default root when there is no workspace', async () => {
     const asked: Array<string | null> = []
     const client = mockClient()
-    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', undefined, undefined, runOpts())
     expect(asked).toEqual([null])
   })
 
   it('builds a fresh client per run, so two items cannot share a root', async () => {
     const asked: Array<string | null> = []
     const client = mockClient()
-    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    await runner.run(makeIssue({ id: 'a' }), 'work', '/workspaces/A')
-    await runner.run(makeIssue({ id: 'b' }), 'work', '/workspaces/B')
+    const runner = new AgentRunner((dir) => { asked.push(dir); return client }, { maxTurns: 1 })
+    await runner.run(makeIssue({ id: 'a' }), 'work', '/workspaces/A', undefined, runOpts())
+    await runner.run(makeIssue({ id: 'b' }), 'work', '/workspaces/B', undefined, runOpts())
     expect(asked).toEqual(['/workspaces/A', '/workspaces/B'])
   })
 
   it('still accepts a plain client, which roots every session the same way', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    const result = await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    const result = await runner.run(makeIssue(), 'do work', '/workspaces/TICKET-1', undefined, runOpts())
     expect(result.success).toBe(true)
     expect(client.session.create).toHaveBeenCalled()
   })
@@ -405,10 +380,11 @@ describe('AgentRunner activity reporting', () => {
     const client = mockClient()
     const runner = new AgentRunner(client, {
       maxTurns: 2,
-      issueStateFetcher: async () => [makeIssue()],
       onActivity: (a) => seen.push(a.event ?? '?'),
     })
-    await runner.run(makeIssue(), 'do work')
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(seen).toEqual(['session_created', 'turn_completed', 'turn_completed'])
   })
 
@@ -426,22 +402,17 @@ describe('AgentRunner activity reporting', () => {
     })
     const runner = new AgentRunner(client, {
       maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
       onActivity: (a) => seen.push(a.event ?? '?'),
     })
-    await runner.run(makeIssue(), 'do work')
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(seen).toContain('message.part.updated')
     expect(seen).toContain('tool.executed')
   })
 
   it('subscribes to the session it created, not to everything', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-      onActivity: () => {},
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 1, onActivity: () => {} })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(client.v2.session.events).toHaveBeenCalledWith(
       expect.objectContaining({ sessionID: 'session-1' }),
       expect.anything(),
@@ -453,10 +424,9 @@ describe('AgentRunner activity reporting', () => {
     const client = mockClient()
     const runner = new AgentRunner(client, {
       maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
       onActivity: (a) => seen.push({ issueId: a.issueId, sessionId: a.sessionId }),
     })
-    await runner.run(makeIssue({ id: 'issue-9' }), 'do work')
+    await runner.run(makeIssue({ id: 'issue-9' }), 'do work', null, undefined, runOpts())
     expect(seen[0]).toEqual({ issueId: 'issue-9', sessionId: 'session-1' })
   })
 
@@ -465,12 +435,8 @@ describe('AgentRunner activity reporting', () => {
     // orchestrator.
     const signalBox: { signal?: AbortSignal } = {}
     const client = mockClient({ signalBox })
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-      onActivity: () => {},
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 1, onActivity: () => {} })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     await flush()
     expect(signalBox.signal?.aborted).toBe(true)
   })
@@ -489,10 +455,9 @@ describe('AgentRunner activity reporting', () => {
     })) as any
     const runner = new AgentRunner(client, {
       maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
       onActivity: (a) => seen.push(a.event ?? '?'),
     })
-    await runner.run(makeIssue(), 'do work')
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     await flush(); await flush()
     const settled = seen.length
     await flush(); await flush(); await flush()
@@ -506,10 +471,9 @@ describe('AgentRunner activity reporting', () => {
     const client = mockClient({ eventsFail: true })
     const runner = new AgentRunner(client, {
       maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
       onActivity: (a) => seen.push(a.event ?? '?'),
     })
-    const result = await runner.run(makeIssue(), 'do work')
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     await flush()
     expect(result.success).toBe(true)
     expect(seen).toEqual(['session_created', 'turn_completed'])
@@ -519,20 +483,16 @@ describe('AgentRunner activity reporting', () => {
     const client = mockClient()
     const runner = new AgentRunner(client, {
       maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
       onActivity: () => { throw new Error('observer blew up') },
     })
-    const result = await runner.run(makeIssue(), 'do work')
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     expect(result.success).toBe(true)
   })
 
   it('does not subscribe at all when nobody is listening', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 1,
-      issueStateFetcher: async () => [makeIssue({ state: 'Done' })],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts())
     await flush()
     expect(client.v2.session.events).not.toHaveBeenCalled()
   })
@@ -540,33 +500,28 @@ describe('AgentRunner activity reporting', () => {
 
 describe('AgentRunner continuation turns', () => {
   it('loops through multiple turns when issue stays active', async () => {
-    let fetcherCalls = 0
+    // The existing-behaviour proof: a target shouldContinue keeps reporting as
+    // active runs every turn up to max_turns, exactly as isActiveState +
+    // issueStateFetcher used to.
+    let calls = 0
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 3,
-      issueStateFetcher: async () => {
-        fetcherCalls++
-        return [makeIssue()] // always active (In Progress)
-      },
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => { calls++; return true },
+    }))
     expect(result.success).toBe(true)
     expect(result.turnsCompleted).toBe(3)
     expect(client.session.prompt).toHaveBeenCalledTimes(3)
+    expect(calls).toBeGreaterThan(0)
   })
 
   it('stops when issue state is no longer active', async () => {
-    let fetcherCalls = 0
+    let calls = 0
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 10,
-      issueStateFetcher: async () => {
-        fetcherCalls++
-        if (fetcherCalls >= 2) return [makeIssue({ state: 'Done' })]
-        return [makeIssue()]
-      },
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 10 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => { calls++; return calls < 2 },
+    }))
     expect(result.success).toBe(true)
     expect(result.turnsCompleted).toBe(2)
     expect(client.session.prompt).toHaveBeenCalledTimes(2)
@@ -577,11 +532,10 @@ describe('AgentRunner continuation turns', () => {
     // it keeps refining while the finishing step goes undone, and the run then
     // exits "cleanly" with nothing to show for it.
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 3,
-      issueStateFetcher: async () => [makeIssue()],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 3 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     const last = client.session.prompt.mock.calls[2][0].parts[0].text
     expect(last).toContain('turn 3 of 3')
     expect(last).toContain('0 turn(s) remain')
@@ -593,11 +547,10 @@ describe('AgentRunner continuation turns', () => {
     // Under the gitlab tracker there is no item file and the workpad is an
     // issue comment, so the instruction pointed at nothing.
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 2,
-      issueStateFetcher: async () => [makeIssue()],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 2 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     const cont = client.session.prompt.mock.calls[1][0].parts[0].text
     expect(cont).not.toContain('queue item')
     expect(cont).toContain('workpad')
@@ -607,10 +560,11 @@ describe('AgentRunner continuation turns', () => {
     const client = mockClient()
     const runner = new AgentRunner(client, {
       maxTurns: 2,
-      issueStateFetcher: async () => [makeIssue()],
       continuationGuidance: 'Turn {{ turn }}/{{ max_turns }}. Open the merge request before you stop.',
     })
-    await runner.run(makeIssue(), 'do work')
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     const cont = client.session.prompt.mock.calls[1][0].parts[0].text
     expect(cont).toBe('Turn 2/2. Open the merge request before you stop.')
   })
@@ -618,28 +572,105 @@ describe('AgentRunner continuation turns', () => {
   it('falls back to the default when the workflow template is broken', async () => {
     // A bad template in WORKFLOW.md must not strand a run already under way.
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 2,
-      issueStateFetcher: async () => [makeIssue()],
-      continuationGuidance: 'broken {{ unclosed',
-    })
-    const result = await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 2, continuationGuidance: 'broken {{ unclosed' })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(result.success).toBe(true)
     expect(client.session.prompt.mock.calls[1][0].parts[0].text).toContain('Continuation guidance')
   })
 
   it('uses continuation guidance for subsequent turns', async () => {
     const client = mockClient()
-    const runner = new AgentRunner(client, {
-      maxTurns: 2,
-      issueStateFetcher: async () => [makeIssue()],
-    })
-    await runner.run(makeIssue(), 'do work')
+    const runner = new AgentRunner(client, { maxTurns: 2 })
+    await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
     expect(client.session.prompt).toHaveBeenCalledTimes(2)
     // Second call should use continuation guidance, not the full prompt
     const firstCall = client.session.prompt.mock.calls[0][0]
     const secondCall = client.session.prompt.mock.calls[1][0]
     expect(firstCall.parts[0].text).toContain('do work')
     expect(secondCall.parts[0].text).toContain('Continuation guidance')
+  })
+})
+
+describe('AgentRunner run() options', () => {
+  // These four pin down the contract the review pipeline (a second caller of
+  // run()) depends on: permissions and liveness are supplied per-run, not
+  // baked into the runner.
+
+  it('uses the permission set it was given, not a hardcoded default', async () => {
+    // A permission set deliberately different from IMPLEMENTATION_PERMISSIONS
+    // (a single deny rule, nothing in common with the five allow rules) so
+    // this fails if the code reverts to a module-level hardcoded set instead
+    // of forwarding options.permissions.
+    const client = mockClient()
+    const reviewPermissions: PermissionRule[] = [
+      { permission: 'edit', pattern: '*', action: 'deny' },
+    ]
+    const runner = new AgentRunner(client, { maxTurns: 1 })
+    await runner.run(makeIssue(), 'do work', null, undefined, {
+      permissions: reviewPermissions,
+      shouldContinue: async () => false,
+    })
+    expect(client.session.create).toHaveBeenCalledWith(
+      expect.objectContaining({ permission: reviewPermissions }),
+    )
+    // And not the implementation set alongside it.
+    const passedPermissions = client.session.create.mock.calls[0][0].permission
+    expect(passedPermissions).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ permission: 'bash' }),
+    ]))
+  })
+
+  it('ends the loop with stopReason issue_inactive when shouldContinue returns false', async () => {
+    const client = mockClient()
+    const runner = new AgentRunner(client, { maxTurns: 5 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => false,
+    }))
+    expect(result.stopReason).toBe('issue_inactive')
+    expect(result.turnsCompleted).toBe(1)
+    // Only the initial prompt ran; the loop broke before a second was sent.
+    expect(client.session.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not call shouldContinue before the first turn', async () => {
+    // A saboteur could move the check earlier (before the initial prompt) or
+    // remove it altogether. Recording the call count at the moment the first
+    // prompt fires, and again once the whole run has finished, catches both:
+    // the first assertion fails if shouldContinue ran early, the second fails
+    // if it never ran at all (which would make the first assertion pass
+    // vacuously).
+    let calls = 0
+    let callsAtFirstPrompt: number | null = null
+    const client = mockClient()
+    client.session.prompt = vi.fn(async () => {
+      if (callsAtFirstPrompt === null) callsAtFirstPrompt = calls
+      return { data: { parts: [] } }
+    })
+    const runner = new AgentRunner(client, { maxTurns: 3 })
+    await runner.run(makeIssue(), 'do work', null, undefined, {
+      permissions: IMPLEMENTATION_PERMISSIONS,
+      shouldContinue: async () => { calls++; return true },
+    })
+    expect(callsAtFirstPrompt).toBe(0)
+    expect(calls).toBeGreaterThan(0)
+  })
+
+  it('continues to max_turns exactly as before when the target stays active', async () => {
+    // The existing-behaviour proof required alongside the new option tests:
+    // a run whose shouldContinue keeps saying "yes" runs every turn up to
+    // max_turns, the same as an issue that stayed active under the old
+    // issueStateFetcher + isActiveState mechanism.
+    const client = mockClient()
+    const runner = new AgentRunner(client, { maxTurns: 4 })
+    const result = await runner.run(makeIssue(), 'do work', null, undefined, runOpts({
+      shouldContinue: async () => true,
+    }))
+    expect(result.stopReason).toBe('max_turns')
+    expect(result.turnsCompleted).toBe(4)
+    expect(client.session.prompt).toHaveBeenCalledTimes(4)
   })
 })
