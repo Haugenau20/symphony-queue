@@ -294,6 +294,49 @@ const ReviewRawSchema = z.object({
   max_attempts: z.number().int().positive().default(3),
   exclude_paths: z.array(z.string()).default([]),
   max_diff_bytes: z.number().int().positive().default(400000),
+  /**
+   * Phase 2. GitLab flags generated files itself (`generated_file`), which is a
+   * better answer than guessing at them with exclude_paths patterns. Default ON:
+   * a generated file's diff is noise the reviewer should not spend a chunk on.
+   */
+  exclude_generated: z.boolean().default(true),
+  /**
+   * Soft per-chunk diff budget. A diff larger than this is split into batches
+   * and reviewed in sequence rather than refused — phase 1 declined outright,
+   * because a partial review presented as a whole one is worse than an honest
+   * refusal, and chunking is what makes the honest refusal unnecessary.
+   * Defaults to max_diff_bytes so a deployment that only ever set that keeps
+   * behaving the way it did.
+   */
+  max_chunk_bytes: z.number().int().positive().optional(),
+  /** Hard ceiling on batches. Beyond it the review is refused, never truncated. */
+  max_chunks: z.number().int().positive().default(20),
+  /**
+   * Budget for the FULL FILE CONTENTS fetched into the sandbox for context.
+   * Separate from the chunk budget on purpose: chunking bounds the diff, and
+   * nothing would otherwise bound the context, so a one-line change to a huge
+   * file would write the whole file into a sandbox the agent container shares.
+   * Exhausting this is not a refusal — the diff is still reviewed in full.
+   */
+  max_context_bytes: z.number().int().positive().optional(),
+  /**
+   * The self-critique pass: a second, independent agent session that re-reads
+   * the first pass's findings and drops the weak ones before publication.
+   * Default ON. Reviewer noise is the only failure mode in this design that
+   * costs anything, and this is the direct attack on it. A critique that cannot
+   * run never fails the review — the note says it did not run.
+   */
+  critique: z.boolean().default(true),
+  /** Ceiling on the critique session. Generous: it re-reads the diff it is judging. */
+  critique_timeout_ms: z.number().int().positive().default(600_000),
+  /**
+   * Optional read-only shallow checkout at the pinned head SHA, for context
+   * beyond the changed files. Default OFF: it costs a network fetch and a
+   * second copy of the working tree per review. The clone is done by trusted
+   * code and `.git` is deleted before the agent starts, so the sandbox still
+   * contains no git repository.
+   */
+  checkout: z.boolean().default(false),
   per_project_max_in_flight: z.number().int().positive().default(1),
   /**
    * Leave the sandbox on disk when a review does not produce findings, so it can
@@ -358,6 +401,13 @@ export interface ReviewConfig {
   maxAttempts: number
   excludePaths: string[]
   maxDiffBytes: number
+  excludeGenerated: boolean
+  maxChunkBytes: number
+  maxChunks: number
+  maxContextBytes: number
+  critique: boolean
+  critiqueTimeoutMs: number
+  checkout: boolean
   perProjectMaxInFlight: number
   keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
@@ -389,6 +439,14 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     maxAttempts: rRaw.max_attempts,
     excludePaths: rRaw.exclude_paths,
     maxDiffBytes: rRaw.max_diff_bytes,
+    excludeGenerated: rRaw.exclude_generated,
+    // Both fall back to max_diff_bytes, so a phase 1 config keeps its meaning.
+    maxChunkBytes: rRaw.max_chunk_bytes ?? rRaw.max_diff_bytes,
+    maxContextBytes: rRaw.max_context_bytes ?? rRaw.max_diff_bytes,
+    maxChunks: rRaw.max_chunks,
+    critique: rRaw.critique,
+    critiqueTimeoutMs: rRaw.critique_timeout_ms,
+    checkout: rRaw.checkout,
     perProjectMaxInFlight: rRaw.per_project_max_in_flight,
     // The environment wins, so this can be turned on for one restart without
     // editing (and later forgetting to un-edit) a config file.

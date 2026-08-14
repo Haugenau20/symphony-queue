@@ -181,3 +181,63 @@ describe('validateReviewConfig — the permissions block must match what is enfo
     expect(errors[0]).toContain('cannot change it')
   })
 })
+
+describe('buildReviewConfig — phase 2 knobs', () => {
+  it('defaults: generated files excluded, critique ON, checkout OFF', () => {
+    const cfg = buildReviewConfig(review(), env())
+
+    // Generated files are excluded by GitLab's own flag rather than guessed at
+    // with patterns, and that is the useful default.
+    expect(cfg.excludeGenerated).toBe(true)
+    // Noise is the failure mode that costs something, so the pass that attacks
+    // it is on unless someone deliberately turns it off.
+    expect(cfg.critique).toBe(true)
+    // A clone per review is real wall-clock and real disk, so this one is opt-in.
+    expect(cfg.checkout).toBe(false)
+    expect(cfg.maxChunks).toBe(20)
+    expect(cfg.critiqueTimeoutMs).toBe(600_000)
+  })
+
+  it('a phase 1 config that set only max_diff_bytes keeps its meaning', () => {
+    // The upgrade path that matters: chunk and context budgets both fall back
+    // to the single cap phase 1 had, so an existing REVIEW.md does not silently
+    // start chunking at a different size than the operator chose.
+    const cfg = buildReviewConfig(review({ max_diff_bytes: 123456 }), env())
+
+    expect(cfg.maxChunkBytes).toBe(123456)
+    expect(cfg.maxContextBytes).toBe(123456)
+  })
+
+  it('chunk and context budgets can be set independently of each other', () => {
+    const cfg = buildReviewConfig(
+      review({ max_diff_bytes: 100, max_chunk_bytes: 200, max_context_bytes: 300 }),
+      env(),
+    )
+
+    expect(cfg.maxDiffBytes).toBe(100)
+    expect(cfg.maxChunkBytes).toBe(200)
+    expect(cfg.maxContextBytes).toBe(300)
+  })
+
+  it('every phase 2 switch can be turned the other way', () => {
+    const cfg = buildReviewConfig(
+      review({ exclude_generated: false, critique: false, checkout: true, max_chunks: 3 }),
+      env(),
+    )
+
+    expect(cfg.excludeGenerated).toBe(false)
+    expect(cfg.critique).toBe(false)
+    expect(cfg.checkout).toBe(true)
+    expect(cfg.maxChunks).toBe(3)
+  })
+
+  it('the checkout still has no config key that could hold a credential', () => {
+    // The checkout is the one phase 2 feature that needs the token, and the
+    // rule is unchanged: it comes from the environment, and no config file can
+    // supply it. Turning the checkout ON must not create a place to put one.
+    const cfg = buildReviewConfig(review({ checkout: true }), env())
+
+    expect(JSON.stringify(cfg)).not.toContain('tok')
+    expect(Object.keys(cfg)).not.toContain('token')
+  })
+})

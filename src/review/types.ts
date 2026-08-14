@@ -258,12 +258,14 @@ export interface ReviewedOutcome {
 export interface TooLargeOutcome {
   kind: 'too_large'
   /**
-   * `exceeds_cap` is phase 1's honest refusal on a diff over the byte cap.
-   * Phase 2 replaces it with chunking, so nothing should produce it once slice
-   * E lands; the member survives only until the wiring wave removes it, and its
-   * removal is deliberately a compile error at every remaining site.
+   * Phase 1 had `exceeds_cap` (diff over the byte cap) and `all_collapsed`
+   * (every file collapsed). Both are gone: chunking replaced the first, and the
+   * material planner folded the second into `nothing_reviewable`, which is the
+   * same condition stated in the planner's own vocabulary. Removing them was a
+   * compile error at every site that still named one, which is how they were
+   * all found.
    */
-  reason: 'all_collapsed' | 'exceeds_cap' | 'nothing_reviewable' | 'too_many_chunks'
+  reason: 'nothing_reviewable' | 'too_many_chunks'
   filesConsidered: number
   totalBytes: number
   maxDiffBytes: number

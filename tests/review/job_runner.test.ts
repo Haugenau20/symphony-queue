@@ -107,13 +107,13 @@ describe('ReviewJobRunner — outcome to job state', () => {
 
   it('too_large -> skipped with a recorded reason, and never publishes', async () => {
     const { s, publishFn, runner: r } = runner({
-      outcome: { kind: 'too_large', reason: 'all_collapsed', filesConsidered: 3, totalBytes: 0, maxDiffBytes: 400000 },
+      outcome: { kind: 'too_large', reason: 'nothing_reviewable', filesConsidered: 3, totalBytes: 0, maxDiffBytes: 400000 },
     })
 
     await r.runJob(job(), new AbortController().signal)
 
     expect(s.final().state).toBe('skipped')
-    expect(s.final().skipReason).toContain('all_collapsed')
+    expect(s.final().skipReason).toContain('nothing_reviewable')
     expect(publishFn).not.toHaveBeenCalled()
   })
 
@@ -173,7 +173,7 @@ describe('ReviewJobRunner — failure and retry', () => {
       { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } as ReviewWorkOutcome,
       { kind: 'stale', reason: 'r' } as ReviewWorkOutcome,
       { kind: 'failed', reason: 'r' } as ReviewWorkOutcome,
-      { kind: 'too_large', reason: 'exceeds_cap', filesConsidered: 1, totalBytes: 9, maxDiffBytes: 1 } as ReviewWorkOutcome,
+      { kind: 'too_large', reason: 'too_many_chunks', filesConsidered: 1, totalBytes: 9, maxDiffBytes: 1 } as ReviewWorkOutcome,
     ]) {
       const { s, runner: r } = runner({ outcome })
       await r.runJob(job(), new AbortController().signal)
