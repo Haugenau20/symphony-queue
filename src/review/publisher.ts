@@ -25,7 +25,14 @@
 
 import { getLogger } from '../log.js'
 import { safeParseFindingsDocument } from './findings.js'
-import type { Finding, FindingsDocument, MergeRequestClient, MergeRequestSummary, ReviewJob } from './types.js'
+import type {
+  Finding,
+  FindingsDocument,
+  MergeRequestClient,
+  MergeRequestSummary,
+  ReviewJob,
+  ReviewProvenance,
+} from './types.js'
 
 // --- public types -----------------------------------------------------------
 
@@ -53,6 +60,21 @@ export interface PublishRequest {
   findings: unknown
   /** The files the review agent actually saw (design: worker's `diffFiles`). Used by step 2. */
   diffFiles: Array<{ oldPath: string; newPath: string }>
+  /**
+   * OPTIONAL, so the existing `FindingsPublisher` caller in job_runner.ts
+   * (which does not construct one) keeps compiling unchanged. When present,
+   * renders as a short footer below the findings (step 5) — see
+   * {@link renderProvenanceFooter}.
+   *
+   * Read that renderer before adding anything to this footer. What makes this
+   * parameter safe is NOT that ReviewProvenance holds only trusted data — it
+   * does not. `excluded[].path` is a diff file path, which comes from the
+   * merge request and is exactly as attacker-controlled as its title. What
+   * makes it safe is that the renderer emits COUNTS and exclusion REASONS and
+   * never a path. Rendering `excluded[].path` would put attacker-authored text
+   * into a published note, through a parameter added for provenance.
+   */
+  provenance?: ReviewProvenance | null
 }
 
 export type PublishResult =
@@ -151,6 +173,56 @@ export function renderReviewNote(findings: FindingsDocument, headSha: string): s
   return lines.join('\n').trimEnd() + '\n'
 }
 
+/**
+ * The provenance footer (design §12: this must be visible to the reader, not
+ * hidden). Every value it renders comes from {@link ReviewProvenance} —
+ * chunk counts, exclusion reasons, a critic's kept/dropped counts — never
+ * from `job.title`, `job` description text, or anything else that could
+ * carry merge-request-authored content. Appended below the findings, never
+ * touching step order or the sanitization/head-SHA-recheck steps above it.
+ *
+ * The chunk line is the ONE conditional element — design §12 only requires
+ * the split to be visible "when more than one", so an unchunked (or
+ * single-chunk) review's note has no chunk line at all. Whether the
+ * self-critique ran is stated unconditionally, in both directions: silence
+ * on that point would read as "it must have passed" to anyone who does not
+ * already know this pipeline has an optional second pass.
+ */
+export function renderProvenanceFooter(provenance: ReviewProvenance): string {
+  const lines: string[] = []
+  lines.push('---')
+  lines.push('')
+  lines.push('**Review notes**')
+
+  if (provenance.chunkCount > 1) {
+    const failedSuffix =
+      provenance.chunksFailed > 0
+        ? ` (${provenance.chunksFailed} of ${provenance.chunkCount} failed and were not included)`
+        : ''
+    lines.push(`- Diff reviewed in ${provenance.chunkCount} batches${failedSuffix}.`)
+  }
+
+  if (provenance.critique) {
+    lines.push(
+      `- Self-critique ran: kept ${provenance.critique.keptCount}, dropped ${provenance.critique.droppedCount}.`,
+    )
+  } else {
+    lines.push('- Self-critique did not run.')
+  }
+
+  const excludedCount = provenance.excluded.length
+  if (excludedCount === 0) {
+    lines.push('- No files excluded.')
+  } else {
+    const byReason = new Map<string, number>()
+    for (const e of provenance.excluded) byReason.set(e.reason, (byReason.get(e.reason) ?? 0) + 1)
+    const breakdown = [...byReason.entries()].map(([reason, count]) => `${count} ${reason}`).join(', ')
+    lines.push(`- ${excludedCount} file${excludedCount === 1 ? '' : 's'} excluded: ${breakdown}.`)
+  }
+
+  return lines.join('\n')
+}
+
 // --- publisher ------------------------------------------------------------
 
 export class ReviewPublisher {
@@ -199,8 +271,11 @@ export class ReviewPublisher {
     }
 
     // 5. post ONE summary note, always — even with zero findings, so silence
-    // unambiguously means the reviewer did not run.
-    const body = renderReviewNote(sanitized, headSha)
+    // unambiguously means the reviewer did not run. The provenance footer
+    // (if any) is appended here, after the findings body is fully rendered —
+    // it never changes step order or the findings rendering above it.
+    const noteBody = renderReviewNote(sanitized, headSha)
+    const body = request.provenance ? `${noteBody}\n${renderProvenanceFooter(request.provenance)}\n` : noteBody
     const noteId = await this.mrClient.createNote(projectId, mrIid, body)
     log.info({ projectId, mrIid, noteId, findingCount: sanitized.findings.length }, 'review_published')
     return { status: 'published', noteId, body }
