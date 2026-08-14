@@ -37,7 +37,7 @@
  * through the publisher it is given.
  */
 
-import type { ReviewJob, ReviewStore } from './types.js'
+import type { ReviewJob, ReviewProvenance, ReviewStore } from './types.js'
 import type { ReviewWorkOutcome } from './worker.js'
 import type { PublishResult } from './publisher.js'
 import { backoffDelay } from '../orchestrator.js'
@@ -54,6 +54,16 @@ export interface FindingsPublisher {
     job: ReviewJob
     findings: unknown
     diffFiles: Array<{ oldPath: string; newPath: string }>
+    /**
+     * How the findings were produced — chunk count, failed chunks, whether the
+     * self-critique ran, what was excluded. The publisher renders it as the
+     * note's provenance footer. Optional so a publisher that does not care
+     * still satisfies this type, but the runner ALWAYS passes it: design §12
+     * requires a chunked review to say so in the note rather than present a
+     * batched reading as a whole one, and this is the only path by which that
+     * reaches GitLab in the real pipeline.
+     */
+    provenance?: ReviewProvenance
   }): Promise<PublishResult>
 }
 
@@ -158,6 +168,7 @@ export class ReviewJobRunner {
       job,
       findings: outcome.findings,
       diffFiles: outcome.diffFiles,
+      provenance: outcome.provenance,
     })
 
     switch (result.status) {
