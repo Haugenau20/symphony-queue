@@ -99,8 +99,23 @@ export interface MergeRequestClient {
   getMergeRequest(projectId: string, mrIid: number): Promise<MergeRequestSummary | null>
   listDiffs(projectId: string, mrIid: number): Promise<MergeRequestDiffFile[]>
   getFileAtRef(projectId: string, path: string, ref: string): Promise<string | null>
-  listNotes(projectId: string, mrIid: number): Promise<Array<{ id: string; body: string }>>
+  /**
+   * `authorId` is what makes the publish marker trustworthy. Matching a marker
+   * by substring alone means anyone who can comment on the merge request can
+   * post `<!-- symphony-review:<sha> -->` themselves and silence the review for
+   * that revision — the publisher would find it and record "already published".
+   * Null when the instance did not report an author, which is treated as
+   * "not ours".
+   */
+  listNotes(projectId: string, mrIid: number): Promise<Array<{ id: string; body: string; authorId: string | null }>>
   createNote(projectId: string, mrIid: number, body: string): Promise<string>
+  /**
+   * The user id this client's token authenticates as, for the check above.
+   * Null when it cannot be determined — the publisher then falls back to
+   * marker-only matching, because not double-posting matters more than not
+   * being spoofable, and a review that refuses to publish is the worse failure.
+   */
+  getCurrentUserId(): Promise<string | null>
 }
 
 export interface Finding {

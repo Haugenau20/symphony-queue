@@ -106,7 +106,11 @@ class FakeClient implements MergeRequestClient {
     throw new Error('not used by controller tests')
   }
 
-  async listNotes(): Promise<Array<{ id: string; body: string }>> {
+  async listNotes(): Promise<Array<{ id: string; body: string; authorId: string | null }>> {
+    throw new Error('not used by controller tests')
+  }
+
+  async getCurrentUserId(): Promise<string | null> {
     throw new Error('not used by controller tests')
   }
 

@@ -66,7 +66,7 @@ function diffFile(over: Partial<MergeRequestDiffFile> = {}): MergeRequestDiffFil
 
 /** Records every write attempt so the test can assert on what reached "GitLab". */
 function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequestDiffFile[]; headAt?: () => string } = {}) {
-  const notes: Array<{ id: string; body: string }> = []
+  const notes: Array<{ id: string; body: string; authorId: string | null }> = []
   const posted: string[] = []
   const client: MergeRequestClient = {
     listOpenMergeRequests: async () => opts.summaries ?? [summary()],
@@ -77,10 +77,11 @@ function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequ
     listDiffs: async () => opts.diffs ?? [diffFile()],
     getFileAtRef: async () => 'file contents at head\n',
     listNotes: async () => notes,
+    getCurrentUserId: async () => 'self',
     createNote: async (_p, _i, body) => {
       posted.push(body)
       const id = `note-${notes.length + 1}`
-      notes.push({ id, body })
+      notes.push({ id, body, authorId: 'self' })
       return id
     },
   }

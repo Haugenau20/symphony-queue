@@ -78,6 +78,7 @@ interface RawChangesResponse {
 interface RawNote {
   id: number | string
   body: string
+  author?: { id?: number | string | null } | null
 }
 
 /**
@@ -194,6 +195,8 @@ const PER_PAGE = 100
 export class GitLabMergeRequestClient implements MergeRequestClient {
   private readonly baseUrl: string
   private readonly token: string
+  private currentUserId: string | null = null
+  private currentUserIdResolved = false
   private readonly group: string | null
   private readonly projects: string[]
   private readonly timeoutMs: number
@@ -370,11 +373,39 @@ export class GitLabMergeRequestClient implements MergeRequestClient {
     return await res.text()
   }
 
-  async listNotes(projectId: string, mrIid: number): Promise<Array<{ id: string; body: string }>> {
+  async listNotes(projectId: string, mrIid: number): Promise<Array<{ id: string; body: string; authorId: string | null }>> {
     const raw = await this.paginate<RawNote>((page) =>
       `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/notes?per_page=${PER_PAGE}&page=${page}`,
     )
-    return raw.map((note) => ({ id: String(note.id), body: note.body }))
+    return raw.map((note) => ({
+      id: String(note.id),
+      body: note.body,
+      authorId: note.author?.id === undefined || note.author?.id === null ? null : String(note.author.id),
+    }))
+  }
+
+  /**
+   * The user this token authenticates as. Resolved once and cached for the life
+   * of the client: it cannot change under a fixed token, and the publisher asks
+   * for it on every publish.
+   *
+   * A failure is cached as `null` rather than retried on every note check — the
+   * caller degrades to marker-only matching, and hammering /user on a broken
+   * instance would add a failing request to every publish for no benefit.
+   */
+  async getCurrentUserId(): Promise<string | null> {
+    if (this.currentUserIdResolved) return this.currentUserId
+    this.currentUserIdResolved = true
+    try {
+      const user = await this.request<{ id?: number | string | null }>('GET', '/user')
+      this.currentUserId = user.id === undefined || user.id === null ? null : String(user.id)
+    } catch (err) {
+      // Never the response body — a GitLab error page can echo the request,
+      // and the token is in a header.
+      getLogger().warn({ error: err instanceof Error ? err.message : String(err) }, 'review_current_user_unavailable')
+      this.currentUserId = null
+    }
+    return this.currentUserId
   }
 
   async createNote(projectId: string, mrIid: number, body: string): Promise<string> {

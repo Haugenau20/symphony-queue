@@ -8,6 +8,7 @@ import {
   type ReviewPublishClient,
 } from '../../src/review/publisher.js'
 import type {
+  Finding,
   FindingsDocument,
   MergeRequestClient,
   MergeRequestSummary,
@@ -107,13 +108,18 @@ interface FakeCalls {
   createNote: Array<{ projectId: string; mrIid: number; body: string }>
 }
 
+type FakeNote = { id: string; body: string; authorId: string | null }
+
 function fakePublishClient(opts: {
   summaries?: (MergeRequestSummary | null)[]
-  notes?: Array<{ id: string; body: string }>
-} = {}): MergeRequestClient & { calls: FakeCalls; notesSeen: Array<{ id: string; body: string }> } {
+  notes?: FakeNote[]
+  /** The id the client's own token authenticates as. null models an instance that would not say. */
+  selfUserId?: string | null
+} = {}): MergeRequestClient & { calls: FakeCalls; notesSeen: FakeNote[] } {
   const summaries = opts.summaries ?? [summary()]
   let summaryIdx = 0
-  const notes: Array<{ id: string; body: string }> = opts.notes ? [...opts.notes] : []
+  const notes: FakeNote[] = opts.notes ? [...opts.notes] : []
+  const selfUserId = opts.selfUserId === undefined ? 'self' : opts.selfUserId
   let noteCounter = 0
   const calls: FakeCalls = { getMergeRequest: 0, listNotes: 0, createNote: [] }
 
@@ -137,9 +143,12 @@ function fakePublishClient(opts: {
       calls.listNotes++
       return notes.map((n) => ({ ...n }))
     },
+    async getCurrentUserId() {
+      return selfUserId
+    },
     async createNote(projectId: string, mrIid: number, body: string) {
       const id = `note-${++noteCounter}`
-      notes.push({ id, body })
+      notes.push({ id, body, authorId: selfUserId })
       calls.createNote.push({ projectId, mrIid, body })
       return id
     },
@@ -237,7 +246,10 @@ describe('ReviewPublisher — file cross-check (step 2)', () => {
     if (result.status !== 'published') throw new Error('unreachable')
     expect(result.body).not.toContain('### Blocking')
     expect(result.body).toContain('### Nit')
-    expect(result.body).toContain('[unverified file]')
+    // The brackets arrive markdown-escaped (`\[`), which RENDERS as a literal
+    // "[unverified file]" — asserting on the text rather than the escaping
+    // keeps this about what a reader sees.
+    expect(result.body).toContain('unverified file')
     expect(result.body).toContain('src/totally/not/in/the/diff.ts')
   })
 
@@ -280,7 +292,7 @@ describe('ReviewPublisher — supersession (step 3)', () => {
 describe('ReviewPublisher — dedup (step 4)', () => {
   it('an existing marker note means no second post — POST count is zero', async () => {
     const marker = reviewNoteMarker('deadbeef00cafe11')
-    const client = fakePublishClient({ notes: [{ id: 'existing-note-1', body: `${marker}\nAlready reviewed.` }] })
+    const client = fakePublishClient({ notes: [{ id: 'existing-note-1', body: `${marker}\nAlready reviewed.`, authorId: 'self' }] })
 
     const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
 
@@ -303,7 +315,7 @@ describe('ReviewPublisher — dedup (step 4)', () => {
 
   it('a marker for a DIFFERENT headSha does not suppress posting for this one', async () => {
     const otherMarker = reviewNoteMarker('some-other-sha')
-    const client = fakePublishClient({ notes: [{ id: 'unrelated', body: `${otherMarker}\nold review` }] })
+    const client = fakePublishClient({ notes: [{ id: 'unrelated', body: `${otherMarker}\nold review`, authorId: 'self' }] })
 
     const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
 
@@ -572,5 +584,130 @@ describe('the provenance footer is not a second channel for merge-request text',
     expect(footer).toContain('3 files excluded')
     expect(footer).toContain('2 exclude_path')
     expect(footer).toContain('1 generated')
+  })
+})
+
+describe('escaping — a finding cannot swallow the note it is in', () => {
+  // From a live run: a review of an HTML-injection bug quoted the payload it
+  // found, GitLab parsed it as real HTML, and an unterminated construct ate the
+  // rest of the document. The note header said "Blocking (14)" and displayed
+  // two. Every case here asserts that a LATER finding survives — that is the
+  // property that actually broke, and counting escapes would not have caught it.
+  function twoFindings(firstDetail: string, overrides: Partial<Finding> = {}) {
+    return {
+      summary: 'Two findings.',
+      findings: [
+        { severity: 'blocking' as const, file: 'a.py', line: 1, lineType: 'added' as const,
+          title: 'First', detail: firstDetail, suggestion: null, ...overrides },
+        { severity: 'blocking' as const, file: 'b.py', line: 2, lineType: 'added' as const,
+          title: 'SECOND FINDING SURVIVES', detail: 'plain', suggestion: null },
+      ],
+    }
+  }
+
+  it('an unterminated HTML comment does not comment out the rest', () => {
+    const body = renderReviewNote(twoFindings('payload like <!-- swallow everything'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<!-- swallow')
+    expect(body).toContain('&lt;!--')
+  })
+
+  it('a script tag is inert', () => {
+    const body = renderReviewNote(twoFindings("input like '<script>alert(1)</script>' executes"), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<script>')
+    expect(body).toContain('&lt;script&gt;')
+  })
+
+  it('a code fence in a detail does not turn the rest into a code block', () => {
+    const body = renderReviewNote(twoFindings('bad:\n```\nnot a fence\n'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).toMatch(/\\```/)
+  })
+
+  it('a heading or list marker in a detail cannot break out of the item', () => {
+    const body = renderReviewNote(twoFindings('line one\n# Heading\n- item'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toMatch(/^# Heading/m)
+    expect(body).not.toMatch(/^- item/m)
+  })
+
+  it('a link in a finding is not rendered as a link', () => {
+    const body = renderReviewNote(twoFindings('see [click here](http://phish.example)'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('[click here](')
+  })
+
+  it('markup in a TITLE cannot escape the bold it sits in', () => {
+    const body = renderReviewNote(twoFindings('plain', { title: 'ends bold ** then `code` and <b>tags' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<b>')
+    expect(body).toMatch(/- \*\*.*\*\* —/)
+  })
+
+  it('a backtick in a FILE PATH cannot escape the code span', () => {
+    // Paths come from the diff, so this is attacker-chosen text landing inside
+    // markdown's one construct that renders its contents literally.
+    const body = renderReviewNote(twoFindings('plain', { file: 'src/we`ird`.py' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).toContain('``src/we`ird`.py:1``')
+  })
+
+  it('a newline in a file path does not break the line', () => {
+    const body = renderReviewNote(twoFindings('plain', { file: 'a.py\n## fake heading' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toMatch(/^## fake heading/m)
+  })
+
+  it('the SUMMARY is escaped too — it is model output like everything else', () => {
+    const body = renderReviewNote(
+      { summary: 'ok <!-- hide the rest', findings: [] },
+      'sha',
+    )
+    expect(body).not.toContain('<!-- hide')
+    expect(body).toContain('No findings.')
+  })
+})
+
+describe('the publish marker cannot be spoofed by another author', () => {
+  it('a marker note written by someone ELSE does not suppress the review', async () => {
+    // The marker is a fixed string in a note body, so anyone who can comment can
+    // post it. Treating that as "already published" would let the author of a
+    // change silence its own review with one comment.
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'impostor', body: `${marker}\nnothing to see here`, authorId: 'someone-else' }],
+      selfUserId: 'self',
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('published')
+    expect(client.calls.createNote).toHaveLength(1)
+  })
+
+  it('our OWN marker note still suppresses it — idempotency is unaffected', async () => {
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'ours', body: `${marker}\nalready posted`, authorId: 'self' }],
+      selfUserId: 'self',
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('already_published')
+    expect(client.calls.createNote).toHaveLength(0)
+  })
+
+  it('when our identity is unknown it degrades to marker-only, rather than double-posting', async () => {
+    // Not publishing at all would be the worse failure, and not double-posting
+    // is what the marker is primarily for.
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'unknown-author', body: `${marker}\nposted earlier`, authorId: null }],
+      selfUserId: null,
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('already_published')
+    expect(client.calls.createNote).toHaveLength(0)
   })
 })
