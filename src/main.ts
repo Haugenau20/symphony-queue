@@ -326,7 +326,6 @@ async function main(): Promise<void> {
   const shutdown = () => {
     log.info('shutdown_requested')
     orch.stop()
-    store.close()
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
