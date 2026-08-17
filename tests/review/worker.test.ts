@@ -108,6 +108,9 @@ function fakeClient(opts: {
   const calls = { getMergeRequest: 0, listDiffs: 0, getFileAtRef: [] as string[] }
   return {
     calls,
+    async getCurrentUserId() {
+      return 'self'
+    },
     async listOpenMergeRequests() {
       return []
     },
