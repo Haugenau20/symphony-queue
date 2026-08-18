@@ -55,13 +55,6 @@ export interface FindingsPublisher {
     findings: unknown
     diffFiles: MergeRequestDiffFile[]
     /**
-     * The same files, handed to the publisher as placement material. Passed
-     * from the SAME value as diffFiles so the two cannot drift: a publisher
-     * that positions findings against a different file set than it validates
-     * them against is a wrong-line comment waiting to happen.
-     */
-    placementFiles?: MergeRequestDiffFile[]
-    /**
      * How the findings were produced — chunk count, failed chunks, whether the
      * self-critique ran, what was excluded. The publisher renders it as the
      * note's provenance footer. Optional so a publisher that does not care
@@ -175,7 +168,6 @@ export class ReviewJobRunner {
       job,
       findings: outcome.findings,
       diffFiles: outcome.diffFiles,
-      placementFiles: outcome.diffFiles,
       provenance: outcome.provenance,
     })
 

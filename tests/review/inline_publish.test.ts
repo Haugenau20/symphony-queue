@@ -107,8 +107,8 @@ function diffFile(overrides: Partial<MergeRequestDiffFile> = {}): MergeRequestDi
   }
 }
 
-const diffFiles = [{ oldPath: 'src/a.ts', newPath: 'src/a.ts' }]
-const placementFiles = [diffFile()]
+// One list, used both to validate a finding's file and to position it.
+const diffFiles = [diffFile()]
 
 function placeableFinding(overrides: Partial<Finding> = {}): Finding {
   return {
@@ -306,12 +306,12 @@ describe('inline comments OFF — byte-identical to today', () => {
     const fixture = renderReviewNote(doc, 'head-sha-1')
 
     const clientDefault = fakeInlineClient()
-    const resultDefault = await new ReviewPublisher({ mrClient: clientDefault }).publish({ job: job(), findings: doc, diffFiles, placementFiles })
+    const resultDefault = await new ReviewPublisher({ mrClient: clientDefault }).publish({ job: job(), findings: doc, diffFiles })
     const published1 = asPublished(resultDefault)
     expect(published1.body).toBe(fixture)
 
     const clientExplicit = fakeInlineClient()
-    const resultExplicit = await publisher(clientExplicit, false).publish({ job: job(), findings: doc, diffFiles, placementFiles })
+    const resultExplicit = await publisher(clientExplicit, false).publish({ job: job(), findings: doc, diffFiles })
     const published2 = asPublished(resultExplicit)
     expect(published2.body).toBe(fixture)
 
@@ -332,7 +332,6 @@ describe('inline comments ON — placement', () => {
       job: job(),
       findings: { summary: 's', findings: [placeableFinding()] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -358,7 +357,6 @@ describe('inline comments ON — placement', () => {
       job: job(),
       findings: { summary: 's', findings: [unplaceableFinding()] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -375,7 +373,6 @@ describe('inline comments ON — placement', () => {
       job: job(),
       findings: { summary: 'nothing found', findings: [] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
     expect(p.body).toContain('No findings.')
@@ -391,7 +388,6 @@ describe('inline comments ON — placement', () => {
       job: job(),
       findings: { summary: 's', findings: [placeableFinding()] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
     expect(client.calls.createNote).toHaveLength(1)
@@ -422,7 +418,6 @@ describe('inline comments ON — escaping (the phase-2 bug must not recur inline
       job: job(),
       findings: { summary: 's', findings: [placeableFinding({ title: hostileTitle })] },
       diffFiles,
-      placementFiles,
     })
     asPublished(result)
     expect(client.calls.createDiscussion).toHaveLength(1)
@@ -445,7 +440,6 @@ describe('inline comments ON — dedup against our own existing threads', () => 
       job: job(),
       findings: { summary: 's', findings: [finding] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -473,8 +467,7 @@ describe('inline comments ON — dedup against our own existing threads', () => 
         job: job(),
         findings: { summary: 's', findings: [finding] },
         diffFiles,
-        placementFiles,
-      })
+        })
       const p = asPublished(result)
 
       expect(client.calls.createDiscussion).toHaveLength(1)
@@ -499,7 +492,6 @@ describe('inline comments ON — dedup against our own existing threads', () => 
       job: job(),
       findings: { summary: 's', findings: [finding] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -526,7 +518,6 @@ describe('inline comments ON — dedup against our own existing threads', () => 
       job: job(),
       findings: { summary: 's', findings: [finding] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -548,7 +539,6 @@ describe('inline comments ON — dedup against our own existing threads', () => 
       job: job(),
       findings: { summary: 's', findings: [findingA, findingB] },
       diffFiles,
-      placementFiles,
     })
     asPublished(result)
 
@@ -571,7 +561,6 @@ describe('inline comments ON — a create failure falls back, never crashes the 
       job: job(),
       findings: { summary: 's', findings: [failing, succeeding] },
       diffFiles,
-      placementFiles,
     })
     const p = asPublished(result)
 
@@ -591,7 +580,6 @@ describe('inline comments ON — earlier steps still short-circuit before any di
       job: job(),
       findings: threeFindingsDoc(),
       diffFiles,
-      placementFiles,
     })
     expect(result.status).toBe('superseded')
     expect(client.calls.listDiscussions).toBe(0)
@@ -609,7 +597,6 @@ describe('inline comments ON — earlier steps still short-circuit before any di
       job: job(),
       findings: threeFindingsDoc(),
       diffFiles,
-      placementFiles,
     })
     expect(result.status).toBe('already_published')
     expect(client.calls.listDiscussions).toBe(0)
@@ -631,7 +618,6 @@ describe('inline comments ON — discussions are created sequentially, in severi
       job: job(),
       findings: { summary: 's', findings: [nit, blocking, concern] },
       diffFiles,
-      placementFiles,
     })
     asPublished(result)
 
@@ -670,8 +656,7 @@ describe('inline comments ON — nothing sensitive ever reaches a log line', () 
         job: job(),
         findings: { summary: 's', findings: [finding] },
         diffFiles,
-        placementFiles,
-      })
+        })
       asPublished(result)
 
       expect(logged.length).toBeGreaterThan(0)

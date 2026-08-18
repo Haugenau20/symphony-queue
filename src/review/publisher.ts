@@ -90,7 +90,7 @@ export type ReviewPublishClient = Pick<
   MergeRequestClient,
   'getMergeRequest' | 'listNotes' | 'createNote' | 'getCurrentUserId'
 > &
-  Partial<MergeRequestDiscussionClient>
+  MergeRequestDiscussionClient
 
 export interface ReviewPublisherConfig {
   mrClient: ReviewPublishClient
@@ -115,21 +115,20 @@ export interface PublishRequest {
    * that a value was already checked.
    */
   findings: unknown
-  /** The files the review agent actually saw (design: worker's `diffFiles`). Used by step 2. */
-  diffFiles: Array<{ oldPath: string; newPath: string }>
   /**
-   * The SAME reviewed files, in full — including each one's diff body — for
-   * step 5's placement. A separate field from {@link diffFiles} rather than a
-   * widened version of it: `diffFiles` is exactly the shape `job_runner.ts`'s
-   * `FindingsPublisher` interface (a structural type, not imported from here)
-   * already promises to supply, and tightening that field would break every
-   * existing caller at the type level. `placementFiles` is additive and
-   * OPTIONAL: a caller that has not been updated to supply it simply gets no
-   * inline placements — every location-bearing finding reports
-   * `file_not_in_diff`, which is an honest, ordinary fallback, never a crash.
-   * Ignored entirely when `inlineComments` is off.
+   * The files the review agent actually saw, WITH their diff bodies. Step 2
+   * reads the paths to catch a finding naming a file outside the review; step
+   * 5 parses the bodies into hunks to position a finding on a line.
+   *
+   * ONE list, not two. This briefly carried paths only, with a second
+   * `placementFiles` field alongside it for the bodies — which meant the set a
+   * finding was VALIDATED against and the set it was POSITIONED against were
+   * separate parameters that could be passed different values. For a feature
+   * whose worst failure is a comment on the wrong line, two file lists that
+   * can disagree is the wrong shape, however carefully the one caller wires
+   * them today.
    */
-  placementFiles?: MergeRequestDiffFile[]
+  diffFiles: MergeRequestDiffFile[]
   /**
    * OPTIONAL, so the existing `FindingsPublisher` caller in job_runner.ts
    * (which does not construct one) keeps compiling unchanged. When present,
@@ -148,27 +147,10 @@ export interface PublishRequest {
 }
 
 export type PublishResult =
-  | { status: 'published'; noteId: string; body: string; inline?: InlinePublishOutcome }
+  | { status: 'published'; noteId: string; body: string; inline: InlinePublishOutcome }
   | { status: 'already_published'; noteId: string }
   | { status: 'superseded' }
   | { status: 'rejected'; reason: string }
-
-/**
- * Whether a client actually implements every discussion operation, not just
- * the type-level `Partial` promise of one. A type guard so the constructor
- * can narrow and store a fully-typed reference once, rather than every call
- * site in `publish()` needing its own non-null assertion.
- */
-function hasDiscussionMethods(
-  client: ReviewPublishClient,
-): client is ReviewPublishClient & MergeRequestDiscussionClient {
-  return (
-    typeof client.listDiscussions === 'function' &&
-    typeof client.createDiscussion === 'function' &&
-    typeof client.replyToDiscussion === 'function' &&
-    typeof client.resolveDiscussion === 'function'
-  )
-}
 
 /** All-zero, `attempted: false` — step 5a's exact contract when inline is off. */
 function emptyInlineOutcome(attempted: boolean): InlinePublishOutcome {
@@ -522,28 +504,10 @@ function renderInlineSummaryLine(outcome: InlinePublishOutcome): string {
 export class ReviewPublisher {
   private readonly mrClient: ReviewPublishClient
   private readonly inlineComments: boolean
-  /**
-   * Set only when `inlineComments` is on, after confirming the client
-   * actually implements the four discussion methods. Steps 5 and 7 read this
-   * rather than `this.mrClient` directly, so they never need their own
-   * non-null assertion or runtime check.
-   */
-  private readonly discussions: MergeRequestDiscussionClient | null
 
   constructor(config: ReviewPublisherConfig) {
     this.mrClient = config.mrClient
     this.inlineComments = config.inlineComments ?? false
-    if (this.inlineComments) {
-      if (!hasDiscussionMethods(config.mrClient)) {
-        throw new Error(
-          'ReviewPublisher: inlineComments is enabled but mrClient does not implement ' +
-            'listDiscussions/createDiscussion/replyToDiscussion/resolveDiscussion',
-        )
-      }
-      this.discussions = config.mrClient
-    } else {
-      this.discussions = null
-    }
   }
 
   async publish(request: PublishRequest): Promise<PublishResult> {
@@ -628,16 +592,13 @@ export class ReviewPublisher {
     const ourThreads: Array<{ discussionId: string; headSha: string; fingerprint: string }> = []
 
     if (this.inlineComments) {
-      // Set in the constructor whenever inlineComments is true — see its
-      // comment. Non-null by construction, but asserted rather than
-      // re-checked here so this block reads like the rest of the method.
-      const discussionClient = this.discussions!
+      const discussionClient = this.mrClient
 
       const ordinals = assignOrdinals(sanitized.findings)
       const entries = sanitized.findings.map((finding, i) => ({
         index: i,
         finding,
-        placement: placeFinding(finding, request.placementFiles ?? [], request.job),
+        placement: placeFinding(finding, request.diffFiles, request.job),
         fingerprint: threadFingerprint(finding, ordinals[i]!),
       }))
 
@@ -741,7 +702,7 @@ export class ReviewPublisher {
     // edits the original note or recomputes its position — a thread anchored
     // to an old revision stays exactly where GitLab put it.
     if (this.inlineComments) {
-      const discussionClient = this.discussions!
+      const discussionClient = this.mrClient
       for (const thread of ourThreads) {
         if (thread.headSha === headSha) continue // this revision, not a prior one
         try {
