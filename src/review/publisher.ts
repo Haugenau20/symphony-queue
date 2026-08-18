@@ -26,6 +26,7 @@
 import { getLogger } from '../log.js'
 import { safeParseFindingsDocument } from './findings.js'
 import type {
+  ExclusionReason,
   Finding,
   FindingsDocument,
   MergeRequestClient,
@@ -201,7 +202,7 @@ function codeSpan(text: string): string {
 const SEVERITY_SECTIONS: Array<{ severity: Finding['severity']; label: string }> = [
   { severity: 'blocking', label: 'Blocking' },
   { severity: 'concern', label: 'Concern' },
-  { severity: 'nit', label: 'Nit' },
+  { severity: 'nit', label: 'Minor' },
 ]
 
 /**
@@ -261,6 +262,39 @@ export function renderReviewNote(findings: FindingsDocument, headSha: string): s
  * on that point would read as "it must have passed" to anyone who does not
  * already know this pipeline has an optional second pass.
  */
+/**
+ * What each exclusion reason means to somebody reading the note, rather than
+ * the enum name. "5 binary" reads like an error code; "5 binary (no text diff)"
+ * says why nothing was reviewed and that nothing went wrong.
+ */
+const EXCLUSION_LABELS: Record<ExclusionReason, string> = {
+  binary: 'binary (no text diff)',
+  generated: 'generated',
+  exclude_path: 'matched exclude_paths',
+  collapsed: 'too large for GitLab to show a diff',
+}
+
+/** The same reasons, short enough to sit after a filename. */
+const EXCLUSION_SHORT: Record<ExclusionReason, string> = {
+  binary: 'binary',
+  generated: 'generated',
+  exclude_path: 'exclude_paths',
+  collapsed: 'too large',
+}
+
+/**
+ * Filenames are listed, not just counted — knowing WHICH five files were
+ * skipped is the difference between "fine, those are icons" and "wait, why was
+ * that one skipped".
+ *
+ * Capped, because an exclude_paths rule matching a vendored directory can
+ * exclude hundreds and the note is a comment, not a manifest. Every path goes
+ * through `codeSpan`: these come from the diff, so they are chosen by whoever
+ * opened the merge request, and a backtick in a filename is the one way out of
+ * a code span.
+ */
+const MAX_LISTED_EXCLUSIONS = 10
+
 export function renderProvenanceFooter(provenance: ReviewProvenance): string {
   const lines: string[] = []
   lines.push('---')
@@ -285,12 +319,19 @@ export function renderProvenanceFooter(provenance: ReviewProvenance): string {
 
   const excludedCount = provenance.excluded.length
   if (excludedCount === 0) {
-    lines.push('- No files excluded.')
+    lines.push('- Every changed file was reviewed.')
   } else {
-    const byReason = new Map<string, number>()
+    const byReason = new Map<ExclusionReason, number>()
     for (const e of provenance.excluded) byReason.set(e.reason, (byReason.get(e.reason) ?? 0) + 1)
-    const breakdown = [...byReason.entries()].map(([reason, count]) => `${count} ${reason}`).join(', ')
-    lines.push(`- ${excludedCount} file${excludedCount === 1 ? '' : 's'} excluded: ${breakdown}.`)
+    const breakdown = [...byReason.entries()]
+      .map(([reason, count]) => `${count} ${EXCLUSION_LABELS[reason]}`)
+      .join(', ')
+    lines.push(`- ${excludedCount} file${excludedCount === 1 ? '' : 's'} not reviewed: ${breakdown}.`)
+    for (const e of provenance.excluded.slice(0, MAX_LISTED_EXCLUSIONS)) {
+      lines.push(`  - ${codeSpan(e.path)} — ${EXCLUSION_SHORT[e.reason]}`)
+    }
+    const remaining = excludedCount - MAX_LISTED_EXCLUSIONS
+    if (remaining > 0) lines.push(`  - …and ${remaining} more.`)
   }
 
   return lines.join('\n')

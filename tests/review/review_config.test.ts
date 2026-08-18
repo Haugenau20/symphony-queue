@@ -241,3 +241,23 @@ describe('buildReviewConfig — phase 2 knobs', () => {
     expect(Object.keys(cfg)).not.toContain('token')
   })
 })
+
+describe('validateReviewConfig — skip_forks documents a boundary, it cannot move one', () => {
+  it('refuses to start when skip_forks is false, rather than silently ignoring it', () => {
+    // The key was parsed and exposed and read by nothing: forks are skipped
+    // unconditionally in classifySkipReason. Making it live would be worse than
+    // the lie — a project access token makes a fork's source project answer 404
+    // rather than a denial, so `skip_forks: false` would not enable fork review,
+    // it would produce a reviewer that fetches nothing and reports nothing.
+    const errors = validateReviewConfig(buildReviewConfig(review({ skip_forks: false }), env()), env())
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('skip_forks cannot be false')
+    expect(errors[0]).toContain('404')
+  })
+
+  it('true, and absent, are both fine', () => {
+    expect(validateReviewConfig(buildReviewConfig(review({ skip_forks: true }), env()), env())).toHaveLength(0)
+    expect(validateReviewConfig(buildReviewConfig(review(), env()), env())).toHaveLength(0)
+  })
+})

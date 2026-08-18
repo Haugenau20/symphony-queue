@@ -490,6 +490,27 @@ export function validateReviewConfig(cfg: ReviewConfig, env: NodeJS.ProcessEnv =
     errors.push('SYMPHONY_REVIEW_STORE_ROOT and SYMPHONY_REVIEW_WORKSPACES_ROOT must differ — durable job state must not share a directory with disposable sandboxes')
   }
 
+  // `skip_forks` documents a boundary; it cannot move one. Fork merge requests
+  // are skipped unconditionally in classifySkipReason, and turning that off
+  // would not enable fork review — design §1: the review token is a PROJECT
+  // access token, so a fork's source project answers 404 rather than 403. The
+  // fork is invisible, not denied, and the reviewer would fetch nothing and
+  // report nothing. Widening the token to follow forks dissolves the boundary
+  // the whole deployment rests on.
+  //
+  // So a config that asks for fork review is a startup failure rather than a
+  // line that quietly does nothing — the same posture as the agent.permissions
+  // block below, which documents the sandbox and refuses to start when it
+  // disagrees with what is enforced.
+  if (!cfg.skipForks) {
+    errors.push(
+      'review.skip_forks cannot be false. Fork merge requests are always skipped: the review token is '
+      + 'a project access token, so a fork\'s source project returns 404 rather than a denial — the '
+      + 'reviewer would see nothing to review and report nothing. Supporting forks means widening that '
+      + 'token, which is a deployment decision, not a config toggle. Remove the line or set it to true.',
+    )
+  }
+
   if (cfg.reservedReviewSlots > cfg.maxConcurrentReviews) {
     errors.push('review.reserved_review_slots cannot exceed review.max_concurrent_reviews')
   }

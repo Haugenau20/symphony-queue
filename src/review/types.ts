@@ -177,6 +177,14 @@ export interface ReviewPlan {
 export interface ReviewPlanRefusal {
   kind: 'refused'
   reason: 'nothing_reviewable' | 'too_many_chunks'
+  /**
+   * Every changed file the planner was handed, INCLUDING the ones it excluded.
+   * One meaning for both reasons, deliberately: this counted survivors for
+   * `too_many_chunks` and all input for `nothing_reviewable`, so the same field
+   * name meant two things depending on why the review was refused. Pair it with
+   * `diffBytes`, which counts only material that would have been reviewed, when
+   * the distinction matters.
+   */
   filesConsidered: number
   diffBytes: number
   chunksRequired: number
