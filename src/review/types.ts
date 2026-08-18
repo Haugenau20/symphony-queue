@@ -323,3 +323,200 @@ export const UNCHUNKED_PROVENANCE: ReviewProvenance = {
   critique: null,
   checkoutUsed: false,
 }
+
+// ===========================================================================
+// PHASE 3 — validated inline diff discussions
+//
+// Same rule as phases 1 and 2: implemented and consumed by slices running in
+// different waves, so this is FROZEN for their duration. A signature that is
+// wrong is reported, not edited.
+//
+// The whole of this phase is one sentence long: a finding that can be tied to
+// a line WITH CERTAINTY becomes a comment on that line, and everything else
+// goes in the summary note exactly as it does today. Design §1 calls a wrongly
+// positioned comment the highest-risk failure in the plan — it is visible,
+// wrong, and on someone else's merge request — so every type below is shaped
+// to make "I could not place this" an ordinary, cheap, frequently-taken answer
+// rather than an error path somebody is tempted to route around.
+// ===========================================================================
+
+/**
+ * GitLab's inline-comment position contract, complete and in one place.
+ *
+ * All eight fields, every time. The three SHAs come from {@link ReviewJob},
+ * BOTH paths come from the {@link MergeRequestDiffFile} the finding was
+ * resolved against — never from the finding's own `file` string, which is
+ * model output — `positionType` is always `'text'`, and the two line numbers
+ * come from diff.ts's `positionFor`, whose per-line-type contract is the half
+ * of this that already exists and is already tested.
+ *
+ * `oldLine` / `newLine` follow that contract exactly, and the transport
+ * serialises a null by OMITTING the key rather than sending an explicit
+ * `null`: GitLab rejects a null where it expects an absent key, and the
+ * difference is invisible to any test that asserts on a parsed object instead
+ * of on the serialised body.
+ */
+export interface DiscussionPosition {
+  baseSha: string
+  startSha: string
+  headSha: string
+  oldPath: string
+  newPath: string
+  positionType: 'text'
+  /** Present for a removed or context line; null for an added one. */
+  oldLine: number | null
+  /** Present for an added or context line; null for a removed one. */
+  newLine: number | null
+}
+
+export interface DiscussionNote {
+  id: string
+  body: string
+  /**
+   * The same discipline the summary-note marker gained in phase 2, for the
+   * same reason: a marker is a fixed string in a body, so anyone who can
+   * comment can paste one. Matching a thread on its marker alone would let the
+   * author of a change suppress its own inline review. Null when the instance
+   * did not report an author, which is treated as "not ours".
+   */
+  authorId: string | null
+  /** Null for a discussion note that is not anchored to a diff line. */
+  position: {
+    oldPath: string
+    newPath: string
+    oldLine: number | null
+    newLine: number | null
+  } | null
+}
+
+export interface Discussion {
+  id: string
+  /** Only a resolvable discussion can be resolved; an individual note is not. */
+  resolvable: boolean
+  resolved: boolean
+  notes: DiscussionNote[]
+}
+
+/**
+ * Why a finding could not be placed on a line.
+ *
+ * Every one of these is NORMAL and none is a failure. A review in which half
+ * the findings fall back to the summary note is a correct review; a review in
+ * which one finding lands on the wrong line is not. The names are deliberately
+ * specific so the fallback counts are diagnosable — "40% outside_hunk" and
+ * "40% file_not_in_diff" call for completely different fixes.
+ */
+export type InlineSkipReason =
+  /** `finding.line` is null — the finding is not about one line at all. */
+  | 'no_line'
+  /** `finding.file` resolves to no file in the reviewed set. */
+  | 'file_not_in_diff'
+  /** It resolves to more than one. Refuse; never pick. */
+  | 'ambiguous_file'
+  /** `positionFor` found no line of the CLAIMED type at that number. */
+  | 'outside_hunk'
+  /** The job is missing base/start/head — nothing can be positioned. */
+  | 'no_diff_refs'
+
+/**
+ * A position, or a reason there is none. There is deliberately no third
+ * variant: no confidence score, no "best effort" placement, no "probably
+ * here". A guess is the one thing this phase exists to prevent.
+ */
+export type InlinePlacement =
+  | { kind: 'placed'; position: DiscussionPosition; fingerprint: string }
+  | { kind: 'unplaceable'; reason: InlineSkipReason }
+
+/**
+ * What inline publishing did. Reported on the publisher's result and rendered
+ * as one line of the note, so a reader who sees a short summary note can tell
+ * WHY it is short rather than assuming the reviewer found little.
+ *
+ * Deliberately NOT part of {@link ReviewProvenance}: provenance is the
+ * worker's output and is complete before the publisher runs. Threading this
+ * through it would reshape a phase 2 contract and edit worker.ts for no
+ * behavioural reason at all.
+ */
+export interface InlinePublishOutcome {
+  /** False when the feature is off. Every count below is then zero. */
+  attempted: boolean
+  /** New threads actually created at this head SHA. */
+  placed: number
+  /**
+   * Threads that already existed for this exact head SHA and fingerprint —
+   * a retry after a partial failure, which is an ordinary case because the
+   * summary note is the LAST write and nothing upstream records partial
+   * progress through the thread posting.
+   */
+  alreadyPresent: number
+  /** Findings that went into the summary note instead. */
+  fellBack: number
+  fallbackReasons: Partial<Record<InlineSkipReason, number>>
+  /**
+   * Threads whose create call failed. These fall back into the note too: a
+   * finding that reaches nobody because one POST returned 500 is the one
+   * outcome worse than a fallback.
+   */
+  failed: number
+  /** Prior-revision threads replied to. */
+  superseded: number
+  /**
+   * Of those, how many the token was actually PERMITTED to resolve. Whether a
+   * Reporter-role token may resolve a discussion it authored is unverified on
+   * our instance, so this is how the answer arrives — from the first live run,
+   * as a number, rather than from documentation this environment cannot reach.
+   */
+  resolved: number
+}
+
+/**
+ * The four discussion operations, deliberately a SEPARATE interface rather
+ * than four more methods on {@link MergeRequestClient}.
+ *
+ * Two reasons, and the second one is why it is worth the extra name:
+ *
+ *  1. `GitLabMergeRequestClient` declares `implements MergeRequestClient`, so
+ *     adding methods there would break the build in the wave that declares
+ *     them and unbreak it in the wave that implements them. A contract that
+ *     cannot be committed on its own is not a contract.
+ *  2. It keeps the capability nameable. The reviewing agent's half of the
+ *     pipeline takes `ReviewMaterialClient` (worker.ts), which is a `Pick` of
+ *     `MergeRequestClient` and does NOT include this interface — so the worker
+ *     still cannot write to GitLab, and still cannot be given the ability by
+ *     editing a call site. Only the publisher's client type widens, in
+ *     publisher.ts, where it already lives.
+ */
+export interface MergeRequestDiscussionClient {
+  listDiscussions(projectId: string, mrIid: number): Promise<Discussion[]>
+
+  /** Creates a diff-anchored discussion. Returns the new discussion's id. */
+  createDiscussion(
+    projectId: string,
+    mrIid: number,
+    body: string,
+    position: DiscussionPosition,
+  ): Promise<string>
+
+  /** Adds a note to an existing discussion. Returns the new note's id. */
+  replyToDiscussion(
+    projectId: string,
+    mrIid: number,
+    discussionId: string,
+    body: string,
+  ): Promise<string>
+
+  /**
+   * Attempts to resolve a discussion. Returns false — never throws — when the
+   * instance or the token refuses (403/404/405) or the discussion is not
+   * resolvable. A 5xx or a transport failure still throws: that is a real
+   * fault and hiding it would be wrong.
+   *
+   * A boolean rather than void, and a refusal rather than an exception,
+   * because whether a Reporter-role token can resolve a discussion it authored
+   * is UNVERIFIED on our instance. The caller replies FIRST and unconditionally
+   * and treats resolution as a bonus, so the reply-only fallback is simply what
+   * happens when this returns false — no second code path, no config key, and
+   * no architecture riding on an answer nobody has yet.
+   */
+  resolveDiscussion(projectId: string, mrIid: number, discussionId: string): Promise<boolean>
+}
