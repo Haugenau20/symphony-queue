@@ -273,8 +273,20 @@ export interface ReviewProvenance {
 export interface ReviewedOutcome {
   kind: 'reviewed'
   findings: FindingsDocument
-  /** The files the agent was actually shown. The publisher uses this to catch a finding naming a file outside the review. */
-  diffFiles: Array<{ oldPath: string; newPath: string }>
+  /**
+   * The files the agent was actually shown, WITH their diff bodies. The
+   * publisher uses the paths to catch a finding naming a file outside the
+   * review, and — phase 3 — the diff bodies to position a finding on a line.
+   *
+   * This carried `{ oldPath, newPath }` and nothing else until phase 3, which
+   * made inline placement impossible: `placeFinding` parses hunks out of
+   * `diff`, and the worker was mapping that away one line after computing it.
+   * The narrower type cost nothing while the paths were all anyone read, and
+   * silently guaranteed that every finding would fall back to the summary
+   * note the moment something needed more. Widening it is free for every
+   * existing reader — `MergeRequestDiffFile` already has both paths.
+   */
+  diffFiles: MergeRequestDiffFile[]
   provenance: ReviewProvenance
 }
 
