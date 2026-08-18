@@ -166,6 +166,30 @@ export function projectPathFromListItem(raw: RawMergeRequestListItem): string {
 export function mapMergeRequestSummary(raw: RawMergeRequest, projectId: string): MergeRequestSummary {
   const diffRefs = raw.diff_refs
   const ready = Boolean(diffRefs && typeof diffRefs.head_sha === 'string' && diffRefs.head_sha.length > 0)
+
+  // `ready` is decided by head_sha alone, because that is all phases 1 and 2
+  // needed: the summary note is anchored to the head SHA and nothing else.
+  // Phase 3's inline positions need ALL THREE — GitLab rejects a position
+  // without base_sha and start_sha — so a merge request that is "ready" by the
+  // old definition can still place nothing at all, silently, for every finding
+  // on every revision.
+  //
+  // Not promoted into `ready`: that would stop the merge request being reviewed
+  // at all, and a summary-only review is far better than no review. Logged
+  // instead, once per mapping, so the cause is visible rather than inferred
+  // from an inline count of zero.
+  if (ready && (!diffRefs!.base_sha || !diffRefs!.start_sha)) {
+    getLogger().warn(
+      {
+        projectId,
+        mrIid: raw.iid,
+        hasBaseSha: Boolean(diffRefs!.base_sha),
+        hasStartSha: Boolean(diffRefs!.start_sha),
+      },
+      'review_diff_refs_incomplete_inline_disabled',
+    )
+  }
+
   return {
     projectId,
     mrIid: raw.iid,

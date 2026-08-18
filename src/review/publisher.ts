@@ -475,10 +475,24 @@ export function renderProvenanceFooter(provenance: ReviewProvenance): string {
       .map(([reason, count]) => `${count} ${EXCLUSION_LABELS[reason]}`)
       .join(', ')
     lines.push(`- ${excludedCount} file${excludedCount === 1 ? '' : 's'} not reviewed: ${breakdown}.`)
-    for (const e of provenance.excluded.slice(0, MAX_LISTED_EXCLUSIONS)) {
+
+    // Files the operator's OWN exclude_paths rule matched are counted but not
+    // named. Naming them is telling the operator what they already told the
+    // system: they wrote the glob, and the count line above already confirms
+    // it matched. A `__pycache__` rule that catches five .pyc files on every
+    // single revision turns the footer into five lines of noise that never
+    // change and never need reading — and noise in the note is the one failure
+    // mode in this design that actually costs anything.
+    //
+    // Every OTHER reason is still named, because those are surprises rather
+    // than instructions: a binary, generated or collapsed file is something
+    // GitLab decided, not something the operator asked for, and "wait, why was
+    // THAT one skipped" is a question worth being able to answer.
+    const named = provenance.excluded.filter((e) => e.reason !== 'exclude_path')
+    for (const e of named.slice(0, MAX_LISTED_EXCLUSIONS)) {
       lines.push(`  - ${codeSpan(e.path)} — ${EXCLUSION_SHORT[e.reason]}`)
     }
-    const remaining = excludedCount - MAX_LISTED_EXCLUSIONS
+    const remaining = named.length - MAX_LISTED_EXCLUSIONS
     if (remaining > 0) lines.push(`  - …and ${remaining} more.`)
   }
 
@@ -691,7 +705,23 @@ export class ReviewPublisher {
     const body = request.provenance ? `${noteBody}\n${renderProvenanceFooter(request.provenance)}\n` : noteBody
     const noteId = await this.mrClient.createNote(projectId, mrIid, body)
     log.info(
-      { projectId, mrIid, noteId, findingCount: sanitized.findings.length, inlinePlaced: inline.placed },
+      {
+        projectId,
+        mrIid,
+        noteId,
+        findingCount: sanitized.findings.length,
+        inlinePlaced: inline.placed,
+        // WHY nothing was placed, not just that nothing was. Without this a
+        // reader of the logs sees "0 findings were posted as inline comments"
+        // in the note and has no way at all to tell whether the diff refs were
+        // missing, the paths did not resolve, or every line fell outside a
+        // hunk — three completely different faults with completely different
+        // fixes. The counts were computed and then thrown away.
+        inlineAlreadyPresent: inline.alreadyPresent,
+        inlineFellBack: inline.fellBack,
+        inlineFailed: inline.failed,
+        inlineFallbackReasons: inline.fallbackReasons,
+      },
       'review_published',
     )
 

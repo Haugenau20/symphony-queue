@@ -819,3 +819,41 @@ describe('listDiffs — externally stored diffs come back empty without access_r
     expect(calls.some((c) => c.url.includes('access_raw_diffs=true'))).toBe(false)
   })
 })
+
+describe('diff_refs completeness — the silent cause of zero inline placements', () => {
+  const base = {
+    iid: 7, title: 't', state: 'opened', updated_at: '2026-01-01T00:00:00Z',
+    source_project_id: 1, target_project_id: 1,
+  }
+
+  it('a merge request with head_sha but NO start_sha still maps, with an empty startSha', () => {
+    // This is the shape that placed nothing on a real merge request: every
+    // finding resolved its file, every line was in a hunk, and placeFinding
+    // refused all seven because one of the three SHAs was ''.
+    const s = mapMergeRequestSummary(
+      { ...base, diff_refs: { base_sha: 'b', start_sha: null, head_sha: 'h' } } as never,
+      'g/p',
+    )
+    expect(s.headSha).toBe('h')
+    expect(s.startSha).toBe('')
+  })
+
+  it('a complete diff_refs maps all three', () => {
+    const s = mapMergeRequestSummary(
+      { ...base, diff_refs: { base_sha: 'b', start_sha: 's', head_sha: 'h' } } as never,
+      'g/p',
+    )
+    expect([s.baseSha, s.startSha, s.headSha]).toEqual(['b', 's', 'h'])
+  })
+
+  it('an incomplete diff_refs does NOT stop the merge request being reviewed', () => {
+    // Deliberate: a summary-only review is far better than no review. The
+    // incompleteness is logged, not escalated into a skip.
+    const s = mapMergeRequestSummary(
+      { ...base, diff_refs: { base_sha: null, start_sha: null, head_sha: 'h' } } as never,
+      'g/p',
+    )
+    expect(s.headSha).toBe('h')
+    expect(s.state).toBe('opened')
+  })
+})
