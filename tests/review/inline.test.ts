@@ -215,20 +215,46 @@ describe('placeFinding — refusals', () => {
     expect(result).toEqual({ kind: 'unplaceable', reason: 'ambiguous_file' })
   })
 
-  it('refuses outside_hunk when a finding claims lineType "added" on a line that is actually context', () => {
-    // New line 13 ("unchanged two") is a context line in SINGLE_HUNK_DIFF —
-    // there is no added line at 13.
+  it('places an "added" claim on a line that is actually context, with the CONTEXT position', () => {
+    // New line 13 ("unchanged two") is a context line. The claim is wrong; the
+    // line is not. Both labels name the new file, so the diff decides, and a
+    // context line requires BOTH line numbers — emitting the added-line shape
+    // here (newLine only) would be a malformed position, not a lenient one.
     const finding = makeFinding({ line: 13, lineType: 'added' })
     const result = placeFinding(finding, [makeFile()], makeJob())
-    expect(result).toEqual({ kind: 'unplaceable', reason: 'outside_hunk' })
+    expect(result.kind).toBe('placed')
+    if (result.kind !== 'placed') throw new Error('unreachable')
+    expect(result.position.newLine).toBe(13)
+    expect(result.position.oldLine).not.toBeNull()
   })
 
-  it('refuses outside_hunk when a finding claims lineType "context" on a line that is genuinely added (the mirror case)', () => {
-    // New line 11 ("new line") is an added line in SINGLE_HUNK_DIFF — there
-    // is no context line at new=11.
+  it('places a "context" claim on a genuinely added line, with the ADDED position (the mirror case)', () => {
+    // New line 11 ("new line") is an added line. This is the exact shape that
+    // placed nothing on a real merge request: a one-line change reads to the
+    // model as "line 11 now says X" and gets labelled context, while the diff
+    // calls it added. An added line has no old-file counterpart, so oldLine
+    // must be absent here.
     const finding = makeFinding({ line: 11, lineType: 'context' })
     const result = placeFinding(finding, [makeFile()], makeJob())
-    expect(result).toEqual({ kind: 'unplaceable', reason: 'outside_hunk' })
+    expect(result.kind).toBe('placed')
+    if (result.kind !== 'placed') throw new Error('unreachable')
+    expect(result.position).toMatchObject({ oldLine: null, newLine: 11 })
+  })
+
+  it('a REMOVED claim is still never resolved by new-file numbering', () => {
+    // The line that must not move. `removed` names an OLD-file line, and
+    // crossing that boundary puts the comment on the wrong SIDE of the diff —
+    // the failure this phase exists to prevent, and the reason the leniency
+    // above is confined to added-versus-context.
+    const finding = makeFinding({ line: 12, lineType: 'removed' })
+    const result = placeFinding(finding, [makeFile()], makeJob())
+    // New line 12 is "another new line" (added). As a removed claim it must
+    // NOT resolve to it; either nothing, or a genuine old-side position.
+    if (result.kind === 'placed') {
+      expect(result.position.newLine).toBeNull()
+    } else {
+      expect(result.reason).toBe('outside_hunk')
+    }
   })
 
   it('refuses outside_hunk when finding.line is beyond the end of every hunk', () => {

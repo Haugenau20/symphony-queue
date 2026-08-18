@@ -177,16 +177,46 @@ export function positionFor(finding: PositionableFinding, file: PositionableFile
   if (finding.line === null) return null
 
   const hunks = parseHunks(file.diff)
+
+  // `removed` is its own world, and the separation is the whole safety
+  // property: a removed line exists ONLY in the pre-image, so the number names
+  // an OLD-file line and the comment belongs on the left side of the diff.
+  // Nothing below may reach it, and it may not reach anything below — resolving
+  // a removed finding by new-file numbering is precisely how a comment lands on
+  // the wrong SIDE, which is the failure this whole phase exists to prevent.
+  if (finding.lineType === 'removed') {
+    for (const hunk of hunks) {
+      for (const line of hunk.lines) {
+        if (line.type === 'removed' && line.oldLine === finding.line) {
+          return { oldLine: line.oldLine, newLine: null }
+        }
+      }
+    }
+    return null
+  }
+
+  // `added` and `context` both name a line of the NEW file, so the number
+  // identifies one physical line and the DIFF says which kind it is. Trusting
+  // the model's label here bought nothing and cost everything: a review of five
+  // Python files placed none of its seven findings, because a one-line change
+  // reads to a model as "the line at 6 now says X" — `context` — while the diff
+  // calls it `added`. Both descriptions point at the same line; only one
+  // matched, so every finding fell back to the summary note.
+  //
+  // This is NOT the cross-type fallback the brief forbids. That prohibition is
+  // about the old/new boundary, which is a question about which SIDE a comment
+  // lands on, and it is still absolute above. Added-versus-context is not a side
+  // question at all: both are the new file, the line number is unambiguous, and
+  // the answer is read off the diff rather than guessed. What changes is only
+  // that a mislabelled finding gets the position its line actually has, instead
+  // of no position at all.
   for (const hunk of hunks) {
     for (const line of hunk.lines) {
-      if (finding.lineType === 'added' && line.type === 'added' && line.newLine === finding.line) {
-        return { oldLine: null, newLine: line.newLine }
-      }
-      if (finding.lineType === 'removed' && line.type === 'removed' && line.oldLine === finding.line) {
-        return { oldLine: line.oldLine, newLine: null }
-      }
-      if (finding.lineType === 'context' && line.type === 'context' && line.newLine === finding.line) {
-        return { oldLine: line.oldLine, newLine: line.newLine }
+      // A removed line carries newLine === null and can never match a number.
+      if (line.newLine === finding.line) {
+        return line.type === 'added'
+          ? { oldLine: null, newLine: line.newLine }
+          : { oldLine: line.oldLine, newLine: line.newLine }
       }
     }
   }
