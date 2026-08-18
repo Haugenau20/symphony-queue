@@ -74,8 +74,19 @@ FROM node:22-slim AS runtime
 # bind-mounted workspace this process creates. A root-owned 0755 directory is
 # readable by the agent and not writable, which surfaces as the agent reading its
 # material happily and then failing every write.
+#
+# git is for src/review/checkout.ts's optional shallow checkout (design report
+# §9, phase 2 slice D) — and belongs ONLY here, in the CONTROLLER image, never
+# in the agent image. This binary runs with a GitLab token and network egress,
+# clones at the pinned head SHA, deletes `.git` and verifies it is gone, then
+# hands the review agent a plain directory. The agent container gets none of
+# this: no git, no token, no egress, and (by construction, since `.git` is
+# deleted before the sandbox is built) no repository at all — see worker.ts's
+# header and the sandbox invariant it documents. Shipping git here and not
+# there is what keeps "the reviewer cannot push" mechanical rather than
+# instructional.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates gosu tini \
+ && apt-get install -y --no-install-recommends ca-certificates git gosu tini \
  && rm -rf /var/lib/apt/lists/*
 
 # Optional private CA, for an internal GitLab or a TLS-intercepting proxy whose

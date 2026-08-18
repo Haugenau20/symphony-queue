@@ -25,6 +25,7 @@ import type {
   MergeRequestSummary,
   ReviewJob,
   ReviewJobKey,
+  ReviewJobState,
   ReviewStore,
 } from './types.js'
 
@@ -56,6 +57,15 @@ export interface ReviewControllerConfig {
   laneMax?: number
   /** `concurrency.review_reserved` (design §6). Default 1. */
   laneReserved?: number
+  /**
+   * `review.rereview_on_new_head` (design §12). Default true: when a new head
+   * SHA is discovered for a merge request that already has a record at a
+   * different head, the new revision is reviewed and every prior non-terminal
+   * revision is superseded immediately — rather than left to run to
+   * completion and be refused at publish time. false disables this: the
+   * first review stands and a new head is never even discovered.
+   */
+  rereviewOnNewHead?: boolean
   /** Injectable clock, for deterministic tests. */
   now?: () => Date
 }
@@ -113,6 +123,15 @@ function jobWorkKey(key: ReviewJobKey): string {
   return `${key.projectId}::${key.mrIid}::${key.headSha}`
 }
 
+/**
+ * States a discovered-but-not-yet-terminal record can be superseded out of
+ * (design §12). Deliberately excludes published/skipped/failed/superseded —
+ * a published review of an older revision is a true historical record, not
+ * something to rewrite, and a failed record is superseded by simply never
+ * being retried once its replacement is discovered rather than by mutation.
+ */
+const SUPERSEDABLE_STATES: ReadonlySet<ReviewJobState> = new Set(['discovered', 'claimed', 'running', 'publishing'])
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -128,6 +147,7 @@ export class ReviewController {
   private readonly perProjectMaxInFlight: number
   private readonly laneMax: number
   private readonly laneReserved: number
+  private readonly rereviewOnNewHead: boolean
   private readonly now: () => Date
 
   private running = false
@@ -145,6 +165,7 @@ export class ReviewController {
     this.perProjectMaxInFlight = config.perProjectMaxInFlight ?? 1
     this.laneMax = config.laneMax ?? 2
     this.laneReserved = config.laneReserved ?? 1
+    this.rereviewOnNewHead = config.rereviewOnNewHead ?? true
     this.now = config.now ?? (() => new Date())
   }
 
@@ -291,6 +312,32 @@ export class ReviewController {
     const existing = await this.store.get(key)
     if (existing) return
 
+    // Phase 2 (design §12): find out whether this merge request already has
+    // a record at some OTHER head SHA before writing the new one — the
+    // rereviewOnNewHead:false branch below must not create a record at all,
+    // so this has to be known first, not decided after the fact.
+    let priorRecords: ReviewJob[] = []
+    try {
+      priorRecords = await this.store.listForMergeRequest(summary.projectId, summary.mrIid)
+    } catch (err) {
+      getLogger().error(
+        { project: summary.projectId, mrIid: summary.mrIid, error: describeError(err) },
+        'review_list_for_mr_failed',
+      )
+    }
+    const hasOtherRevision = priorRecords.some((r) => r.key.headSha !== summary.headSha)
+
+    if (hasOtherRevision && !this.rereviewOnNewHead) {
+      // rereview_on_new_head is off: the first review of this merge request
+      // stands. Do not create a record for the new head at all, and leave
+      // every existing record exactly as it is.
+      getLogger().info(
+        { project: summary.projectId, mrIid: summary.mrIid, headSha: summary.headSha },
+        'review_new_head_ignored',
+      )
+      return
+    }
+
     const skipReason = classifySkipReason(summary, this.includeDrafts)
 
     const job: ReviewJob = {
@@ -312,6 +359,100 @@ export class ReviewController {
       getLogger().info(
         { project: summary.projectId, mrIid: summary.mrIid, headSha: summary.headSha, reason: skipReason },
         'review_mr_skipped',
+      )
+    }
+
+    if (hasOtherRevision) {
+      await this.supersedeOlderRevisions(summary)
+    }
+  }
+
+  /**
+   * Marks every prior, non-terminal record for this merge request — at any
+   * head SHA other than the one just discovered — as 'superseded', and
+   * aborts this process's live work for it if any is in flight (design §12:
+   * a stale review is already worthless, so it should stop burning its
+   * concurrency slot the moment a newer head is known, not run to completion
+   * only to be refused at publish time).
+   *
+   * A public method, deliberately not inlined into processSummary, so
+   * supersession itself is directly testable without driving discovery
+   * end-to-end — the same reason {@link buildRoundRobinQueue} above is
+   * exported as its own pure function.
+   *
+   * Terminal records (published/skipped/failed/superseded) are left exactly
+   * as they are: a published review of an older revision is a true
+   * historical record, not something to rewrite. A record claimed by a
+   * process that has since died has no entry in this process's `liveWork`
+   * map, so only its store state is updated — there is nothing to abort.
+   */
+  async supersedeOlderRevisions(summary: MergeRequestSummary): Promise<void> {
+    let priorRecords: ReviewJob[]
+    try {
+      priorRecords = await this.store.listForMergeRequest(summary.projectId, summary.mrIid)
+    } catch (err) {
+      getLogger().error(
+        { project: summary.projectId, mrIid: summary.mrIid, error: describeError(err) },
+        'review_supersede_list_failed',
+      )
+      return
+    }
+
+    for (const record of priorRecords) {
+      if (record.key.headSha === summary.headSha) continue
+      if (!SUPERSEDABLE_STATES.has(record.state)) continue
+
+      const workKey = jobWorkKey(record.key)
+
+      // ORDER IS LOAD-BEARING: the store write happens BEFORE the abort.
+      //
+      // job_runner.ts cannot tell a supersession abort from a stop() abort by
+      // the thrown error — both are an AbortError — so it re-reads the record
+      // and treats 'superseded' as the signal. That only works if the record
+      // already SAYS 'superseded' by the time the aborted run unwinds into its
+      // catch block. Aborting first loses the race: abort() fires its
+      // listeners synchronously, while a real store update is mkdir + write +
+      // fsync + rename, several event loop turns later. The run would then
+      // find its record still 'running', record a retryable failure, consume
+      // an attempt on a revision that is already pointless, and race this
+      // write to decide whether the record ends up 'superseded' or 'failed'.
+      //
+      // Written the other way round the race cannot happen at all: the record
+      // is authoritative before anything can observe the cancellation.
+      try {
+        await this.store.update({
+          ...record,
+          state: 'superseded',
+          skipReason: `superseded by new head ${summary.headSha}`,
+        })
+      } catch (err) {
+        getLogger().error(
+          {
+            project: record.key.projectId,
+            mrIid: record.key.mrIid,
+            headSha: record.key.headSha,
+            error: describeError(err),
+          },
+          'review_supersede_update_failed',
+        )
+        continue
+      }
+
+      // Only now, with the record authoritative on disk, cancel the live run.
+      // A record claimed by a process that has since died has no entry here,
+      // so the state update above is the whole of its supersession.
+      const abortController = this.liveWork.get(workKey)
+      if (abortController) abortController.abort()
+
+      getLogger().info(
+        {
+          project: record.key.projectId,
+          mrIid: record.key.mrIid,
+          oldHeadSha: record.key.headSha,
+          newHeadSha: summary.headSha,
+          aborted: abortController !== undefined,
+        },
+        'review_revision_superseded',
       )
     }
   }

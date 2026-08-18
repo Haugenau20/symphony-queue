@@ -15,6 +15,8 @@ import { buildReviewConfig, validateReviewConfig } from './config.js'
 import { GitLabMergeRequestClient } from './review/gitlab_mr.js'
 import { DirectoryReviewStore } from './review/store.js'
 import { ReviewWorker } from './review/worker.js'
+import { AgentFindingsCritic } from './review/critique.js'
+import { GitShallowCheckout } from './review/checkout.js'
 import { ReviewPublisher } from './review/publisher.js'
 import { ReviewJobRunner } from './review/job_runner.js'
 import { ReviewController } from './review/controller.js'
@@ -60,6 +62,15 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
       projectCount: config.projects.length,
       pollIntervalMs: config.pollIntervalMs,
       includeDrafts: config.includeDrafts,
+      // Phase 2 behaviour, in the one line an operator reads first. "Why did
+      // the note say the critique did not run" should be answerable from
+      // startup, not from reading the config file over someone's shoulder.
+      excludeGenerated: config.excludeGenerated,
+      critique: config.critique,
+      checkout: config.checkout,
+      maxChunkBytes: config.maxChunkBytes,
+      maxChunks: config.maxChunks,
+      maxContextBytes: config.maxContextBytes,
     },
     'review_config_loaded',
   )
@@ -89,12 +100,39 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     sessionTimeoutMs: config.agent.sessionTimeoutMs,
   })
 
+  // The self-critique pass runs as its OWN agent session, deliberately: a model
+  // asked to disown findings still sitting in its context window defends them,
+  // while one meeting them cold can disagree. It shares the runner (same
+  // OpenCode server, same permission set) and holds no GitLab client of any
+  // kind — the type it takes makes reaching GitLab a compile error.
+  const critic = config.critique
+    ? new AgentFindingsCritic({ agentRunner, timeoutMs: config.critiqueTimeoutMs })
+    : null
+
+  // Optional wider-context checkout. TRUSTED code does the clone, because it is
+  // the only side holding the token and the egress; `.git` is deleted before the
+  // agent session exists, so the sandbox still contains no git repository and
+  // the reviewing agent still has nothing to push with.
+  const checkout = config.checkout
+    ? new GitShallowCheckout({
+        baseUrl: config.baseUrl,
+        token: process.env.SYMPHONY_REVIEW_GITLAB_TOKEN!,
+        sandboxRoot: config.workspacesRoot,
+      })
+    : null
+
   const worker = new ReviewWorker({
     mrClient: client,
     agentRunner,
     workspaceManager: wsManager,
     excludePaths: config.excludePaths,
     maxDiffBytes: config.maxDiffBytes,
+    excludeGenerated: config.excludeGenerated,
+    maxChunkBytes: config.maxChunkBytes,
+    maxChunks: config.maxChunks,
+    maxContextBytes: config.maxContextBytes,
+    ...(critic ? { critic } : {}),
+    ...(checkout ? { checkout, enableCheckout: true } : {}),
     keepFailedWorkspaces: config.keepFailedWorkspaces,
     // Slightly beyond the runner's own deadline, so the runner's cleaner error
     // normally wins and this stays a backstop rather than the usual path.
@@ -288,7 +326,6 @@ async function main(): Promise<void> {
   const shutdown = () => {
     log.info('shutdown_requested')
     orch.stop()
-    store.close()
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)

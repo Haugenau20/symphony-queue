@@ -328,7 +328,40 @@ describe('listNotes / createNote', () => {
   it('lists notes with string ids', async () => {
     route('GET', '/merge_requests/5/notes', [{ id: 10, body: 'first' }, { id: 11, body: 'second' }])
     const notes = await client().listNotes('g/p', 5)
-    expect(notes).toEqual([{ id: '10', body: 'first' }, { id: '11', body: 'second' }])
+    // An instance that reports no author yields null, never a guess — the
+    // publisher treats null as "not ours" rather than assuming it is.
+    expect(notes).toEqual([
+      { id: '10', body: 'first', authorId: null },
+      { id: '11', body: 'second', authorId: null },
+    ])
+  })
+
+  it('maps the note author, which is what makes the publish marker trustworthy', async () => {
+    route('GET', '/merge_requests/5/notes', [
+      { id: 10, body: 'ours', author: { id: 7 } },
+      { id: 11, body: 'theirs', author: { id: 99 } },
+    ])
+    const notes = await client().listNotes('g/p', 5)
+    expect(notes.map((n) => n.authorId)).toEqual(['7', '99'])
+  })
+
+  it('getCurrentUserId resolves the token holder, and caches it', async () => {
+    route('GET', '/user', { id: 7 })
+    const c = client()
+    expect(await c.getCurrentUserId()).toBe('7')
+    expect(await c.getCurrentUserId()).toBe('7')
+    expect(calls.filter((x) => x.url.includes('/user')).length).toBe(1)
+  })
+
+  it('getCurrentUserId degrades to null rather than throwing, and does not retry every call', async () => {
+    // A publish must not fail because identity could not be established; the
+    // publisher falls back to marker-only dedup, which is the check that
+    // actually prevents double-posting.
+    route('GET', '/user', null, 500)
+    const c = client()
+    expect(await c.getCurrentUserId()).toBeNull()
+    expect(await c.getCurrentUserId()).toBeNull()
+    expect(calls.filter((x) => x.url.includes('/user')).length).toBe(1)
   })
 
   it('creates a note and returns its id as a string', async () => {
