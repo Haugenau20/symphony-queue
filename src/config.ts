@@ -337,6 +337,25 @@ const ReviewRawSchema = z.object({
    * contains no git repository.
    */
   checkout: z.boolean().default(false),
+  /**
+   * Inline diff discussions. A finding whose line can be validated against the
+   * diff becomes a comment ON that line; anything that cannot be placed with
+   * certainty stays in the summary note, never guessed at. The summary note is
+   * still posted every time, so silence still means the reviewer did not run.
+   *
+   * Default ON, which is a deliberate departure from design §14's "behind a
+   * flag, off, until it has run against real merge requests" and from the
+   * phase 3 brief's own instruction not to enable it by default. The owner
+   * decided otherwise on the stated grounds that this deployment is not live
+   * anywhere and watches a single test repository, so shipping it off would
+   * only mean turning it on by hand immediately. Recorded here rather than in
+   * a commit message because the next person to read this line will wonder why
+   * it disagrees with the design document.
+   *
+   * Turning it off is a one-line edit and a container restart, and is the right
+   * first move if a comment ever lands on a wrong line.
+   */
+  inline_comments: z.boolean().default(true),
   per_project_max_in_flight: z.number().int().positive().default(1),
   /**
    * Leave the sandbox on disk when a review does not produce findings, so it can
@@ -408,6 +427,7 @@ export interface ReviewConfig {
   critique: boolean
   critiqueTimeoutMs: number
   checkout: boolean
+  inlineComments: boolean
   perProjectMaxInFlight: number
   keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
@@ -447,6 +467,7 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     critique: rRaw.critique,
     critiqueTimeoutMs: rRaw.critique_timeout_ms,
     checkout: rRaw.checkout,
+    inlineComments: rRaw.inline_comments,
     perProjectMaxInFlight: rRaw.per_project_max_in_flight,
     // The environment wins, so this can be turned on for one restart without
     // editing (and later forgetting to un-edit) a config file.

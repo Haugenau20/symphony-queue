@@ -14,8 +14,7 @@ import type {
   MergeRequestSummary,
   ReviewJob,
   ReviewJobKey,
-  ReviewProvenance,
-} from '../../src/review/types.js'
+  ReviewProvenance, MergeRequestDiffFile, MergeRequestDiscussionClient } from '../../src/review/types.js'
 import { UNCHUNKED_PROVENANCE } from '../../src/review/types.js'
 
 // ---------------------------------------------------------------------------
@@ -61,10 +60,23 @@ function summary(overrides: Partial<MergeRequestSummary> = {}): MergeRequestSumm
   }
 }
 
-const diffFiles = [
-  { oldPath: 'src/tracker/gitlab.ts', newPath: 'src/tracker/gitlab.ts' },
-  { oldPath: 'src/review/diff.ts', newPath: 'src/review/diff.ts' },
-  { oldPath: 'src/review/worker.ts', newPath: 'src/review/worker.ts' },
+/**
+ * Full MergeRequestDiffFile objects. These tests are about the summary note
+ * and never place anything inline, so the diff bodies are deliberately empty —
+ * an empty body parses to zero hunks, so every finding here is unplaceable,
+ * which is exactly the state the summary-note path is supposed to handle.
+ */
+function file(path: string): MergeRequestDiffFile {
+  return {
+    oldPath: path, newPath: path, diff: '',
+    newFile: false, renamedFile: false, deletedFile: false, generatedFile: false, collapsed: false,
+  }
+}
+
+const diffFiles: MergeRequestDiffFile[] = [
+  file('src/tracker/gitlab.ts'),
+  file('src/review/diff.ts'),
+  file('src/review/worker.ts'),
 ]
 
 function threeFindingsDoc(): FindingsDocument {
@@ -115,7 +127,7 @@ function fakePublishClient(opts: {
   notes?: FakeNote[]
   /** The id the client's own token authenticates as. null models an instance that would not say. */
   selfUserId?: string | null
-} = {}): MergeRequestClient & { calls: FakeCalls; notesSeen: FakeNote[] } {
+} = {}): MergeRequestClient & MergeRequestDiscussionClient & { calls: FakeCalls; notesSeen: FakeNote[] } {
   const summaries = opts.summaries ?? [summary()]
   let summaryIdx = 0
   const notes: FakeNote[] = opts.notes ? [...opts.notes] : []
@@ -145,6 +157,22 @@ function fakePublishClient(opts: {
     },
     async getCurrentUserId() {
       return selfUserId
+    },
+    // The discussion half. Every test in THIS file runs with inline comments
+    // OFF, so each of these throwing is itself an assertion: the flag-off path
+    // must not touch discussions at all, and a regression that made it do so
+    // would fail loudly here rather than passing quietly.
+    async listDiscussions(): Promise<never> {
+      throw new Error('publisher must not list discussions when inline comments are off')
+    },
+    async createDiscussion(): Promise<never> {
+      throw new Error('publisher must not create a discussion when inline comments are off')
+    },
+    async replyToDiscussion(): Promise<never> {
+      throw new Error('publisher must not reply to a discussion when inline comments are off')
+    },
+    async resolveDiscussion(): Promise<never> {
+      throw new Error('publisher must not resolve a discussion when inline comments are off')
     },
     async createNote(projectId: string, mrIid: number, body: string) {
       const id = `note-${++noteCounter}`

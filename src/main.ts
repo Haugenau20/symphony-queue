@@ -17,7 +17,7 @@ import { DirectoryReviewStore } from './review/store.js'
 import { ReviewWorker } from './review/worker.js'
 import { AgentFindingsCritic } from './review/critique.js'
 import { GitShallowCheckout } from './review/checkout.js'
-import { ReviewPublisher } from './review/publisher.js'
+import { buildReviewPublisher } from './review/pipeline.js'
 import { ReviewJobRunner } from './review/job_runner.js'
 import { ReviewController } from './review/controller.js'
 import { ConcurrencyGate } from './concurrency.js'
@@ -68,6 +68,7 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
       excludeGenerated: config.excludeGenerated,
       critique: config.critique,
       checkout: config.checkout,
+      inlineComments: config.inlineComments,
       maxChunkBytes: config.maxChunkBytes,
       maxChunks: config.maxChunks,
       maxContextBytes: config.maxContextBytes,
@@ -145,7 +146,7 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     ...(wf.promptTemplate.trim() ? { promptOverride: wf.promptTemplate } : {}),
   })
 
-  const publisher = new ReviewPublisher({ mrClient: client })
+  const publisher = buildReviewPublisher(client, config)
 
   const jobRunner = new ReviewJobRunner({
     worker,

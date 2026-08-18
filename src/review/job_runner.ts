@@ -37,7 +37,7 @@
  * through the publisher it is given.
  */
 
-import type { ReviewJob, ReviewProvenance, ReviewStore } from './types.js'
+import type { MergeRequestDiffFile, ReviewJob, ReviewProvenance, ReviewStore } from './types.js'
 import type { ReviewWorkOutcome } from './worker.js'
 import type { PublishResult } from './publisher.js'
 import { backoffDelay } from '../orchestrator.js'
@@ -53,7 +53,7 @@ export interface FindingsPublisher {
   publish(request: {
     job: ReviewJob
     findings: unknown
-    diffFiles: Array<{ oldPath: string; newPath: string }>
+    diffFiles: MergeRequestDiffFile[]
     /**
      * How the findings were produced — chunk count, failed chunks, whether the
      * self-critique ran, what was excluded. The publisher renders it as the

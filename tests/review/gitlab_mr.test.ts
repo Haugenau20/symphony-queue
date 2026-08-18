@@ -4,8 +4,10 @@ import {
   GitLabApiError,
   mapMergeRequestSummary,
   mapDiffFile,
+  mapDiscussion,
   projectPathFromListItem,
 } from '../../src/review/gitlab_mr.js'
+import type { DiscussionPosition } from '../../src/review/types.js'
 
 const BASE = 'https://gitlab.internal.example'
 
@@ -14,8 +16,18 @@ interface Call { method: string; url: string; body: unknown; headers: Record<str
 let calls: Call[]
 let routes: Array<{ match: (m: string, u: string) => boolean; status?: number; json?: unknown; text?: string }>
 
+/**
+ * `text` is populated from the same value as `json`, deliberately: on a real
+ * response the two are views of the SAME bytes, and a fake where `.text()`
+ * always returns '' cannot observe a leak written the most natural way —
+ * `await res.text()` on an error response. Both body-leak tests below were
+ * blind to exactly that until this line existed: breaking the client to echo
+ * `res.text()` into its error left the whole suite green, while the same leak
+ * through `res.json()` was caught. Same class as the phase 2 credential test
+ * that exercised a transport the token never travelled on.
+ */
 function route(method: string, urlPart: string, json: unknown, status = 200) {
-  routes.unshift({ match: (m, u) => m === method && u.includes(urlPart), status, json })
+  routes.unshift({ match: (m, u) => m === method && u.includes(urlPart), status, json, text: JSON.stringify(json) })
 }
 
 function routeText(method: string, urlPart: string, text: string, status = 200) {
@@ -535,6 +547,225 @@ describe('listDiffs — /diffs is not reliable everywhere', () => {
     await expect(client().listDiffs('grp/svc', 6)).rejects.toThrow(
       expect.not.stringContaining('glpat-should-never-appear') as unknown as string,
     )
+  })
+})
+
+describe('listDiscussions', () => {
+  function rawDiscussion(id: string | number, notes: unknown[]) {
+    return { id, notes }
+  }
+
+  it('maps a diff-anchored note position, carrying old_path/new_path/old_line/new_line', async () => {
+    route('GET', '/merge_requests/5/discussions', [
+      rawDiscussion('disc-1', [
+        {
+          id: 100,
+          body: 'looks off',
+          author: { id: 7 },
+          resolvable: true,
+          resolved: false,
+          position: { old_path: 'a.ts', new_path: 'a.ts', old_line: null, new_line: 12 },
+        },
+      ]),
+    ])
+    const found = await client().listDiscussions('g/p', 5)
+    expect(found).toHaveLength(1)
+    expect(found[0]).toEqual({
+      id: 'disc-1',
+      resolvable: true,
+      resolved: false,
+      notes: [
+        {
+          id: '100',
+          body: 'looks off',
+          authorId: '7',
+          position: { oldPath: 'a.ts', newPath: 'a.ts', oldLine: null, newLine: 12 },
+        },
+      ],
+    })
+  })
+
+  it('maps a note with no position to position: null', async () => {
+    route('GET', '/merge_requests/5/discussions', [
+      rawDiscussion('disc-2', [{ id: 200, body: 'general comment', resolvable: false, resolved: false }]),
+    ])
+    const found = await client().listDiscussions('g/p', 5)
+    expect(found[0]!.notes[0]!.position).toBeNull()
+  })
+
+  it('defaults resolvable/resolved to false when the raw discussion omits them, rather than throwing', async () => {
+    route('GET', '/merge_requests/5/discussions', [
+      rawDiscussion('disc-3', [{ id: 300, body: 'x' }]),
+    ])
+    const found = await client().listDiscussions('g/p', 5)
+    expect(found[0]!.resolvable).toBe(false)
+    expect(found[0]!.resolved).toBe(false)
+  })
+
+  it('defaults resolvable/resolved to false when notes is entirely missing', () => {
+    const mapped = mapDiscussion({ id: 'disc-4' } as never)
+    expect(mapped.resolvable).toBe(false)
+    expect(mapped.resolved).toBe(false)
+    expect(mapped.notes).toEqual([])
+  })
+
+  it('paginates: two pages of results are both returned, and a short page stops the loop', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => rawDiscussion(`d${i}`, [{ id: i, body: 'x', resolvable: true, resolved: false }]))
+    const page2 = [rawDiscussion('d-last', [{ id: 999, body: 'y', resolvable: true, resolved: false }])]
+    route('GET', '/merge_requests/5/discussions?per_page=100&page=1', page1)
+    route('GET', '/merge_requests/5/discussions?per_page=100&page=2', page2)
+    const found = await client().listDiscussions('g/p', 5)
+    expect(found).toHaveLength(101)
+    expect(found[100]!.id).toBe('d-last')
+    // A third page would only be fetched if the loop failed to stop at a short page.
+    expect(calls.filter((c) => c.url.includes('/discussions')).length).toBe(2)
+  })
+})
+
+describe('createDiscussion', () => {
+  function position(overrides: Partial<DiscussionPosition> = {}): DiscussionPosition {
+    return {
+      baseSha: 'base123',
+      startSha: 'start123',
+      headSha: 'head123',
+      oldPath: 'a.ts',
+      newPath: 'a.ts',
+      positionType: 'text',
+      oldLine: null,
+      newLine: null,
+      ...overrides,
+    }
+  }
+
+  it('serialises all three SHAs, both paths and position_type: text with GitLab snake_case names', async () => {
+    route('POST', '/merge_requests/5/discussions', { id: 'disc-9' })
+    await client().createDiscussion('g/p', 5, 'a finding', position({ oldLine: 3, newLine: 3 }))
+    const call = calls.find((c) => c.method === 'POST')!
+    const parsed = call.body as { body: string; position: Record<string, unknown> }
+    expect(parsed.body).toBe('a finding')
+    expect(parsed.position).toMatchObject({
+      base_sha: 'base123',
+      start_sha: 'start123',
+      head_sha: 'head123',
+      old_path: 'a.ts',
+      new_path: 'a.ts',
+      position_type: 'text',
+    })
+  })
+
+  it('returns the new discussion id as a string', async () => {
+    route('POST', '/merge_requests/5/discussions', { id: 'disc-9' })
+    const id = await client().createDiscussion('g/p', 5, 'a finding', position({ oldLine: 3, newLine: 3 }))
+    expect(id).toBe('disc-9')
+  })
+
+  it('omits old_line entirely for an added-line position (oldLine: null) — never sends an explicit null', async () => {
+    route('POST', '/merge_requests/5/discussions', { id: 'd' })
+    await client().createDiscussion('g/p', 5, 'x', position({ oldLine: null, newLine: 12 }))
+    const call = calls.find((c) => c.method === 'POST')!
+    const parsed = JSON.parse(JSON.stringify(call.body)) as { position: Record<string, unknown> }
+    expect('old_line' in parsed.position).toBe(false)
+    expect('new_line' in parsed.position).toBe(true)
+    expect(parsed.position.new_line).toBe(12)
+  })
+
+  it('omits new_line entirely for a removed-line position (newLine: null) — never sends an explicit null', async () => {
+    route('POST', '/merge_requests/5/discussions', { id: 'd' })
+    await client().createDiscussion('g/p', 5, 'x', position({ oldLine: 8, newLine: null }))
+    const call = calls.find((c) => c.method === 'POST')!
+    const parsed = JSON.parse(JSON.stringify(call.body)) as { position: Record<string, unknown> }
+    expect('new_line' in parsed.position).toBe(false)
+    expect('old_line' in parsed.position).toBe(true)
+    expect(parsed.position.old_line).toBe(8)
+  })
+
+  it('serialises BOTH line fields for a context-line position', async () => {
+    route('POST', '/merge_requests/5/discussions', { id: 'd' })
+    await client().createDiscussion('g/p', 5, 'x', position({ oldLine: 8, newLine: 9 }))
+    const call = calls.find((c) => c.method === 'POST')!
+    const parsed = JSON.parse(JSON.stringify(call.body)) as { position: Record<string, unknown> }
+    expect('old_line' in parsed.position).toBe(true)
+    expect('new_line' in parsed.position).toBe(true)
+    expect(parsed.position.old_line).toBe(8)
+    expect(parsed.position.new_line).toBe(9)
+  })
+})
+
+describe('replyToDiscussion', () => {
+  it('posts to the discussion notes endpoint, URL-encoding the discussion id, and returns the new note id', async () => {
+    route('POST', '/discussions/disc%2Fweird/notes', { id: 55 })
+    const id = await client().replyToDiscussion('g/p', 5, 'disc/weird', 'a reply')
+    expect(id).toBe('55')
+    const call = calls.find((c) => c.method === 'POST')!
+    expect(call.url).toContain('/merge_requests/5/discussions/disc%2Fweird/notes')
+    expect(call.body).toEqual({ body: 'a reply' })
+  })
+})
+
+describe('resolveDiscussion', () => {
+  for (const status of [403, 404, 405]) {
+    it(`returns false without throwing on ${status}`, async () => {
+      route('PUT', '/discussions/disc-1', { message: 'nope' }, status)
+      const result = await client().resolveDiscussion('g/p', 5, 'disc-1')
+      expect(result).toBe(false)
+    })
+  }
+
+  it('returns true on a 2xx', async () => {
+    route('PUT', '/discussions/disc-1', { id: 'disc-1', resolved: true }, 200)
+    const result = await client().resolveDiscussion('g/p', 5, 'disc-1')
+    expect(result).toBe(true)
+    const call = calls.find((c) => c.method === 'PUT')!
+    expect(call.body).toEqual({ resolved: true })
+  })
+
+  it('throws on 500 rather than swallowing it', async () => {
+    route('PUT', '/discussions/disc-1', { message: 'server exploded' }, 500)
+    await expect(client().resolveDiscussion('g/p', 5, 'disc-1')).rejects.toThrow(/returned 500/)
+  })
+})
+
+describe('discussion transport — token and error hygiene', () => {
+  it('sends PRIVATE-TOKEN and never puts the token in any discussion-related URL', async () => {
+    route('GET', '/merge_requests/5/discussions', [])
+    route('POST', '/merge_requests/5/discussions', { id: 'd' })
+    route('POST', '/discussions/disc-1/notes', { id: 'n' })
+    route('PUT', '/discussions/disc-1', { resolved: true })
+
+    const c = client()
+    await c.listDiscussions('g/p', 5)
+    await c.createDiscussion('g/p', 5, 'x', {
+      baseSha: 'b', startSha: 's', headSha: 'h', oldPath: 'a', newPath: 'a',
+      positionType: 'text', oldLine: 1, newLine: 1,
+    })
+    await c.replyToDiscussion('g/p', 5, 'disc-1', 'x')
+    await c.resolveDiscussion('g/p', 5, 'disc-1')
+
+    expect(calls.length).toBeGreaterThan(0)
+    for (const call of calls) {
+      expect(call.headers['PRIVATE-TOKEN']).toBe('glpat-review-secret')
+      expect(call.url).not.toContain('glpat-review-secret')
+    }
+  })
+
+  it('no error from any of the four discussion methods echoes the response body', async () => {
+    const SECRET = 'SECRET-BODY-abc'
+    route('GET', '/merge_requests/5/discussions', { message: SECRET }, 500)
+    route('POST', '/merge_requests/5/discussions', { message: SECRET }, 500)
+    route('POST', '/discussions/disc-1/notes', { message: SECRET }, 500)
+    route('PUT', '/discussions/disc-1', { message: SECRET }, 500)
+
+    const c = client()
+    await expect(c.listDiscussions('g/p', 5)).rejects.not.toThrow(new RegExp(SECRET))
+    await expect(
+      c.createDiscussion('g/p', 5, 'x', {
+        baseSha: 'b', startSha: 's', headSha: 'h', oldPath: 'a', newPath: 'a',
+        positionType: 'text', oldLine: 1, newLine: 1,
+      }),
+    ).rejects.not.toThrow(new RegExp(SECRET))
+    await expect(c.replyToDiscussion('g/p', 5, 'disc-1', 'x')).rejects.not.toThrow(new RegExp(SECRET))
+    // resolveDiscussion: 500 still throws (not one of the refusal statuses).
+    await expect(c.resolveDiscussion('g/p', 5, 'disc-1')).rejects.not.toThrow(new RegExp(SECRET))
   })
 })
 
