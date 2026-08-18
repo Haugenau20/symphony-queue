@@ -16,8 +16,18 @@ interface Call { method: string; url: string; body: unknown; headers: Record<str
 let calls: Call[]
 let routes: Array<{ match: (m: string, u: string) => boolean; status?: number; json?: unknown; text?: string }>
 
+/**
+ * `text` is populated from the same value as `json`, deliberately: on a real
+ * response the two are views of the SAME bytes, and a fake where `.text()`
+ * always returns '' cannot observe a leak written the most natural way —
+ * `await res.text()` on an error response. Both body-leak tests below were
+ * blind to exactly that until this line existed: breaking the client to echo
+ * `res.text()` into its error left the whole suite green, while the same leak
+ * through `res.json()` was caught. Same class as the phase 2 credential test
+ * that exercised a transport the token never travelled on.
+ */
 function route(method: string, urlPart: string, json: unknown, status = 200) {
-  routes.unshift({ match: (m, u) => m === method && u.includes(urlPart), status, json })
+  routes.unshift({ match: (m, u) => m === method && u.includes(urlPart), status, json, text: JSON.stringify(json) })
 }
 
 function routeText(method: string, urlPart: string, text: string, status = 200) {
