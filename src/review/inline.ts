@@ -1,0 +1,175 @@
+/**
+ * The inline position builder: turns a finding plus the diff file it names
+ * into GitLab's complete inline-comment position contract, or a reason it
+ * cannot be trusted.
+ *
+ * Pure. No fs, no network, no clock, no logger, no randomness — everything
+ * needed is in the arguments, and the same inputs always produce the same
+ * placement. Design §1 calls a wrongly positioned comment the highest-risk
+ * failure in the whole plan (visible, wrong, and on someone else's merge
+ * request), so this module's job is to make "I could not place this" an
+ * ordinary, cheap, ungrudging answer rather than an error path someone is
+ * tempted to route around by relaxing a check.
+ */
+
+import { createHash } from 'node:crypto'
+import { positionFor } from './diff.js'
+import type { DiscussionPosition, Finding, InlinePlacement, MergeRequestDiffFile, ReviewJob } from './types.js'
+
+// --- placement ---------------------------------------------------------------
+
+/**
+ * Places one finding onto GitLab's inline position contract, or refuses.
+ *
+ * Order of checks is load-bearing — see the wave brief for why each one must
+ * run before the next:
+ *
+ *  1. Any of job.baseSha / job.startSha / job.key.headSha missing -> no SHA
+ *     triple can be trusted, so nothing downstream is attempted at all.
+ *  2. finding.line === null -> not an error, most summary-level findings are
+ *     like this.
+ *  3. Resolve finding.file against the reviewed files: newPath first, then
+ *     oldPath. Zero matches or more than one are both refusals — a rename can
+ *     make one string match two files' different fields, and picking one is
+ *     guessing, which this module exists to never do.
+ *  4. positionFor (diff.ts, untouched here) maps the line, honoring
+ *     finding.lineType exactly. No fallback ever ignores lineType: that is
+ *     precisely how a comment lands on the wrong side of the diff.
+ *  5. Build the full DiscussionPosition — SHAs from the job, both paths from
+ *     the RESOLVED file (never from finding.file, which is model output).
+ */
+export function placeFinding(
+  finding: Finding,
+  files: MergeRequestDiffFile[],
+  job: ReviewJob,
+): InlinePlacement {
+  if (job.baseSha === '' || job.startSha === '' || job.key.headSha === '') {
+    return { kind: 'unplaceable', reason: 'no_diff_refs' }
+  }
+
+  if (finding.line === null) {
+    return { kind: 'unplaceable', reason: 'no_line' }
+  }
+
+  const matches = files.filter((f) => f.newPath === finding.file || f.oldPath === finding.file)
+  if (matches.length === 0) {
+    return { kind: 'unplaceable', reason: 'file_not_in_diff' }
+  }
+  if (matches.length > 1) {
+    return { kind: 'unplaceable', reason: 'ambiguous_file' }
+  }
+  const file = matches[0]!
+
+  const mapped = positionFor(finding, file)
+  if (mapped === null) {
+    return { kind: 'unplaceable', reason: 'outside_hunk' }
+  }
+
+  const position: DiscussionPosition = {
+    baseSha: job.baseSha,
+    startSha: job.startSha,
+    headSha: job.key.headSha,
+    oldPath: file.oldPath,
+    newPath: file.newPath,
+    positionType: 'text',
+    oldLine: mapped.oldLine,
+    newLine: mapped.newLine,
+  }
+
+  // No fingerprint here, deliberately. Identity needs the ordinal that
+  // separates findings sharing (file, lineType, title), and that is a property
+  // of the whole findings list — invisible to a function placing one finding.
+  // The caller runs assignOrdinals over the full list and calls
+  // threadFingerprint itself. See InlinePlacement's doc in types.ts.
+  return { kind: 'placed', position }
+}
+
+// --- identity ------------------------------------------------------------------
+
+/**
+ * The field separator inside a fingerprint's hash input and inside a group
+ * key. A NUL rather than a space, because neither a file path nor a title can
+ * contain one — so `{file: "a b", lineType: "c"}` and `{file: "a", lineType:
+ * "b c"}` cannot hash to the same input, which a space-separated encoding
+ * would allow. Written as an escape rather than as a literal NUL byte in the
+ * source: the semantics are identical, but a raw NUL makes git classify this
+ * file as binary and stop producing reviewable diffs of it.
+ */
+const SEP = '\0'
+
+/** trim, collapse internal whitespace to single spaces, lowercase. */
+function normalizeTitle(title: string): string {
+  return title.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+/**
+ * A stable short identity for a finding's thread, over exactly: the resolved
+ * file path (finding.file — the same string the next revision's dedup lookup
+ * will have), finding.lineType, the normalized title, and the ordinal.
+ *
+ * Deliberately NOT the line number: a rebase shifts every line below a
+ * change, and a line-keyed fingerprint would re-post every thread on every
+ * push — the exact accumulation this slice exists to prevent.
+ *
+ * Deliberately NOT finding.detail: the model rewords it every run, which
+ * would break dedup while looking, from a green test, like it worked.
+ */
+export function threadFingerprint(finding: Finding, ordinal: number): string {
+  const hash = createHash('sha256')
+  hash.update(finding.file)
+  hash.update(SEP)
+  hash.update(finding.lineType)
+  hash.update(SEP)
+  hash.update(normalizeTitle(finding.title))
+  hash.update(SEP)
+  hash.update(String(ordinal))
+  return hash.digest('hex').slice(0, 16)
+}
+
+/**
+ * Per (file, lineType, normalized title) group, 0-based in input order, so
+ * two findings that would otherwise fingerprint identically within one review
+ * do not collide. Pure and deterministic — returns an array parallel to the
+ * input.
+ */
+export function assignOrdinals(findings: Finding[]): number[] {
+  const counts = new Map<string, number>()
+  const ordinals: number[] = []
+  for (const finding of findings) {
+    const key = groupKey(finding)
+    const next = counts.get(key) ?? 0
+    ordinals.push(next)
+    counts.set(key, next + 1)
+  }
+  return ordinals
+}
+
+function groupKey(finding: Finding): string {
+  return `${finding.file}${SEP}${finding.lineType}${SEP}${normalizeTitle(finding.title)}`
+}
+
+// --- thread marker -------------------------------------------------------------
+
+/**
+ * Mirrors reviewNoteMarker's shape in publisher.ts: a fixed HTML comment,
+ * safe to embed in a rendered note body and invisible when rendered.
+ */
+export function inlineThreadMarker(headSha: string, fingerprint: string): string {
+  return `<!-- symphony-review-thread:${headSha}:${fingerprint} -->`
+}
+
+const THREAD_MARKER_RE = /<!--\s*symphony-review-thread:([^:\s]+):([^:\s]+)\s*-->/
+
+/**
+ * Reads the FIRST marker in a body and ignores anything after it. Returns
+ * null for a malformed one rather than throwing: this runs over note bodies
+ * written by strangers.
+ */
+export function parseInlineThreadMarker(body: string): { headSha: string; fingerprint: string } | null {
+  const match = THREAD_MARKER_RE.exec(body)
+  if (!match) return null
+  const headSha = match[1]
+  const fingerprint = match[2]
+  if (!headSha || !fingerprint) return null
+  return { headSha, fingerprint }
+}

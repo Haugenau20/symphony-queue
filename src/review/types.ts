@@ -422,9 +422,23 @@ export type InlineSkipReason =
  * A position, or a reason there is none. There is deliberately no third
  * variant: no confidence score, no "best effort" placement, no "probably
  * here". A guess is the one thing this phase exists to prevent.
+ *
+ * Carries NO fingerprint, and that is a correction rather than an omission.
+ * The first draft of this contract put one on the `placed` variant, which
+ * cannot be computed correctly here: a fingerprint needs the ordinal that
+ * disambiguates findings sharing (file, lineType, title), and that ordinal is
+ * a property of the WHOLE findings list, which a function placing one finding
+ * cannot see. The slice implementing it flagged this rather than papering over
+ * it, and the honest fix is that placement and identity are orthogonal —
+ * placement answers "where does this go", identity answers "which thread is
+ * this", and the second needs no position at all.
+ *
+ * So the caller does both explicitly: `assignOrdinals` over the full list
+ * once, then `threadFingerprint(finding, ordinals[i])` per finding. One field
+ * that is right beats one that is right only when you have read the comment.
  */
 export type InlinePlacement =
-  | { kind: 'placed'; position: DiscussionPosition; fingerprint: string }
+  | { kind: 'placed'; position: DiscussionPosition }
   | { kind: 'unplaceable'; reason: InlineSkipReason }
 
 /**
