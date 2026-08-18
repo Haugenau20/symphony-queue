@@ -436,3 +436,42 @@ describe('planReviewMaterial — plan-level diffBytes', () => {
     expect(plan.diffBytes).toBe(60)
   })
 })
+
+describe('planReviewMaterial — filesConsidered means one thing', () => {
+  // It used to count survivors for too_many_chunks and all input for
+  // nothing_reviewable, so the same field meant two different things depending
+  // on why the review was refused. It is now every file the planner was handed,
+  // in both branches; diffBytes is the one that counts reviewable material.
+  it('counts every input file on a too_many_chunks refusal, excluded ones included', () => {
+    const files = [
+      diffFile({ newPath: 'vendor/big.lock', diff: 'x'.repeat(500) }),
+      diffFile({ newPath: 'a.ts', diff: 'a'.repeat(500) }),
+      diffFile({ newPath: 'b.ts', diff: 'b'.repeat(500) }),
+    ]
+    const plan = planReviewMaterial(files, {
+      excludePaths: ['**/*.lock'],
+      excludeGenerated: false,
+      maxChunkBytes: 100,
+      maxChunks: 1,
+    })
+
+    expect(plan.kind).toBe('refused')
+    if (plan.kind !== 'refused') throw new Error('unreachable')
+    expect(plan.reason).toBe('too_many_chunks')
+    expect(plan.filesConsidered).toBe(3)
+    // ...while the byte count reflects only what would have been reviewed.
+    expect(plan.diffBytes).toBe(1000)
+  })
+
+  it('counts every input file on a nothing_reviewable refusal too', () => {
+    const plan = planReviewMaterial(
+      [diffFile({ newPath: 'a.ts', diff: '', collapsed: true }), diffFile({ newPath: 'b.ts', diff: '', collapsed: true })],
+      { excludePaths: [], excludeGenerated: false, maxChunkBytes: 1000, maxChunks: 10 },
+    )
+
+    expect(plan.kind).toBe('refused')
+    if (plan.kind !== 'refused') throw new Error('unreachable')
+    expect(plan.reason).toBe('nothing_reviewable')
+    expect(plan.filesConsidered).toBe(2)
+  })
+})

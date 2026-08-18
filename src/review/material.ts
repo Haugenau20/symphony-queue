@@ -263,7 +263,10 @@ export function planReviewMaterial(
     return {
       kind: 'refused',
       reason: 'too_many_chunks',
-      filesConsidered: included.length,
+      // Every file the planner was handed, matching the 'nothing_reviewable'
+      // branch above — see ReviewPlanRefusal.filesConsidered. `diffBytes` below
+      // is the one that counts only reviewable material.
+      filesConsidered: files.length,
       diffBytes,
       chunksRequired: chunks.length,
       maxChunks: options.maxChunks,
