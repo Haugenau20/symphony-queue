@@ -37,7 +37,7 @@
  * through the publisher it is given.
  */
 
-import type { ReviewJob, ReviewStore } from './types.js'
+import type { ReviewJob, ReviewProvenance, ReviewStore } from './types.js'
 import type { ReviewWorkOutcome } from './worker.js'
 import type { PublishResult } from './publisher.js'
 import { backoffDelay } from '../orchestrator.js'
@@ -54,6 +54,16 @@ export interface FindingsPublisher {
     job: ReviewJob
     findings: unknown
     diffFiles: Array<{ oldPath: string; newPath: string }>
+    /**
+     * How the findings were produced — chunk count, failed chunks, whether the
+     * self-critique ran, what was excluded. The publisher renders it as the
+     * note's provenance footer. Optional so a publisher that does not care
+     * still satisfies this type, but the runner ALWAYS passes it: design §12
+     * requires a chunked review to say so in the note rather than present a
+     * batched reading as a whole one, and this is the only path by which that
+     * reaches GitLab in the real pipeline.
+     */
+    provenance?: ReviewProvenance
   }): Promise<PublishResult>
 }
 
@@ -125,8 +135,25 @@ export class ReviewJobRunner {
           return
       }
     } catch (err) {
-      // Includes an aborted run: stop() cancels live work, and the record is
-      // meant to come back as claimable rather than stay 'running' forever.
+      // Includes an aborted run: both stop() and supersession abort live
+      // work through the same AbortController, and there is no reliable way
+      // to tell them apart from the thrown error alone (an AbortError looks
+      // the same either way). The two cases need opposite handling —
+      // stop()'s abort must still land as a retryable failure (design §12:
+      // "leave records claimed for the next start"), while a supersession
+      // abort must NOT consume a retry attempt on a revision that is already
+      // pointless — so the record itself, not the abort reason, is the
+      // source of truth: re-read it, and if the controller has already
+      // marked it 'superseded' (which only supersession ever does), there is
+      // nothing left for this run to record.
+      const current = await this.store.get(job.key).catch(() => null)
+      if (current?.state === 'superseded') {
+        log.info(
+          { project: projectId, mrIid, headSha },
+          'review_run_aborted_by_supersession',
+        )
+        return
+      }
       await this.recordFailure(job, describe(err))
     }
   }
@@ -141,6 +168,7 @@ export class ReviewJobRunner {
       job,
       findings: outcome.findings,
       diffFiles: outcome.diffFiles,
+      provenance: outcome.provenance,
     })
 
     switch (result.status) {

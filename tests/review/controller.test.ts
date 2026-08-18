@@ -73,6 +73,12 @@ class FakeReviewStore implements ReviewStore {
   async writeCursor(at: Date): Promise<void> {
     this.cursor = at
   }
+
+  async listForMergeRequest(projectId: string, mrIid: number): Promise<ReviewJob[]> {
+    return Array.from(this.records.values())
+      .filter((j) => j.key.projectId === projectId && j.key.mrIid === mrIid)
+      .sort((a, b) => b.discoveredAt.getTime() - a.discoveredAt.getTime())
+  }
 }
 
 class FakeClient implements MergeRequestClient {
@@ -100,7 +106,11 @@ class FakeClient implements MergeRequestClient {
     throw new Error('not used by controller tests')
   }
 
-  async listNotes(): Promise<Array<{ id: string; body: string }>> {
+  async listNotes(): Promise<Array<{ id: string; body: string; authorId: string | null }>> {
+    throw new Error('not used by controller tests')
+  }
+
+  async getCurrentUserId(): Promise<string | null> {
     throw new Error('not used by controller tests')
   }
 
@@ -193,6 +203,7 @@ function controllerWith(opts: {
   perProjectMaxInFlight?: number
   laneMax?: number
   laneReserved?: number
+  rereviewOnNewHead?: boolean
   now?: () => Date
 }) {
   const store = opts.store ?? new FakeReviewStore()
@@ -209,6 +220,7 @@ function controllerWith(opts: {
     perProjectMaxInFlight: opts.perProjectMaxInFlight,
     laneMax: opts.laneMax,
     laneReserved: opts.laneReserved,
+    rereviewOnNewHead: opts.rereviewOnNewHead,
     now: opts.now,
   })
   return { store, client, worker, gate, controller }
@@ -768,5 +780,225 @@ describe('ReviewController dispatch — respects the concurrency gate', () => {
 
     await controller.poll()
     expect(worker.calls.length).toBe(1) // review still got its reserved slot
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Supersession on a new head SHA (design §12, slice A)
+// ---------------------------------------------------------------------------
+
+describe('ReviewController — supersession when a new head is discovered', () => {
+  it('a running revision is marked superseded AND its AbortController is actually aborted, not merely its state changed', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 1, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'running' }))
+    store.recoverJobs = [(await store.get(keyA))!]
+
+    const worker = new FakeWorker()
+    worker.pending = true // A's runJob never resolves on its own — proves the abort, not completion, ends it
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 1, headSha: 'sha-b' })])
+    const { controller } = controllerWith({ store, worker, client, perProjectMaxInFlight: 5 })
+
+    // Dispatch A first (as recovery would after a restart), so a real
+    // AbortController for A's revision lives in the controller's liveWork map.
+    await controller.recoverAndRedispatch()
+    expect(worker.calls).toHaveLength(1)
+    const signalA = worker.calls[0].signal
+    expect(signalA.aborted).toBe(false)
+
+    // Discover head B for the same MR.
+    await controller.poll()
+
+    // The load-bearing assertion: abort() actually fired on A's own signal.
+    expect(signalA.aborted).toBe(true)
+
+    const recA = await store.get(keyA)
+    expect(recA?.state).toBe('superseded')
+    expect(recA?.skipReason).toContain('sha-b')
+  })
+
+  it('a discovered (not yet claimed) revision is also superseded, even though nothing was ever dispatched for it', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 2, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'discovered' }))
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 2, headSha: 'sha-b' })])
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    const recA = await store.get(keyA)
+    expect(recA?.state).toBe('superseded')
+  })
+
+  it('a claimed record with no live work in this process (recovered by nobody, or claimed by a since-dead process) is still marked superseded — supersession by state does not require an in-process AbortController', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 3, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'claimed' })) // never dispatched by this controller instance
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 3, headSha: 'sha-b' })])
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await expect(controller.poll()).resolves.toBeUndefined() // no AbortController to find; must not throw
+
+    const recA = await store.get(keyA)
+    expect(recA?.state).toBe('superseded')
+  })
+
+  it('a PUBLISHED record at the old head is NOT rewritten when a new head arrives', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 4, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'published', publishedNoteId: 'note-1' }))
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 4, headSha: 'sha-b' })])
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    const recA = await store.get(keyA)
+    expect(recA?.state).toBe('published')
+    expect(recA?.publishedNoteId).toBe('note-1')
+
+    const recB = await store.get({ ...keyA, headSha: 'sha-b' })
+    expect(recB?.state).toBe('discovered')
+  })
+
+  it('skipped and failed records at the old head are likewise left exactly as they are', async () => {
+    const store = new FakeReviewStore()
+    const skippedKey: ReviewJobKey = { projectId: 'org/a', mrIid: 5, headSha: 'sha-skip' }
+    const failedKey: ReviewJobKey = { projectId: 'org/a', mrIid: 5, headSha: 'sha-fail' }
+    store.seed(job({ key: skippedKey, state: 'skipped', skipReason: 'draft' }))
+    store.seed(job({ key: failedKey, state: 'failed', attempts: 2, skipReason: 'boom' }))
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 5, headSha: 'sha-new' })])
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    expect((await store.get(skippedKey))?.skipReason).toBe('draft')
+    expect((await store.get(failedKey))?.skipReason).toBe('boom')
+    expect((await store.get(failedKey))?.attempts).toBe(2)
+  })
+
+  it('with rereviewOnNewHead:false, the new head creates NO record at all, and the old record is left untouched', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 6, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'running' }))
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 6, headSha: 'sha-b' })])
+    const { controller } = controllerWith({ store, client, rereviewOnNewHead: false, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    const recB = await store.get({ ...keyA, headSha: 'sha-b' })
+    expect(recB).toBeNull()
+
+    const recA = await store.get(keyA)
+    expect(recA?.state).toBe('running')
+  })
+
+  it('rereviewOnNewHead defaults to true when unset', async () => {
+    const store = new FakeReviewStore()
+    const keyA: ReviewJobKey = { projectId: 'org/a', mrIid: 7, headSha: 'sha-a' }
+    store.seed(job({ key: keyA, state: 'discovered' }))
+
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 7, headSha: 'sha-b' })])
+    // rereviewOnNewHead deliberately omitted.
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    const recB = await store.get({ ...keyA, headSha: 'sha-b' })
+    expect(recB?.state).toBe('discovered')
+    expect((await store.get(keyA))?.state).toBe('superseded')
+  })
+
+  it('a brand-new MR (no prior record at any head) is unaffected by supersession logic entirely', async () => {
+    const store = new FakeReviewStore()
+    const client = new FakeClient(async () => [summary({ projectId: 'org/a', mrIid: 8, headSha: 'sha-only' })])
+    const { controller } = controllerWith({ store, client, perProjectMaxInFlight: 0 })
+
+    await controller.poll()
+
+    const rec = await store.get({ projectId: 'org/a', mrIid: 8, headSha: 'sha-only' })
+    expect(rec?.state).toBe('discovered')
+  })
+
+  describe('supersedeOlderRevisions (direct, without driving discovery)', () => {
+    it('marks every non-terminal prior revision superseded and leaves the new head alone even if it is already on record', async () => {
+      const store = new FakeReviewStore()
+      const older: ReviewJobKey = { projectId: 'org/a', mrIid: 9, headSha: 'sha-old' }
+      const newer: ReviewJobKey = { projectId: 'org/a', mrIid: 9, headSha: 'sha-new' }
+      store.seed(job({ key: older, state: 'claimed' }))
+      store.seed(job({ key: newer, state: 'discovered' }))
+
+      const { controller } = controllerWith({ store })
+      await controller.supersedeOlderRevisions(summary({ projectId: 'org/a', mrIid: 9, headSha: 'sha-new' }))
+
+      expect((await store.get(older))?.state).toBe('superseded')
+      expect((await store.get(newer))?.state).toBe('discovered')
+    })
+
+    it('is a no-op when there are no prior records for the merge request', async () => {
+      const store = new FakeReviewStore()
+      const { controller } = controllerWith({ store })
+      await expect(
+        controller.supersedeOlderRevisions(summary({ projectId: 'org/a', mrIid: 10, headSha: 'sha-new' })),
+      ).resolves.toBeUndefined()
+    })
+  })
+})
+
+describe('ReviewController — supersession ordering (regression)', () => {
+  // This is the bug the slice's own tests agreed with: supersedeOlderRevisions
+  // aborted the live run BEFORE writing 'superseded', while job_runner.ts
+  // decides supersession-vs-stop() by re-reading that very record. abort()
+  // fires its listeners synchronously; a real store update is mkdir + write +
+  // fsync + rename, several event loop turns later. So the aborted run reached
+  // its catch block, found the record still 'running', and recorded a
+  // retryable failure — consuming an attempt on a revision already known to be
+  // pointless, and racing the supersede write for the final state.
+  //
+  // The original test could not catch it, because its fake worker set the
+  // store to 'superseded' itself and then aborted, simulating the ordering it
+  // assumed rather than exercising the ordering the controller had. This test
+  // observes both events through the real controller and asserts their order.
+  it('writes the store BEFORE the abort is observable, so the aborted run can never see a stale state', async () => {
+    const events: string[] = []
+    const records = new Map<string, ReviewJob>()
+    records.set('old', job({ key: { projectId: 'p/q', mrIid: 1, headSha: 'old' }, state: 'running' }))
+
+    const store: ReviewStore = {
+      get: async (k: ReviewJobKey) => records.get(k.headSha) ?? null,
+      put: async (j: ReviewJob) => { records.set(j.key.headSha, j) },
+      // Modelled as genuinely multi-turn, because a real one is. A store whose
+      // update resolves in the same microtask hides exactly this class of bug.
+      update: async (j: ReviewJob) => {
+        await new Promise((r) => setTimeout(r, 5))
+        records.set(j.key.headSha, j)
+        if (j.state === 'superseded') events.push('store:superseded')
+      },
+      claim: async () => true,
+      listClaimable: async () => [],
+      recoverInFlight: async () => [],
+      readCursor: async () => null,
+      writeCursor: async () => {},
+      listForMergeRequest: async () => Array.from(records.values()),
+    }
+
+    const { controller } = controllerWith({ store: store as unknown as FakeReviewStore })
+
+    const ac = new AbortController()
+    ac.signal.addEventListener('abort', () => events.push('abort:observed'))
+    ;(controller as unknown as { liveWork: Map<string, AbortController> })
+      .liveWork.set('p/q::1::old', ac)
+
+    await controller.supersedeOlderRevisions(
+      summary({ projectId: 'p/q', mrIid: 1, headSha: 'new' }),
+    )
+
+    expect(events).toEqual(['store:superseded', 'abort:observed'])
+    expect(records.get('old')!.state).toBe('superseded')
+    expect(ac.signal.aborted).toBe(true)
   })
 })

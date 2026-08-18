@@ -3,10 +3,20 @@ import {
   ReviewPublisher,
   reviewNoteMarker,
   renderReviewNote,
+  renderProvenanceFooter,
   sanitizeFindings,
   type ReviewPublishClient,
 } from '../../src/review/publisher.js'
-import type { FindingsDocument, MergeRequestClient, MergeRequestSummary, ReviewJob, ReviewJobKey } from '../../src/review/types.js'
+import type {
+  Finding,
+  FindingsDocument,
+  MergeRequestClient,
+  MergeRequestSummary,
+  ReviewJob,
+  ReviewJobKey,
+  ReviewProvenance,
+} from '../../src/review/types.js'
+import { UNCHUNKED_PROVENANCE } from '../../src/review/types.js'
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -98,13 +108,18 @@ interface FakeCalls {
   createNote: Array<{ projectId: string; mrIid: number; body: string }>
 }
 
+type FakeNote = { id: string; body: string; authorId: string | null }
+
 function fakePublishClient(opts: {
   summaries?: (MergeRequestSummary | null)[]
-  notes?: Array<{ id: string; body: string }>
-} = {}): MergeRequestClient & { calls: FakeCalls; notesSeen: Array<{ id: string; body: string }> } {
+  notes?: FakeNote[]
+  /** The id the client's own token authenticates as. null models an instance that would not say. */
+  selfUserId?: string | null
+} = {}): MergeRequestClient & { calls: FakeCalls; notesSeen: FakeNote[] } {
   const summaries = opts.summaries ?? [summary()]
   let summaryIdx = 0
-  const notes: Array<{ id: string; body: string }> = opts.notes ? [...opts.notes] : []
+  const notes: FakeNote[] = opts.notes ? [...opts.notes] : []
+  const selfUserId = opts.selfUserId === undefined ? 'self' : opts.selfUserId
   let noteCounter = 0
   const calls: FakeCalls = { getMergeRequest: 0, listNotes: 0, createNote: [] }
 
@@ -128,9 +143,12 @@ function fakePublishClient(opts: {
       calls.listNotes++
       return notes.map((n) => ({ ...n }))
     },
+    async getCurrentUserId() {
+      return selfUserId
+    },
     async createNote(projectId: string, mrIid: number, body: string) {
       const id = `note-${++noteCounter}`
-      notes.push({ id, body })
+      notes.push({ id, body, authorId: selfUserId })
       calls.createNote.push({ projectId, mrIid, body })
       return id
     },
@@ -154,7 +172,7 @@ describe('ReviewPublisher — happy path, 3 findings', () => {
     expect(client.calls.createNote).toHaveLength(1)
     expect(result.body).toContain(reviewNoteMarker('deadbeef00cafe11'))
     expect(result.body.indexOf('### Blocking')).toBeLessThan(result.body.indexOf('### Concern'))
-    expect(result.body.indexOf('### Concern')).toBeLessThan(result.body.indexOf('### Nit'))
+    expect(result.body.indexOf('### Concern')).toBeLessThan(result.body.indexOf('### Minor'))
     expect(result.body).toContain('src/tracker/gitlab.ts:342')
     expect(result.body).toContain('Token may be logged on retry')
   })
@@ -227,8 +245,11 @@ describe('ReviewPublisher — file cross-check (step 2)', () => {
     expect(result.status).toBe('published')
     if (result.status !== 'published') throw new Error('unreachable')
     expect(result.body).not.toContain('### Blocking')
-    expect(result.body).toContain('### Nit')
-    expect(result.body).toContain('[unverified file]')
+    expect(result.body).toContain('### Minor')
+    // The brackets arrive markdown-escaped (`\[`), which RENDERS as a literal
+    // "[unverified file]" — asserting on the text rather than the escaping
+    // keeps this about what a reader sees.
+    expect(result.body).toContain('unverified file')
     expect(result.body).toContain('src/totally/not/in/the/diff.ts')
   })
 
@@ -271,7 +292,7 @@ describe('ReviewPublisher — supersession (step 3)', () => {
 describe('ReviewPublisher — dedup (step 4)', () => {
   it('an existing marker note means no second post — POST count is zero', async () => {
     const marker = reviewNoteMarker('deadbeef00cafe11')
-    const client = fakePublishClient({ notes: [{ id: 'existing-note-1', body: `${marker}\nAlready reviewed.` }] })
+    const client = fakePublishClient({ notes: [{ id: 'existing-note-1', body: `${marker}\nAlready reviewed.`, authorId: 'self' }] })
 
     const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
 
@@ -294,7 +315,7 @@ describe('ReviewPublisher — dedup (step 4)', () => {
 
   it('a marker for a DIFFERENT headSha does not suppress posting for this one', async () => {
     const otherMarker = reviewNoteMarker('some-other-sha')
-    const client = fakePublishClient({ notes: [{ id: 'unrelated', body: `${otherMarker}\nold review` }] })
+    const client = fakePublishClient({ notes: [{ id: 'unrelated', body: `${otherMarker}\nold review`, authorId: 'self' }] })
 
     const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
 
@@ -357,7 +378,7 @@ describe('ReviewPublisher — SECURITY: MR-supplied text cannot change what is p
       // The finding is still posted, still under Blocking — the schema's
       // "severity" field decided the section, not the embedded text.
       expect(result.body).toContain('### Blocking')
-      expect(result.body).not.toContain('### Nit')
+      expect(result.body).not.toContain('### Minor')
     }
     expect(client.calls.createNote).toHaveLength(1)
   })
@@ -378,7 +399,7 @@ describe('renderReviewNote', () => {
     const body = renderReviewNote(doc, 'sha1')
     expect(body).not.toContain('### Blocking')
     expect(body).not.toContain('### Concern')
-    expect(body).toContain('### Nit')
+    expect(body).toContain('### Minor')
   })
 
   it('renders a finding with a null line using the file alone', () => {
@@ -389,5 +410,348 @@ describe('renderReviewNote', () => {
     const body = renderReviewNote(doc, 'sha1')
     expect(body).toContain('`a.ts`')
     expect(body).not.toContain('a.ts:null')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SLICE E: the provenance footer (design §12)
+// ---------------------------------------------------------------------------
+
+function provenance(overrides: Partial<ReviewProvenance> = {}): ReviewProvenance {
+  return { ...UNCHUNKED_PROVENANCE, ...overrides }
+}
+
+describe('ReviewPublisher — no provenance supplied (existing callers keep compiling and behaving)', () => {
+  it('publish() with no provenance field renders a note with no footer at all', async () => {
+    const client = fakePublishClient()
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('published')
+    if (result.status !== 'published') throw new Error('unreachable')
+    expect(result.body).not.toContain('Review notes')
+    expect(result.body).not.toContain('---')
+  })
+})
+
+describe('renderProvenanceFooter', () => {
+  it('omits the chunk line entirely when there was exactly one chunk', () => {
+    const footer = renderProvenanceFooter(provenance({ chunkCount: 1 }))
+    expect(footer).not.toContain('batch')
+    expect(footer).not.toContain('batches')
+  })
+
+  it('states the chunk count when the diff was split into more than one batch', () => {
+    const footer = renderProvenanceFooter(provenance({ chunkCount: 3, chunksFailed: 0 }))
+    expect(footer).toContain('3 batches')
+  })
+
+  it('also states how many chunks failed, when any did', () => {
+    const footer = renderProvenanceFooter(provenance({ chunkCount: 4, chunksFailed: 1 }))
+    expect(footer).toContain('4 batches')
+    expect(footer).toContain('1 of 4 failed')
+  })
+
+  it('says the self-critique did not run when provenance.critique is null', () => {
+    const footer = renderProvenanceFooter(provenance({ critique: null }))
+    expect(footer).toContain('Self-critique did not run.')
+  })
+
+  it('states kept/dropped counts when the critique DID run', () => {
+    const footer = renderProvenanceFooter(
+      provenance({ critique: { ran: true, keptCount: 5, droppedCount: 2, dropped: [] } }),
+    )
+    expect(footer).toContain('Self-critique ran: kept 5, dropped 2.')
+    expect(footer).not.toContain('did not run')
+  })
+
+  it('reports zero excluded files explicitly, and a breakdown by reason otherwise', () => {
+    const none = renderProvenanceFooter(provenance({ excluded: [] }))
+    expect(none).toContain('Every changed file was reviewed.')
+
+    const some = renderProvenanceFooter(
+      provenance({
+        excluded: [
+          { path: 'vendor/a.js', reason: 'exclude_path' },
+          { path: 'vendor/b.js', reason: 'exclude_path' },
+          { path: 'dist/bundle.min.js', reason: 'generated' },
+        ],
+      }),
+    )
+    expect(some).toContain('3 files not reviewed')
+    expect(some).toContain('2 matched exclude_paths')
+    expect(some).toContain('1 generated')
+  })
+})
+
+describe('ReviewPublisher — provenance footer end to end through publish()', () => {
+  it('a chunked, critiqued, partly-excluded review gets a full footer below the findings', async () => {
+    const client = fakePublishClient()
+    const prov = provenance({
+      chunkCount: 3,
+      chunksFailed: 1,
+      critique: { ran: true, keptCount: 2, droppedCount: 1, dropped: [] },
+      excluded: [{ path: 'vendor/x.js', reason: 'exclude_path' }],
+      checkoutUsed: true,
+    })
+
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles, provenance: prov })
+
+    expect(result.status).toBe('published')
+    if (result.status !== 'published') throw new Error('unreachable')
+    // Footer comes AFTER the findings, not interleaved with them.
+    const findingsEnd = result.body.lastIndexOf('Inconsistent naming')
+    const footerStart = result.body.indexOf('Review notes')
+    expect(footerStart).toBeGreaterThan(findingsEnd)
+    expect(result.body).toContain('3 batches (1 of 3 failed and were not included)')
+    expect(result.body).toContain('Self-critique ran: kept 2, dropped 1.')
+    expect(result.body).toContain('1 file not reviewed: 1 matched exclude_paths.')
+  })
+
+  it('a single-chunk review with no critic and no exclusions gets the "did not run" / "everything reviewed" footer, no chunk line', async () => {
+    const client = fakePublishClient()
+    const result = await publisher(client).publish({
+      job: job(), findings: threeFindingsDoc(), diffFiles, provenance: UNCHUNKED_PROVENANCE,
+    })
+
+    expect(result.status).toBe('published')
+    if (result.status !== 'published') throw new Error('unreachable')
+    expect(result.body).not.toContain('batch')
+    expect(result.body).toContain('Self-critique did not run.')
+    expect(result.body).toContain('Every changed file was reviewed.')
+  })
+
+  /**
+   * The one item the acceptance bar calls out by name: a critic that ran but
+   * came back `unavailable` must still publish, and the footer must say the
+   * critique did not run — the reader is never left assuming a silent pass.
+   */
+  it('critic "unavailable" (provenance.critique null after an attempted run) still publishes with a footer saying so', async () => {
+    const client = fakePublishClient()
+    const result = await publisher(client).publish({
+      job: job(), findings: threeFindingsDoc(), diffFiles, provenance: provenance({ critique: null }),
+    })
+
+    expect(result.status).toBe('published')
+    if (result.status !== 'published') throw new Error('unreachable')
+    expect(result.body).toContain('Self-critique did not run.')
+  })
+
+  it('no merge-request title or description text reaches the footer, even when both try to inject one', async () => {
+    const distinctiveTitle = 'ZQXJ-TITLE-MARKER-7f3e9c'
+    const distinctiveDescription = 'ZQXJ-DESCRIPTION-MARKER-a18b02'
+    const client = fakePublishClient({
+      summaries: [summary({ title: distinctiveTitle, description: distinctiveDescription })],
+    })
+    const maliciousJob = job({ title: distinctiveTitle })
+    const prov = provenance({
+      chunkCount: 2,
+      chunksFailed: 1,
+      // The critic's own dropped[] reasons are model text about the change, and
+      // the footer reports only counts from it — never these strings.
+      critique: { ran: true, keptCount: 1, droppedCount: 1, dropped: [{ title: distinctiveTitle, file: 'x', reason: distinctiveTitle }] },
+      excluded: [{ path: 'vendor/skipped.min.js', reason: 'exclude_path' }],
+    })
+
+    const result = await publisher(client).publish({ job: maliciousJob, findings: threeFindingsDoc(), diffFiles, provenance: prov })
+
+    expect(result.status).toBe('published')
+    if (result.status !== 'published') throw new Error('unreachable')
+    const footer = result.body.slice(result.body.indexOf('Review notes'))
+    expect(footer).not.toContain(distinctiveTitle)
+    expect(footer).not.toContain(distinctiveDescription)
+    // Excluded PATHS are a deliberate exception and do appear — a reader cannot
+    // judge "5 binary" without knowing which five. They are merge-request-chosen
+    // text, so they are listed inside a code span rather than withheld.
+    expect(footer).toContain('vendor/skipped.min.js')
+  })
+})
+
+describe('the provenance footer is not a second channel for merge-request text', () => {
+  // provenance.excluded carries FILE PATHS, which come from the diff and are
+  // no more trustworthy than the merge request's title. The footer is safe
+  // because it renders counts and reasons and never a path — not because the
+  // data going in is clean. This test is what keeps that true.
+  it('names the excluded files, because a count alone cannot be judged', () => {
+    // This assertion used to be the opposite: paths were withheld precisely
+    // because nothing escaped them, so rendering one was a way to inject markup
+    // into the note. The escaping added alongside this makes listing them a
+    // choice rather than a hazard, and "5 binary" tells a reader nothing about
+    // whether the right five were skipped.
+    const footer = renderProvenanceFooter({
+      chunkCount: 1,
+      chunksFailed: 0,
+      excluded: [
+        { path: 'dist/bundle.js', reason: 'exclude_path' },
+        { path: 'schema.pb.go', reason: 'generated' },
+        { path: 'assets/logo.png', reason: 'binary' },
+      ],
+      critique: null,
+      checkoutUsed: false,
+    })
+
+    expect(footer).toContain('3 files not reviewed')
+    expect(footer).toContain('1 matched exclude_paths')
+    expect(footer).toContain('1 generated')
+    expect(footer).toContain('1 binary (no text diff)')
+    expect(footer).toContain('dist/bundle.js')
+    expect(footer).toContain('schema.pb.go')
+    expect(footer).toContain('assets/logo.png')
+  })
+
+  it('a hostile filename still cannot inject markup — it is listed inside a code span', () => {
+    // Paths come from the diff, so the author of a merge request chooses them.
+    // Listing them is safe only because of how they are listed.
+    const footer = renderProvenanceFooter({
+      chunkCount: 1,
+      chunksFailed: 0,
+      excluded: [{ path: 'src/we`ird`<!--hide.png', reason: 'binary' }],
+      critique: null,
+      checkoutUsed: false,
+    })
+
+    expect(footer).toContain('``src/we`ird`<!--hide.png``')
+    // The comment opener is inside a code span, where it is inert, and the
+    // lines after it survive.
+    expect(footer.split('\n').length).toBeGreaterThan(3)
+  })
+
+  it('caps the list at ten and says how many it did not name', () => {
+    const excluded = Array.from({ length: 14 }, (_, i) => ({
+      path: `vendor/lib-${i}.min.js`,
+      reason: 'exclude_path' as const,
+    }))
+    const footer = renderProvenanceFooter({
+      chunkCount: 1, chunksFailed: 0, excluded, critique: null, checkoutUsed: false,
+    })
+
+    expect(footer).toContain('14 files not reviewed')
+    expect(footer).toContain('vendor/lib-9.min.js')
+    expect(footer).not.toContain('vendor/lib-10.min.js')
+    expect(footer).toContain('…and 4 more.')
+  })
+})
+
+describe('escaping — a finding cannot swallow the note it is in', () => {
+  // From a live run: a review of an HTML-injection bug quoted the payload it
+  // found, GitLab parsed it as real HTML, and an unterminated construct ate the
+  // rest of the document. The note header said "Blocking (14)" and displayed
+  // two. Every case here asserts that a LATER finding survives — that is the
+  // property that actually broke, and counting escapes would not have caught it.
+  function twoFindings(firstDetail: string, overrides: Partial<Finding> = {}) {
+    return {
+      summary: 'Two findings.',
+      findings: [
+        { severity: 'blocking' as const, file: 'a.py', line: 1, lineType: 'added' as const,
+          title: 'First', detail: firstDetail, suggestion: null, ...overrides },
+        { severity: 'blocking' as const, file: 'b.py', line: 2, lineType: 'added' as const,
+          title: 'SECOND FINDING SURVIVES', detail: 'plain', suggestion: null },
+      ],
+    }
+  }
+
+  it('an unterminated HTML comment does not comment out the rest', () => {
+    const body = renderReviewNote(twoFindings('payload like <!-- swallow everything'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<!-- swallow')
+    expect(body).toContain('&lt;!--')
+  })
+
+  it('a script tag is inert', () => {
+    const body = renderReviewNote(twoFindings("input like '<script>alert(1)</script>' executes"), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<script>')
+    expect(body).toContain('&lt;script&gt;')
+  })
+
+  it('a code fence in a detail does not turn the rest into a code block', () => {
+    const body = renderReviewNote(twoFindings('bad:\n```\nnot a fence\n'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).toMatch(/\\```/)
+  })
+
+  it('a heading or list marker in a detail cannot break out of the item', () => {
+    const body = renderReviewNote(twoFindings('line one\n# Heading\n- item'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toMatch(/^# Heading/m)
+    expect(body).not.toMatch(/^- item/m)
+  })
+
+  it('a link in a finding is not rendered as a link', () => {
+    const body = renderReviewNote(twoFindings('see [click here](http://phish.example)'), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('[click here](')
+  })
+
+  it('markup in a TITLE cannot escape the bold it sits in', () => {
+    const body = renderReviewNote(twoFindings('plain', { title: 'ends bold ** then `code` and <b>tags' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toContain('<b>')
+    expect(body).toMatch(/- \*\*.*\*\* —/)
+  })
+
+  it('a backtick in a FILE PATH cannot escape the code span', () => {
+    // Paths come from the diff, so this is attacker-chosen text landing inside
+    // markdown's one construct that renders its contents literally.
+    const body = renderReviewNote(twoFindings('plain', { file: 'src/we`ird`.py' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).toContain('``src/we`ird`.py:1``')
+  })
+
+  it('a newline in a file path does not break the line', () => {
+    const body = renderReviewNote(twoFindings('plain', { file: 'a.py\n## fake heading' }), 'sha')
+    expect(body).toContain('SECOND FINDING SURVIVES')
+    expect(body).not.toMatch(/^## fake heading/m)
+  })
+
+  it('the SUMMARY is escaped too — it is model output like everything else', () => {
+    const body = renderReviewNote(
+      { summary: 'ok <!-- hide the rest', findings: [] },
+      'sha',
+    )
+    expect(body).not.toContain('<!-- hide')
+    expect(body).toContain('No findings.')
+  })
+})
+
+describe('the publish marker cannot be spoofed by another author', () => {
+  it('a marker note written by someone ELSE does not suppress the review', async () => {
+    // The marker is a fixed string in a note body, so anyone who can comment can
+    // post it. Treating that as "already published" would let the author of a
+    // change silence its own review with one comment.
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'impostor', body: `${marker}\nnothing to see here`, authorId: 'someone-else' }],
+      selfUserId: 'self',
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('published')
+    expect(client.calls.createNote).toHaveLength(1)
+  })
+
+  it('our OWN marker note still suppresses it — idempotency is unaffected', async () => {
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'ours', body: `${marker}\nalready posted`, authorId: 'self' }],
+      selfUserId: 'self',
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('already_published')
+    expect(client.calls.createNote).toHaveLength(0)
+  })
+
+  it('when our identity is unknown it degrades to marker-only, rather than double-posting', async () => {
+    // Not publishing at all would be the worse failure, and not double-posting
+    // is what the marker is primarily for.
+    const marker = reviewNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'unknown-author', body: `${marker}\nposted earlier`, authorId: null }],
+      selfUserId: null,
+    })
+    const result = await publisher(client).publish({ job: job(), findings: threeFindingsDoc(), diffFiles })
+
+    expect(result.status).toBe('already_published')
+    expect(client.calls.createNote).toHaveLength(0)
   })
 })

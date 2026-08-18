@@ -181,3 +181,83 @@ describe('validateReviewConfig — the permissions block must match what is enfo
     expect(errors[0]).toContain('cannot change it')
   })
 })
+
+describe('buildReviewConfig — phase 2 knobs', () => {
+  it('defaults: generated files excluded, critique ON, checkout OFF', () => {
+    const cfg = buildReviewConfig(review(), env())
+
+    // Generated files are excluded by GitLab's own flag rather than guessed at
+    // with patterns, and that is the useful default.
+    expect(cfg.excludeGenerated).toBe(true)
+    // Noise is the failure mode that costs something, so the pass that attacks
+    // it is on unless someone deliberately turns it off.
+    expect(cfg.critique).toBe(true)
+    // A clone per review is real wall-clock and real disk, so this one is opt-in.
+    expect(cfg.checkout).toBe(false)
+    expect(cfg.maxChunks).toBe(20)
+    expect(cfg.critiqueTimeoutMs).toBe(600_000)
+  })
+
+  it('a phase 1 config that set only max_diff_bytes keeps its meaning', () => {
+    // The upgrade path that matters: chunk and context budgets both fall back
+    // to the single cap phase 1 had, so an existing REVIEW.md does not silently
+    // start chunking at a different size than the operator chose.
+    const cfg = buildReviewConfig(review({ max_diff_bytes: 123456 }), env())
+
+    expect(cfg.maxChunkBytes).toBe(123456)
+    expect(cfg.maxContextBytes).toBe(123456)
+  })
+
+  it('chunk and context budgets can be set independently of each other', () => {
+    const cfg = buildReviewConfig(
+      review({ max_diff_bytes: 100, max_chunk_bytes: 200, max_context_bytes: 300 }),
+      env(),
+    )
+
+    expect(cfg.maxDiffBytes).toBe(100)
+    expect(cfg.maxChunkBytes).toBe(200)
+    expect(cfg.maxContextBytes).toBe(300)
+  })
+
+  it('every phase 2 switch can be turned the other way', () => {
+    const cfg = buildReviewConfig(
+      review({ exclude_generated: false, critique: false, checkout: true, max_chunks: 3 }),
+      env(),
+    )
+
+    expect(cfg.excludeGenerated).toBe(false)
+    expect(cfg.critique).toBe(false)
+    expect(cfg.checkout).toBe(true)
+    expect(cfg.maxChunks).toBe(3)
+  })
+
+  it('the checkout still has no config key that could hold a credential', () => {
+    // The checkout is the one phase 2 feature that needs the token, and the
+    // rule is unchanged: it comes from the environment, and no config file can
+    // supply it. Turning the checkout ON must not create a place to put one.
+    const cfg = buildReviewConfig(review({ checkout: true }), env())
+
+    expect(JSON.stringify(cfg)).not.toContain('tok')
+    expect(Object.keys(cfg)).not.toContain('token')
+  })
+})
+
+describe('validateReviewConfig — skip_forks documents a boundary, it cannot move one', () => {
+  it('refuses to start when skip_forks is false, rather than silently ignoring it', () => {
+    // The key was parsed and exposed and read by nothing: forks are skipped
+    // unconditionally in classifySkipReason. Making it live would be worse than
+    // the lie — a project access token makes a fork's source project answer 404
+    // rather than a denial, so `skip_forks: false` would not enable fork review,
+    // it would produce a reviewer that fetches nothing and reports nothing.
+    const errors = validateReviewConfig(buildReviewConfig(review({ skip_forks: false }), env()), env())
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('skip_forks cannot be false')
+    expect(errors[0]).toContain('404')
+  })
+
+  it('true, and absent, are both fine', () => {
+    expect(validateReviewConfig(buildReviewConfig(review({ skip_forks: true }), env()), env())).toHaveLength(0)
+    expect(validateReviewConfig(buildReviewConfig(review(), env()), env())).toHaveLength(0)
+  })
+})
