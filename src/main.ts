@@ -12,13 +12,12 @@ import type { TrackerAdapter } from './tracker/base.js'
 import { parseCliArgs, guardrailsBanner, usageMessage } from './cli.js'
 import { loadWorkflow } from './workflow.js'
 import { buildReviewConfig, validateReviewConfig } from './config.js'
-import type { ReviewConfig } from './config.js'
 import { GitLabMergeRequestClient } from './review/gitlab_mr.js'
 import { DirectoryReviewStore } from './review/store.js'
 import { ReviewWorker } from './review/worker.js'
 import { AgentFindingsCritic } from './review/critique.js'
 import { GitShallowCheckout } from './review/checkout.js'
-import { ReviewPublisher } from './review/publisher.js'
+import { buildReviewPublisher } from './review/pipeline.js'
 import { ReviewJobRunner } from './review/job_runner.js'
 import { ReviewController } from './review/controller.js'
 import { ConcurrencyGate } from './concurrency.js'
@@ -179,31 +178,6 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
   await controller.run()
   log.info('review_stopped')
   process.exit(0)
-}
-
-/**
- * Constructs the publisher from config. Extracted from `runReviewMode` and
- * EXPORTED for one reason: nothing else in this file is reachable from a test,
- * and this is the line that decides whether inline discussions happen at all.
- *
- * Deleting the `inlineComments` argument here turns the entire feature off in
- * production — the publisher's own default is false — and when that line lived
- * inline in `runReviewMode`, doing so left all 784 tests green and the
- * typecheck clean. That is the third time in this phase the same shape of bug
- * appeared: a feature that is correct everywhere except at the one seam the
- * suite cannot see. The first two were the worker dropping the diff bodies and
- * the publisher reading them from a field nothing populated.
- *
- * Inline discussions are the publisher's job alone: the worker is not told
- * about them and its client type still cannot reach them. The flag is passed
- * explicitly rather than left to the publisher's default, so config.ts remains
- * the single place the shipped default lives.
- */
-export function buildReviewPublisher(
-  client: ConstructorParameters<typeof ReviewPublisher>[0]['mrClient'],
-  config: Pick<ReviewConfig, 'inlineComments'>,
-): ReviewPublisher {
-  return new ReviewPublisher({ mrClient: client, inlineComments: config.inlineComments })
 }
 
 /** The OpenCode server URL for review mode, which has no WORKFLOW.md to read it from. */

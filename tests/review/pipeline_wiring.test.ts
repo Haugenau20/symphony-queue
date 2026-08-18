@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { buildReviewPublisher } from '../../src/main.js'
+import { readFile } from 'node:fs/promises'
+import { buildReviewPublisher } from '../../src/review/pipeline.js'
 import type { DiscussionPosition, FindingsDocument, MergeRequestClient, MergeRequestDiffFile, MergeRequestDiscussionClient, ReviewJob } from '../../src/review/types.js'
 
 /**
@@ -57,7 +58,7 @@ function fakeClient() {
   return { client, created }
 }
 
-describe('main.ts wiring — the flag actually reaches the publisher', () => {
+describe('deployment wiring — the flag actually reaches the publisher', () => {
   it('inlineComments true produces a real inline discussion', async () => {
     const { client, created } = fakeClient()
     const result = await buildReviewPublisher(client, { inlineComments: true })
@@ -76,5 +77,25 @@ describe('main.ts wiring — the flag actually reaches the publisher', () => {
 
     expect(result.status).toBe('published')
     expect(created).toHaveLength(0)
+  })
+})
+
+describe('deployment wiring — main.ts actually calls the factory', () => {
+  it('constructs its publisher through buildReviewPublisher, not directly', async () => {
+    // A SOURCE-LEVEL assertion, and deliberately so. Everything above proves
+    // the factory passes the flag; nothing above proves main.ts uses the
+    // factory, because importing main.ts boots the CLI (that is why the
+    // factory lives in pipeline.ts at all). Swapping main.ts back to a bare
+    // `new ReviewPublisher({ mrClient: client })` leaves every behavioural
+    // test in this phase green while turning the feature off in production.
+    //
+    // Reading the file is a blunt way to close that, and a blunt guard on the
+    // one line the suite cannot otherwise reach beats no guard at all. This
+    // phase has now produced three bugs of exactly that shape.
+    const source = await readFile(new URL('../../src/main.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('buildReviewPublisher(client, config)')
+    // And it must not go around the factory.
+    expect(source).not.toContain('new ReviewPublisher(')
   })
 })
