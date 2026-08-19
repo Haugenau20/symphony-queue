@@ -344,3 +344,86 @@ token for the repository. Neither can do the other's job, so a compromised
 orchestrator can vandalize issue text and nothing else. Note the role does the
 constraining — `api` is full API access for that project, and there is no
 issues-only scope.
+
+## 11. Inline review discussions: what the diff decides, and what the model only claims
+
+Phase 3 posts a finding as a comment on its own diff line. The machinery is small; the
+judgement around it is not, and three of the decisions below are the kind a later reader
+would "simplify" straight back into the bug they were written to prevent.
+
+### The old/new boundary is absolute. Added-versus-context is not.
+
+`positionFor` (`review/diff.ts`) maps a finding onto GitLab's position contract. A finding
+carries a `lineType` the MODEL wrote, and the question is how far to trust it.
+
+**`removed` is its own world and nothing may cross into it.** A removed line exists only in
+the pre-image, so the number names an OLD-file line and the comment belongs in the left
+gutter. Resolving a removed finding by new-file numbering is exactly how a comment lands on
+the wrong *side* of the diff — the failure the design report calls the worst in the plan,
+because it is visible, wrong, and on someone else's merge request. Two tests exist for no
+other purpose than to assert this; deleting the removed branch fails four.
+
+**`added` and `context` both name a line of the NEW file**, so the number identifies one
+physical line and the diff itself says which kind it is. The first implementation demanded
+the model's label match, and a live review of five Python files placed NONE of its seven
+findings: a one-line change reads to a model as "line 6 now says X" — `context` — where the
+diff says `added`.
+
+Loosening that in both directions fixed the first problem and caused a worse one. A comment
+describing `JSONLinesDataSource` landed on an untouched line inside `CSVDataSource`, because
+the type match had quietly been doing a SECOND job: corroborating the line NUMBER. "Added" is
+a specific claim — this line is part of the diff's additions — and when the diff disagrees,
+the model is wrong about something, most likely the number.
+
+So the leniency is **one-directional**:
+
+| Model claims | Diff says | Result |
+| --- | --- | --- |
+| `context` | `added` | placed — the label added nothing the diff lacked |
+| `added` | `context` | REFUSED — the number is not corroborated |
+| `removed` | anything in the new file | never resolved by new-file numbering |
+
+Ten consecutive live placements were correct after this change. It is not a heuristic to tidy
+into symmetry.
+
+### The removed-line path is correct, tested, and appears never to be taken
+
+Across every live run, the reviewing model described deletions but anchored them on the
+ADJACENT ADDED line, citing new-file numbers. It never emitted `lineType: "removed"`.
+
+Left exactly as it is, deliberately. Pushing the model toward removed-line reporting would buy
+a marginally better anchor and spend it on the only path that can produce a wrong-side
+comment. An unexercised safety net is a good outcome here, not a gap.
+
+### Unplaceable is ordinary, and the note must never imply approval
+
+Every `InlineSkipReason` is a normal answer. A review that places half its findings and lists
+the rest is a correct review; one that places a finding on the wrong line is not.
+
+With inline on, the summary note lists only what FELL BACK — and that produced a note reading
+"4 findings were posted as inline comments" directly above "No findings.". Read quickly, that
+says the reviewer found nothing, which is the one meaning silence must never carry. An empty
+list now states which emptiness it is: nothing fell back, or nothing was found.
+
+### The bug this phase produced four times
+
+Not a logic error. Four times, correct code and thorough tests were joined by a wire nothing
+exercised:
+
+1. The worker mapped the diff bodies away one line after computing them — inline placement was
+   impossible in production. 779 tests green.
+2. The publisher read placement material from a field only tests populated. Feature 100% inert.
+   779 green.
+3. `main.ts` never passed the config flag to the publisher. Feature off. 784 green.
+4. `main.ts` never passed `diffEndpoint` to the client. Setting inert. 801 green — and the
+   source-text guard written for (3) *also* missed it, matching the same words in a nearby log
+   line at different indentation.
+
+Every one was found by deliberately breaking the implementation, none by writing more tests.
+The suite was not weak; it was complete at every layer and blind to the joins, because each
+layer's tests construct their own inputs. `main.ts` is the worst case, since importing it boots
+the CLI — which is why `review/pipeline.ts` exists: factories there are importable, so the
+deployment path can be tested behaviourally instead of grepped for.
+
+**Standing practice, extending §8: after the suite is green, break the wires, not just the
+logic.** Delete an argument at a call site and see whether anything fails.
