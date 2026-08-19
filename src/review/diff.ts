@@ -210,14 +210,35 @@ export function positionFor(finding: PositionableFinding, file: PositionableFile
   // the answer is read off the diff rather than guessed. What changes is only
   // that a mislabelled finding gets the position its line actually has, instead
   // of no position at all.
+  // The leniency is ONE-DIRECTIONAL, and the asymmetry is the whole of what
+  // makes it safe. The two mismatches are not the same kind of mistake:
+  //
+  //   claim `context`, line is `added`   -> ACCEPT.
+  //       "Context" is ambiguous. A model describing a one-line change says
+  //       "line 6 now reads X", which is a true statement about an added line,
+  //       and labels it context. The label carries no information the diff
+  //       does not already have, so the diff wins.
+  //
+  //   claim `added`, line is `context`   -> REFUSE.
+  //       "Added" is a specific claim: this line is part of the diff's
+  //       additions. When the diff says it is not, the model is wrong about
+  //       something — and the likeliest thing it is wrong about is the line
+  //       NUMBER. Accepting this put a comment about JSONLinesDataSource on an
+  //       untouched line inside CSVDataSource, on a real merge request, which
+  //       is the exact failure design §1 calls the worst in the plan.
+  //
+  // So the type match was quietly doing a SECOND job all along: corroborating
+  // the line number. Dropping it in both directions removed a real check to
+  // fix an unrelated one. Kept where it corroborates, dropped where it only
+  // second-guesses a description of the same line.
   for (const hunk of hunks) {
     for (const line of hunk.lines) {
       // A removed line carries newLine === null and can never match a number.
-      if (line.newLine === finding.line) {
-        return line.type === 'added'
-          ? { oldLine: null, newLine: line.newLine }
-          : { oldLine: line.oldLine, newLine: line.newLine }
-      }
+      if (line.newLine !== finding.line) continue
+      if (line.type === 'added') return { oldLine: null, newLine: line.newLine }
+      // Context line: only a `context` claim corroborates it.
+      if (finding.lineType === 'context') return { oldLine: line.oldLine, newLine: line.newLine }
+      return null
     }
   }
   return null
