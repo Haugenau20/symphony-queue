@@ -577,7 +577,7 @@ describe('ReviewPublisher — provenance footer end to end through publish()', (
       // The critic's own dropped[] reasons are model text about the change, and
       // the footer reports only counts from it — never these strings.
       critique: { ran: true, keptCount: 1, droppedCount: 1, dropped: [{ title: distinctiveTitle, file: 'x', reason: distinctiveTitle }] },
-      excluded: [{ path: 'vendor/skipped.min.js', reason: 'exclude_path' }],
+      excluded: [{ path: 'vendor/skipped.min.js', reason: 'binary' }],
     })
 
     const result = await publisher(client).publish({ job: maliciousJob, findings: threeFindingsDoc(), diffFiles, provenance: prov })
@@ -621,9 +621,15 @@ describe('the provenance footer is not a second channel for merge-request text',
     expect(footer).toContain('1 matched exclude_paths')
     expect(footer).toContain('1 generated')
     expect(footer).toContain('1 binary (no text diff)')
-    expect(footer).toContain('dist/bundle.js')
+    // Named, because nobody asked for these to be skipped — GitLab decided,
+    // and "wait, why was THAT one skipped" is a real question about them.
     expect(footer).toContain('schema.pb.go')
     expect(footer).toContain('assets/logo.png')
+    // NOT named: the operator's own exclude_paths glob matched it. The count
+    // line above already proves the rule fired, and reciting the matches back
+    // is telling the operator what they told the system — five identical
+    // __pycache__ lines on every revision, forever.
+    expect(footer).not.toContain('dist/bundle.js')
   })
 
   it('a hostile filename still cannot inject markup — it is listed inside a code span', () => {
@@ -644,9 +650,11 @@ describe('the provenance footer is not a second channel for merge-request text',
   })
 
   it('caps the list at ten and says how many it did not name', () => {
+    // `binary` rather than `exclude_path`: operator-configured exclusions are
+    // no longer named at all, so capping a list of them would test nothing.
     const excluded = Array.from({ length: 14 }, (_, i) => ({
       path: `vendor/lib-${i}.min.js`,
-      reason: 'exclude_path' as const,
+      reason: 'binary' as const,
     }))
     const footer = renderProvenanceFooter({
       chunkCount: 1, chunksFailed: 0, excluded, critique: null, checkoutUsed: false,
@@ -781,5 +789,57 @@ describe('the publish marker cannot be spoofed by another author', () => {
 
     expect(result.status).toBe('already_published')
     expect(client.calls.createNote).toHaveLength(0)
+  })
+})
+
+describe('renderProvenanceFooter — an operator-configured exclusion is counted, not recited', () => {
+  const pyc = (n: string) => ({ path: `analytics/__pycache__/${n}.cpython-311.pyc`, reason: 'exclude_path' as const })
+
+  it('does not name files matched by the operator\'s own exclude_paths rule', () => {
+    // The real shape of the complaint: a __pycache__ rule matches the same five
+    // files on every revision, and naming them adds five lines of noise that
+    // never change. The operator wrote the glob; the count line proves it fired.
+    const footer = renderProvenanceFooter({
+      chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
+      excluded: [pyc('__init__'), pyc('aggregator'), pyc('calculator'), pyc('reporter'), pyc('visualizer')],
+    })
+
+    expect(footer).toContain('5 files not reviewed')
+    expect(footer).toContain('matched exclude_paths')
+    expect(footer).not.toContain('__pycache__')
+    expect(footer).not.toContain('.pyc')
+  })
+
+  it('still names a binary, generated or collapsed file — those are surprises, not instructions', () => {
+    const footer = renderProvenanceFooter({
+      chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
+      excluded: [
+        pyc('__init__'),
+        { path: 'assets/logo.png', reason: 'binary' },
+        { path: 'src/schema.generated.ts', reason: 'generated' },
+        { path: 'src/huge.ts', reason: 'collapsed' },
+      ],
+    })
+
+    expect(footer).toContain('4 files not reviewed')
+    expect(footer).not.toContain('__pycache__')   // configured — counted only
+    expect(footer).toContain('assets/logo.png')   // GitLab's call — named
+    expect(footer).toContain('src/schema.generated.ts')
+    expect(footer).toContain('src/huge.ts')
+  })
+
+  it('the "and N more" cap counts only the files it would actually have named', () => {
+    // Before, a hundred exclude_paths matches made the cap report "…and 95
+    // more" while naming none of them, which is arithmetic about an invisible
+    // list.
+    const many = Array.from({ length: 100 }, (_, i) => pyc(`m${i}`))
+    const footer = renderProvenanceFooter({
+      chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
+      excluded: [...many, { path: 'a.png', reason: 'binary' }],
+    })
+
+    expect(footer).toContain('101 files not reviewed')
+    expect(footer).toContain('a.png')
+    expect(footer).not.toContain('more.')
   })
 })
