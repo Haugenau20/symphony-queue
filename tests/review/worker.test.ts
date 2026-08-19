@@ -350,7 +350,12 @@ describe('ReviewWorker — happy path', () => {
     expect(outcome.kind).toBe('reviewed')
     if (outcome.kind !== 'reviewed') throw new Error('unreachable')
     expect(outcome.findings).toEqual(validFindings())
-    expect(outcome.diffFiles).toEqual([{ oldPath: 'src/foo.ts', newPath: 'src/foo.ts' }])
+    // Paths AND the diff body. Asserting only the paths is what let the worker
+    // map the bodies away unnoticed, making inline placement impossible in
+    // production while this test stayed green.
+    expect(outcome.diffFiles.map((f) => ({ oldPath: f.oldPath, newPath: f.newPath })))
+      .toEqual([{ oldPath: 'src/foo.ts', newPath: 'src/foo.ts' }])
+    expect(outcome.diffFiles[0]!.diff.length).toBeGreaterThan(0)
 
     // Workspace destroyed afterwards.
     expect(existsSync(join(root, 'mr-412-deadbeef'))).toBe(false)
@@ -443,7 +448,12 @@ describe('ReviewWorker — exclude_paths and the size cap', () => {
 
     expect(outcome.kind).toBe('reviewed')
     if (outcome.kind === 'reviewed') {
-      expect(outcome.diffFiles).toEqual([{ oldPath: 'src/foo.ts', newPath: 'src/foo.ts' }])
+      // Paths AND the diff body. Asserting only the paths is what let the worker
+      // map the bodies away unnoticed, making inline placement impossible in
+      // production while this test stayed green.
+      expect(outcome.diffFiles.map((f) => ({ oldPath: f.oldPath, newPath: f.newPath })))
+        .toEqual([{ oldPath: 'src/foo.ts', newPath: 'src/foo.ts' }])
+      expect(outcome.diffFiles[0]!.diff.length).toBeGreaterThan(0)
     }
   })
 

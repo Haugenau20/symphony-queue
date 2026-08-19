@@ -31,8 +31,7 @@ import type {
   FindingsCritic,
   CritiqueResult,
   RepoCheckout,
-  CheckoutResult,
-} from '../../src/review/types.js'
+  CheckoutResult, MergeRequestDiscussionClient } from '../../src/review/types.js'
 
 let root: string
 let storeRoot: string
@@ -68,7 +67,8 @@ function diffFile(over: Partial<MergeRequestDiffFile> = {}): MergeRequestDiffFil
 function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequestDiffFile[]; headAt?: () => string } = {}) {
   const notes: Array<{ id: string; body: string; authorId: string | null }> = []
   const posted: string[] = []
-  const client: MergeRequestClient = {
+  const discussions: Array<{ id: string; body: string }> = []
+  const client: MergeRequestClient & MergeRequestDiscussionClient = {
     listOpenMergeRequests: async () => opts.summaries ?? [summary()],
     getMergeRequest: async () => {
       const head = opts.headAt ? opts.headAt() : 'head1'
@@ -84,8 +84,20 @@ function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequ
       notes.push({ id, body, authorId: 'self' })
       return id
     },
+    // The discussion half of the client. These end-to-end tests exercise the
+    // summary-note path with inline comments OFF, so nothing here is called —
+    // but the publisher's client type now requires them, which is the point:
+    // the capability is part of the type rather than a runtime hope.
+    listDiscussions: async () => [],
+    createDiscussion: async (_p, _i, body) => {
+      const id = `disc-${discussions.length + 1}`
+      discussions.push({ id, body })
+      return id
+    },
+    replyToDiscussion: async () => 'reply-1',
+    resolveDiscussion: async () => true,
   }
-  return { client, notes, posted }
+  return { client, notes, posted, discussions }
 }
 
 /** An agent that writes a findings document into the workspace, as the real one would. */

@@ -16,20 +16,47 @@
  *      whatever the worker saw — the worker may have finished minutes ago.
  *   4. list existing notes; a note already carrying this headSha's marker
  *      means a previous attempt already succeeded — record and stop.
- *   5. post ONE summary note carrying that marker; return its id.
+ *   5. NEW, only when inline comments are enabled: place every finding that
+ *      can be tied to a line with certainty, dedup against our own existing
+ *      inline threads, and post the rest as new discussions — one at a time,
+ *      never in parallel. Anything that cannot be placed, or whose post
+ *      fails, falls back to the summary note.
+ *   6. post ONE summary note carrying the headSha marker. With inline off it
+ *      lists every finding, exactly as before. With inline on it lists only
+ *      the findings that fell back, plus one line saying how many went
+ *      inline — so a short note still explains itself. Always posted, even
+ *      with zero findings: silence must keep meaning "did not run".
+ *   7. NEW, only when inline comments are enabled: reply to every one of our
+ *      own inline threads that carries an OLDER headSha, naming the new one,
+ *      and attempt to resolve it. Logged and swallowed on failure — the
+ *      review is already published by this point.
  *
- * The ordering is load-bearing, not cosmetic: swapping 3 and 5 would let a
+ * The ordering is load-bearing, not cosmetic: swapping 3 and 6 would let a
  * stale review get posted after the code it describes has already changed,
- * and dropping 4 would double-post on every retry.
+ * dropping 4 would double-post on every retry, running 5 after 6 would leave
+ * the note unable to say what went inline, and running 7 before 6 would risk
+ * a crash leaving a half-superseded history instead of a published review.
  */
 
 import { getLogger } from '../log.js'
 import { safeParseFindingsDocument } from './findings.js'
+import {
+  assignOrdinals,
+  inlineThreadMarker,
+  parseInlineThreadMarker,
+  placeFinding,
+  threadFingerprint,
+} from './inline.js'
 import type {
+  Discussion,
   ExclusionReason,
   Finding,
   FindingsDocument,
+  InlinePublishOutcome,
+  InlineSkipReason,
   MergeRequestClient,
+  MergeRequestDiffFile,
+  MergeRequestDiscussionClient,
   MergeRequestSummary,
   ReviewJob,
   ReviewProvenance,
@@ -42,14 +69,39 @@ import type {
  * {@link MergeRequestClient}: no `listDiffs` / `getFileAtRef`, so it is a
  * compile-time error for this module to go fetch its own material — it only
  * ever acts on what {@link PublishRequest} was handed.
+ *
+ * Intersected with the full {@link MergeRequestDiscussionClient} (not another
+ * `Pick`) — the publisher is the one place in this pipeline allowed to write
+ * inline discussions at all, and it needs all four operations — list, create,
+ * reply, resolve — to do steps 5 and 7. No other module's client type gains
+ * these; `ReviewMaterialClient` (worker.ts) stays exactly as narrow as it
+ * always was.
+ *
+ * All four are MANDATORY, not `Partial`. They were briefly optional plus a
+ * constructor-time runtime check, so that two test fixtures typed as a bare
+ * `MergeRequestClient` would keep compiling — which traded a compile-time
+ * guarantee for a thrown string in order to spare two fixtures. The fixtures
+ * grew the methods instead. The `Pick` discipline is the reason this boundary
+ * holds by compilation rather than convention; weakening it to accommodate a
+ * test is backwards.
  */
 export type ReviewPublishClient = Pick<
   MergeRequestClient,
   'getMergeRequest' | 'listNotes' | 'createNote' | 'getCurrentUserId'
->
+> &
+  MergeRequestDiscussionClient
 
 export interface ReviewPublisherConfig {
   mrClient: ReviewPublishClient
+  /**
+   * Off unless explicitly turned on. The SHIPPED default lives in config.ts
+   * (the orchestrator's call, not this module's) — main.ts always passes this
+   * explicitly. Defaulting to false here is what makes "an old caller that
+   * never mentions this key gets byte-identical output" a property this
+   * module can guarantee on its own, rather than one that depends on every
+   * caller getting config.ts right.
+   */
+  inlineComments?: boolean
 }
 
 export interface PublishRequest {
@@ -62,8 +114,20 @@ export interface PublishRequest {
    * that a value was already checked.
    */
   findings: unknown
-  /** The files the review agent actually saw (design: worker's `diffFiles`). Used by step 2. */
-  diffFiles: Array<{ oldPath: string; newPath: string }>
+  /**
+   * The files the review agent actually saw, WITH their diff bodies. Step 2
+   * reads the paths to catch a finding naming a file outside the review; step
+   * 5 parses the bodies into hunks to position a finding on a line.
+   *
+   * ONE list, not two. This briefly carried paths only, with a second
+   * `placementFiles` field alongside it for the bodies — which meant the set a
+   * finding was VALIDATED against and the set it was POSITIONED against were
+   * separate parameters that could be passed different values. For a feature
+   * whose worst failure is a comment on the wrong line, two file lists that
+   * can disagree is the wrong shape, however carefully the one caller wires
+   * them today.
+   */
+  diffFiles: MergeRequestDiffFile[]
   /**
    * OPTIONAL, so the existing `FindingsPublisher` caller in job_runner.ts
    * (which does not construct one) keeps compiling unchanged. When present,
@@ -82,10 +146,41 @@ export interface PublishRequest {
 }
 
 export type PublishResult =
-  | { status: 'published'; noteId: string; body: string }
+  | { status: 'published'; noteId: string; body: string; inline: InlinePublishOutcome }
   | { status: 'already_published'; noteId: string }
   | { status: 'superseded' }
   | { status: 'rejected'; reason: string }
+
+/** All-zero, `attempted: false` — step 5a's exact contract when inline is off. */
+function emptyInlineOutcome(attempted: boolean): InlinePublishOutcome {
+  return {
+    attempted,
+    placed: 0,
+    alreadyPresent: 0,
+    fellBack: 0,
+    fallbackReasons: {},
+    failed: 0,
+    superseded: 0,
+    resolved: 0,
+  }
+}
+
+/**
+ * The HTTP status off a thrown error, if it looks like one — never the
+ * message, and never the error object itself. `GitLabApiError` (gitlab_mr.ts)
+ * carries `.status` and builds its `.message` from method/path/status alone,
+ * but this module logs neither: an error thrown by some OTHER client
+ * implementation (a test fake, a future transport) is not guaranteed to keep
+ * that same discipline, and this is the one place credentials or a response
+ * body could otherwise leak into a log line.
+ */
+function errorStatus(err: unknown): number | null {
+  if (err && typeof err === 'object' && 'status' in err) {
+    const status = (err as { status?: unknown }).status
+    if (typeof status === 'number') return status
+  }
+  return null
+}
 
 // --- marker -------------------------------------------------------------------
 
@@ -210,8 +305,23 @@ const SEVERITY_SECTIONS: Array<{ severity: Finding['severity']; label: string }>
  * headSha alone. No parameter here can carry merge-request-authored text —
  * the summary and every finding field came out of FINDINGS.json, which is
  * the agent's own output, already schema-validated by the time this runs.
+ *
+ * `extraLine`, when given, is inserted as its own paragraph right after the
+ * summary and before the findings — step 6's "N findings posted inline"
+ * line. It is OPTIONAL and every existing caller omits it, which is what
+ * keeps this function's output byte-identical to what it always produced
+ * for those callers: the inline-off acceptance test depends on that.
+ * `extraLine` is always OUR OWN generated text (a count), never
+ * merge-request-authored, so it is written through as-is rather than run
+ * through the escaping helpers below.
  */
-export function renderReviewNote(findings: FindingsDocument, headSha: string): string {
+export function renderReviewNote(
+  findings: FindingsDocument,
+  headSha: string,
+  extraLine?: string,
+  /** What an EMPTY findings list means here. Defaults to "No findings." */
+  emptyMeans?: string,
+): string {
   const bySeverity = new Map<Finding['severity'], Finding[]>()
   for (const { severity } of SEVERITY_SECTIONS) bySeverity.set(severity, [])
   for (const finding of findings.findings) {
@@ -225,9 +335,20 @@ export function renderReviewNote(findings: FindingsDocument, headSha: string): s
   lines.push('')
   lines.push(findings.summary.trim().length > 0 ? blockText(findings.summary, '') : '_(no summary provided)_')
   lines.push('')
+  if (extraLine !== undefined) {
+    lines.push(extraLine)
+    lines.push('')
+  }
 
   if (findings.findings.length === 0) {
-    lines.push('No findings.')
+    // `emptyMeans` distinguishes the two very different reasons this list can
+    // be empty, and getting it wrong undermines the oldest property in this
+    // design. With inline comments on, the note lists only what FELL BACK — so
+    // a review that placed all four of its findings inline printed "No
+    // findings." directly above "4 findings were posted as inline comments on
+    // this revision." Read quickly, that says the reviewer found nothing, which
+    // is the one thing silence must never be able to mean here.
+    lines.push(emptyMeans ?? 'No findings.')
   } else {
     for (const { severity, label } of SEVERITY_SECTIONS) {
       const items = bySeverity.get(severity)!
@@ -245,6 +366,45 @@ export function renderReviewNote(findings: FindingsDocument, headSha: string): s
   }
 
   return lines.join('\n').trimEnd() + '\n'
+}
+
+/**
+ * One inline thread's body (step 5's rendering). Lives beside
+ * {@link renderReviewNote} because this is where the escaping helpers are —
+ * the same discipline applies for the same reason: `finding.title`,
+ * `finding.detail` and `finding.suggestion` are model output derived from a
+ * diff the merge request's author wrote, and GitLab renders discussion note
+ * bodies as markdown with raw HTML enabled exactly as it does summary notes.
+ * Title through `boldText`, detail and suggestion through `blockText`.
+ *
+ * Deliberately omits `finding.file` and the line number: GitLab renders the
+ * anchor itself, so repeating the location is both noise and — since
+ * `finding.file` is model output — attacker-influenced text with nothing to
+ * gain by including it.
+ */
+export function renderInlineDiscussionBody(finding: Finding, headSha: string, fingerprint: string): string {
+  const lines: string[] = []
+  lines.push(inlineThreadMarker(headSha, fingerprint))
+  lines.push('')
+  lines.push(`**${boldText(finding.title)}**`)
+  lines.push('')
+  lines.push(blockText(finding.detail, ''))
+  if (finding.suggestion) {
+    lines.push('')
+    lines.push(`Suggestion: ${blockText(finding.suggestion, '')}`)
+  }
+  return lines.join('\n').trimEnd() + '\n'
+}
+
+/**
+ * Step 7's reply to a prior-revision thread. STATIC text plus a head SHA —
+ * nothing else. The SHA is our own job's identity, not merge-request-authored
+ * text, but it is still wrapped in a code span rather than trusted verbatim:
+ * defence in depth costs one function call here, and every other string this
+ * module ever sends to GitLab earns its escaping the same way.
+ */
+function renderSupersededReply(newHeadSha: string): string {
+  return `Superseded by a review of the new revision at ${codeSpan(newHeadSha)}. See the new thread(s) posted there.`
 }
 
 /**
@@ -327,23 +487,53 @@ export function renderProvenanceFooter(provenance: ReviewProvenance): string {
       .map(([reason, count]) => `${count} ${EXCLUSION_LABELS[reason]}`)
       .join(', ')
     lines.push(`- ${excludedCount} file${excludedCount === 1 ? '' : 's'} not reviewed: ${breakdown}.`)
-    for (const e of provenance.excluded.slice(0, MAX_LISTED_EXCLUSIONS)) {
+
+    // Files the operator's OWN exclude_paths rule matched are counted but not
+    // named. Naming them is telling the operator what they already told the
+    // system: they wrote the glob, and the count line above already confirms
+    // it matched. A `__pycache__` rule that catches five .pyc files on every
+    // single revision turns the footer into five lines of noise that never
+    // change and never need reading — and noise in the note is the one failure
+    // mode in this design that actually costs anything.
+    //
+    // Every OTHER reason is still named, because those are surprises rather
+    // than instructions: a binary, generated or collapsed file is something
+    // GitLab decided, not something the operator asked for, and "wait, why was
+    // THAT one skipped" is a question worth being able to answer.
+    const named = provenance.excluded.filter((e) => e.reason !== 'exclude_path')
+    for (const e of named.slice(0, MAX_LISTED_EXCLUSIONS)) {
       lines.push(`  - ${codeSpan(e.path)} — ${EXCLUSION_SHORT[e.reason]}`)
     }
-    const remaining = excludedCount - MAX_LISTED_EXCLUSIONS
+    const remaining = named.length - MAX_LISTED_EXCLUSIONS
     if (remaining > 0) lines.push(`  - …and ${remaining} more.`)
   }
 
   return lines.join('\n')
 }
 
+/**
+ * Step 6's one extra line — plain text we generated ourselves (a count), not
+ * merge-request-authored, so it needs no escaping. Counts both newly placed
+ * threads and ones that already existed for this head SHA (a retry): both
+ * are, right now, a live inline comment on the merge request, which is what
+ * "went inline" means to a reader of the note.
+ */
+function renderInlineSummaryLine(outcome: InlinePublishOutcome): string {
+  const count = outcome.placed + outcome.alreadyPresent
+  const finding = count === 1 ? 'finding was' : 'findings were'
+  const comment = count === 1 ? 'comment' : 'comments'
+  return `_${count} ${finding} posted as inline ${comment} on this revision._`
+}
+
 // --- publisher ------------------------------------------------------------
 
 export class ReviewPublisher {
   private readonly mrClient: ReviewPublishClient
+  private readonly inlineComments: boolean
 
   constructor(config: ReviewPublisherConfig) {
     this.mrClient = config.mrClient
+    this.inlineComments = config.inlineComments ?? false
   }
 
   async publish(request: PublishRequest): Promise<PublishResult> {
@@ -415,14 +605,204 @@ export class ReviewPublisher {
       return { status: 'already_published', noteId: existing.id }
     }
 
-    // 5. post ONE summary note, always — even with zero findings, so silence
-    // unambiguously means the reviewer did not run. The provenance footer
-    // (if any) is appended here, after the findings body is fully rendered —
-    // it never changes step order or the findings rendering above it.
-    const noteBody = renderReviewNote(sanitized, headSha)
+    // 5. inline placement and posting — only when enabled. Every branch below
+    // this `if` makes zero discussion-API calls when it is false, which is
+    // what keeps the note byte-identical to the pre-inline output.
+    const inline = emptyInlineOutcome(this.inlineComments)
+    // Findings that fall back to the summary note: unplaceable, or placeable
+    // but their create call threw. In sanitized-list order.
+    const fallback: Finding[] = []
+    // Our own inline-thread markers, across every headSha, parsed once from a
+    // single listDiscussions call and reused by step 7 below — never
+    // re-fetched.
+    const ourThreads: Array<{ discussionId: string; headSha: string; fingerprint: string }> = []
+
+    if (this.inlineComments) {
+      const discussionClient = this.mrClient
+
+      const ordinals = assignOrdinals(sanitized.findings)
+      const entries = sanitized.findings.map((finding, i) => ({
+        index: i,
+        finding,
+        placement: placeFinding(finding, request.diffFiles, request.job),
+        fingerprint: threadFingerprint(finding, ordinals[i]!),
+      }))
+
+      const discussions: Discussion[] = await discussionClient.listDiscussions(projectId, mrIid)
+
+      let foreignThreadCount = 0
+      for (const d of discussions) {
+        const first = d.notes[0]
+        if (!first) continue
+        const marker = parseInlineThreadMarker(first.body)
+        if (!marker) continue
+        // Same discipline as step 4's marker: a thread's first note has to be
+        // OURS, not merely carry our marker string, or the author of a change
+        // could post one themselves and suppress its own inline review. When
+        // our identity is unknown (selfId === null) this degrades to
+        // marker-only, exactly as step 4 does, for the same reason: refusing
+        // to publish at all is the worse failure.
+        if (selfId !== null && first.authorId !== selfId) {
+          foreignThreadCount++
+          continue
+        }
+        ourThreads.push({ discussionId: d.id, headSha: marker.headSha, fingerprint: marker.fingerprint })
+      }
+      if (selfId !== null && foreignThreadCount > 0) {
+        log.warn({ projectId, mrIid, foreignThreadCount }, 'review_inline_marker_not_ours')
+      }
+
+      const presentAtThisHead = new Set(
+        ourThreads.filter((t) => t.headSha === headSha).map((t) => t.fingerprint),
+      )
+
+      const severityRank: Record<Finding['severity'], number> = { blocking: 0, concern: 1, nit: 2 }
+      const toCreate: typeof entries = []
+
+      for (const entry of entries) {
+        if (entry.placement.kind === 'unplaceable') {
+          fallback.push(entry.finding)
+          inline.fellBack++
+          const reason: InlineSkipReason = entry.placement.reason
+          inline.fallbackReasons[reason] = (inline.fallbackReasons[reason] ?? 0) + 1
+          continue
+        }
+        if (presentAtThisHead.has(entry.fingerprint)) {
+          // Already posted for THIS revision — a retry after a partial
+          // failure. Post nothing, and it does not fall back either: it
+          // already has a live thread.
+          inline.alreadyPresent++
+          continue
+        }
+        toCreate.push(entry)
+      }
+
+      // Severity order, then input order — never Promise.all. GitLab rate
+      // limits are a real constraint, and creating discussions sequentially
+      // is how that is respected rather than discovered in production.
+      toCreate.sort((a, b) => severityRank[a.finding.severity] - severityRank[b.finding.severity] || a.index - b.index)
+
+      for (const entry of toCreate) {
+        if (entry.placement.kind !== 'placed') continue // narrowed by the filter above; keeps TS happy
+        const body = renderInlineDiscussionBody(entry.finding, headSha, entry.fingerprint)
+        try {
+          await discussionClient.createDiscussion(projectId, mrIid, body, entry.placement.position)
+          inline.placed++
+        } catch (err) {
+          // A create that throws does not fail the publish — it falls back to
+          // the summary note instead. A finding that reaches nobody because a
+          // POST 500'd is the one outcome worse than a fallback. Logged with
+          // the status only: never the message, never the body.
+          inline.failed++
+          fallback.push(entry.finding)
+          log.warn(
+            { projectId, mrIid, status: errorStatus(err) },
+            'review_inline_discussion_create_failed',
+          )
+        }
+      }
+    }
+
+    // 6. post ONE summary note, always — even with zero findings, so silence
+    // unambiguously means the reviewer did not run. With inline off it lists
+    // every finding, exactly as it always has. With inline on it lists only
+    // the findings that fell back, plus one line saying how many went inline.
+    // The provenance footer (if any) is appended after, never changing step
+    // order or the findings rendering above it.
+    const notedFindings: FindingsDocument = this.inlineComments
+      ? { summary: sanitized.summary, findings: fallback }
+      : sanitized
+    const extraLine = this.inlineComments ? renderInlineSummaryLine(inline) : undefined
+    // An empty note list means "nothing fell back" when findings exist and went
+    // inline, and "nothing was found" only when there were no findings at all.
+    const placedSomething = inline.placed + inline.alreadyPresent > 0
+    const emptyMeans = this.inlineComments && placedSomething
+      ? 'Every finding was placed on its own line — see the **Changes** tab.'
+      : undefined
+    const noteBody = renderReviewNote(notedFindings, headSha, extraLine, emptyMeans)
     const body = request.provenance ? `${noteBody}\n${renderProvenanceFooter(request.provenance)}\n` : noteBody
     const noteId = await this.mrClient.createNote(projectId, mrIid, body)
-    log.info({ projectId, mrIid, noteId, findingCount: sanitized.findings.length }, 'review_published')
-    return { status: 'published', noteId, body }
+    log.info(
+      {
+        projectId,
+        mrIid,
+        noteId,
+        findingCount: sanitized.findings.length,
+        inlinePlaced: inline.placed,
+        // WHY nothing was placed, not just that nothing was. Without this a
+        // reader of the logs sees "0 findings were posted as inline comments"
+        // in the note and has no way at all to tell whether the diff refs were
+        // missing, the paths did not resolve, or every line fell outside a
+        // hunk — three completely different faults with completely different
+        // fixes. The counts were computed and then thrown away.
+        inlineAlreadyPresent: inline.alreadyPresent,
+        inlineFellBack: inline.fellBack,
+        inlineFailed: inline.failed,
+        inlineFallbackReasons: inline.fallbackReasons,
+      },
+      'review_published',
+    )
+
+    // 7. supersede prior-revision threads — only when enabled, and only after
+    // the note above is safely posted. A crash between 6 and 7 must leave a
+    // published review, never a half-superseded history: superseding is
+    // tidying, and tidying is what is sacrificed on a partial failure. Never
+    // edits the original note or recomputes its position — a thread anchored
+    // to an old revision stays exactly where GitLab put it.
+    if (this.inlineComments) {
+      const discussionClient = this.mrClient
+      for (const thread of ourThreads) {
+        if (thread.headSha === headSha) continue // this revision, not a prior one
+        try {
+          await discussionClient.replyToDiscussion(projectId, mrIid, thread.discussionId, renderSupersededReply(headSha))
+          inline.superseded++
+        } catch (err) {
+          // Logged and swallowed: the review is already published, and
+          // failing the job now would only retry a publish that already
+          // succeeded.
+          log.warn(
+            { projectId, mrIid, discussionId: thread.discussionId, status: errorStatus(err) },
+            'review_inline_supersede_reply_failed',
+          )
+          continue
+        }
+        try {
+          const resolved = await discussionClient.resolveDiscussion(projectId, mrIid, thread.discussionId)
+          if (resolved) inline.resolved++
+        } catch (err) {
+          log.warn(
+            { projectId, mrIid, discussionId: thread.discussionId, status: errorStatus(err) },
+            'review_inline_supersede_resolve_failed',
+          )
+        }
+      }
+    }
+
+    // Step 7's own outcome, logged HERE and not with `review_published` above —
+    // that line is emitted before this block runs, so `superseded` and
+    // `resolved` are necessarily still zero there. Logging them at that point
+    // reported nothing and looked like it reported something.
+    //
+    // Only when supersession actually did something, so an ordinary first
+    // review stays quiet. `resolved` is the interesting number: it answers,
+    // from production rather than from documentation, whether this token may
+    // resolve a discussion it authored. On our instance it may not — GitLab
+    // returns 403 to a Reporter — so the reply stands alone and the thread
+    // stays open, which is the designed fallback and not a failure.
+    if (inline.superseded > 0) {
+      log.info(
+        {
+          projectId,
+          mrIid,
+          headSha,
+          superseded: inline.superseded,
+          resolved: inline.resolved,
+          resolvePermitted: inline.resolved > 0,
+        },
+        'review_inline_superseded',
+      )
+    }
+
+    return { status: 'published', noteId, body, inline }
   }
 }

@@ -798,7 +798,11 @@ export class ReviewWorker {
       return {
         kind: 'reviewed',
         findings: finalFindings,
-        diffFiles: allFiles.map((f) => ({ oldPath: f.oldPath, newPath: f.newPath })),
+        // The FULL files, bodies included: the publisher needs the diff text
+        // to position a finding on a line. Mapping this down to paths here is
+        // what made inline placement impossible in production while every
+        // test passed.
+        diffFiles: allFiles,
         provenance: {
           chunkCount: chunks.length,
           chunksFailed,
