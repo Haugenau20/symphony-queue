@@ -2,7 +2,15 @@ import { fetch as undiciFetch, ProxyAgent, type Dispatcher, type RequestInit } f
 import { proxyFromEnv, describeCause } from '../tracker/gitlab.js'
 import { getLogger } from '../log.js'
 import { isCollapsedDiff } from './diff.js'
-import type { MergeRequestClient, MergeRequestDiffFile, MergeRequestSummary } from './types.js'
+import type {
+  Discussion,
+  DiscussionNote,
+  DiscussionPosition,
+  MergeRequestClient,
+  MergeRequestDiffFile,
+  MergeRequestDiscussionClient,
+  MergeRequestSummary,
+} from './types.js'
 
 /**
  * Reads (and, for notes, writes) merge requests. Deliberately not built on
@@ -82,6 +90,33 @@ interface RawNote {
 }
 
 /**
+ * A note's diff position, as returned nested inside a discussion note. Every
+ * field optional, read defensively — same posture as `RawDiffFile` above.
+ */
+interface RawDiscussionPosition {
+  old_path?: string | null
+  new_path?: string | null
+  old_line?: number | null
+  new_line?: number | null
+}
+
+interface RawDiscussionNote {
+  id: number | string
+  body?: string | null
+  author?: { id?: number | string | null } | null
+  /** Whether this note (and by extension its discussion) can be resolved. */
+  resolvable?: boolean | null
+  resolved?: boolean | null
+  /** Absent/null for a note that is not anchored to a diff line. */
+  position?: RawDiscussionPosition | null
+}
+
+interface RawDiscussion {
+  id: string | number
+  notes?: RawDiscussionNote[] | null
+}
+
+/**
  * Whether a `/diffs` failure means "this instance cannot serve that endpoint"
  * as opposed to "something is wrong that another endpoint will not fix".
  *
@@ -131,6 +166,30 @@ export function projectPathFromListItem(raw: RawMergeRequestListItem): string {
 export function mapMergeRequestSummary(raw: RawMergeRequest, projectId: string): MergeRequestSummary {
   const diffRefs = raw.diff_refs
   const ready = Boolean(diffRefs && typeof diffRefs.head_sha === 'string' && diffRefs.head_sha.length > 0)
+
+  // `ready` is decided by head_sha alone, because that is all phases 1 and 2
+  // needed: the summary note is anchored to the head SHA and nothing else.
+  // Phase 3's inline positions need ALL THREE — GitLab rejects a position
+  // without base_sha and start_sha — so a merge request that is "ready" by the
+  // old definition can still place nothing at all, silently, for every finding
+  // on every revision.
+  //
+  // Not promoted into `ready`: that would stop the merge request being reviewed
+  // at all, and a summary-only review is far better than no review. Logged
+  // instead, once per mapping, so the cause is visible rather than inferred
+  // from an inline count of zero.
+  if (ready && (!diffRefs!.base_sha || !diffRefs!.start_sha)) {
+    getLogger().warn(
+      {
+        projectId,
+        mrIid: raw.iid,
+        hasBaseSha: Boolean(diffRefs!.base_sha),
+        hasStartSha: Boolean(diffRefs!.start_sha),
+      },
+      'review_diff_refs_incomplete_inline_disabled',
+    )
+  }
+
   return {
     projectId,
     mrIid: raw.iid,
@@ -159,6 +218,41 @@ export function mapDiffFile(raw: RawDiffFile): MergeRequestDiffFile {
     deletedFile,
     generatedFile: Boolean(raw.generated_file),
     collapsed: isCollapsedDiff({ diff, deletedFile }),
+  }
+}
+
+export function mapDiscussionNote(raw: RawDiscussionNote): DiscussionNote {
+  const authorId = raw.author?.id === undefined || raw.author?.id === null ? null : String(raw.author.id)
+  const position = raw.position
+    ? {
+        oldPath: raw.position?.old_path ?? '',
+        newPath: raw.position?.new_path ?? '',
+        oldLine: raw.position?.old_line ?? null,
+        newLine: raw.position?.new_line ?? null,
+      }
+    : null
+  return {
+    id: String(raw.id),
+    body: raw.body ?? '',
+    authorId,
+    position,
+  }
+}
+
+/**
+ * `resolvable`/`resolved` are properties of the discussion's FIRST note in
+ * GitLab's own model — a discussion has no such field of its own. Read
+ * defensively: a raw discussion missing either field, or missing notes
+ * entirely, maps to `false` rather than throwing.
+ */
+export function mapDiscussion(raw: RawDiscussion): Discussion {
+  const rawNotes = raw.notes ?? []
+  const first = rawNotes[0]
+  return {
+    id: String(raw.id),
+    resolvable: Boolean(first?.resolvable),
+    resolved: Boolean(first?.resolved),
+    notes: rawNotes.map(mapDiscussionNote),
   }
 }
 
@@ -192,7 +286,7 @@ export interface GitLabMergeRequestClientConfig {
 const MAX_PAGES = 20
 const PER_PAGE = 100
 
-export class GitLabMergeRequestClient implements MergeRequestClient {
+export class GitLabMergeRequestClient implements MergeRequestClient, MergeRequestDiscussionClient {
   private readonly baseUrl: string
   private readonly token: string
   private currentUserId: string | null = null
@@ -415,6 +509,90 @@ export class GitLabMergeRequestClient implements MergeRequestClient {
       { body },
     )
     return String(raw.id)
+  }
+
+  // --- MergeRequestDiscussionClient -------------------------------------------
+
+  /**
+   * Paginated, deliberately: a merge request under re-review accumulates
+   * discussions across its whole lifetime, and a single page would silently
+   * truncate the very MRs this feature exists for.
+   */
+  async listDiscussions(projectId: string, mrIid: number): Promise<Discussion[]> {
+    const raw = await this.paginate<RawDiscussion>((page) =>
+      `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/discussions?per_page=${PER_PAGE}&page=${page}`,
+    )
+    return raw.map(mapDiscussion)
+  }
+
+  /**
+   * `oldLine`/`newLine` are omitted from the serialised body entirely when the
+   * contract's value is null — never sent as an explicit `null`. GitLab
+   * rejects a null where it expects an absent key, and that difference is
+   * invisible to any test that asserts on a parsed object rather than the
+   * wire body (design §16, types.ts's {@link DiscussionPosition} doc).
+   */
+  async createDiscussion(
+    projectId: string,
+    mrIid: number,
+    body: string,
+    position: DiscussionPosition,
+  ): Promise<string> {
+    const positionBody: Record<string, unknown> = {
+      base_sha: position.baseSha,
+      start_sha: position.startSha,
+      head_sha: position.headSha,
+      old_path: position.oldPath,
+      new_path: position.newPath,
+      position_type: position.positionType,
+    }
+    if (position.oldLine !== null) positionBody.old_line = position.oldLine
+    if (position.newLine !== null) positionBody.new_line = position.newLine
+
+    const raw = await this.request<RawDiscussion>(
+      'POST',
+      `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/discussions`,
+      { body, position: positionBody },
+    )
+    return String(raw.id)
+  }
+
+  async replyToDiscussion(
+    projectId: string,
+    mrIid: number,
+    discussionId: string,
+    body: string,
+  ): Promise<string> {
+    const raw = await this.request<RawNote>(
+      'POST',
+      `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/discussions/${encodeURIComponent(discussionId)}/notes`,
+      { body },
+    )
+    return String(raw.id)
+  }
+
+  /**
+   * Whether a Reporter-role token can resolve a discussion it authored is
+   * UNVERIFIED on our instance (design §16), so 403/404/405 are treated as an
+   * ordinary refusal — logged at WARN with the status only, never a body —
+   * and reported back as `false` rather than thrown. A 5xx or a transport
+   * failure is a real fault and still throws.
+   */
+  async resolveDiscussion(projectId: string, mrIid: number, discussionId: string): Promise<boolean> {
+    const path = `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/discussions/${encodeURIComponent(discussionId)}`
+    try {
+      await this.request('PUT', path, { resolved: true })
+      return true
+    } catch (err) {
+      if (err instanceof GitLabApiError && (err.status === 403 || err.status === 404 || err.status === 405)) {
+        getLogger().warn(
+          { projectId, mrIid, discussionId, status: err.status },
+          'review_discussion_resolve_refused',
+        )
+        return false
+      }
+      throw err
+    }
   }
 
   // --- discovery internals ---------------------------------------------------

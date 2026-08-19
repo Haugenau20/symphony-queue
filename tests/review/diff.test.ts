@@ -170,10 +170,29 @@ describe('positionFor', () => {
     expect(positionFor({ line: null, lineType: 'context' }, file)).toBeNull()
   })
 
-  it('does not match a line number against the wrong lineType', () => {
-    // Line 11 exists as a removed old-line and as an added new-line in this
-    // hunk; asking for it as 'context' must not accidentally match either.
-    expect(positionFor({ line: 11, lineType: 'context' }, file)).toBeNull()
+  it('resolves a new-file line by its ACTUAL type, not the label the model gave it', () => {
+    // Line 11 is an ADDED line in this hunk. A finding calling it 'context'
+    // means the same physical line -- both labels describe the new file -- so
+    // it resolves to the added-line position rather than to nothing. Trusting
+    // the label here placed zero of seven findings on a real merge request:
+    // a one-line change reads to a model as "line 11 now says X", which it
+    // labels context, while the diff calls it added.
+    expect(positionFor({ line: 11, lineType: 'context' }, file))
+      .toEqual(positionFor({ line: 11, lineType: 'added' }, file))
+  })
+
+  it('NEVER resolves a removed finding by new-file numbering — the side is not negotiable', () => {
+    // The safety property the above must not erode. `removed` names an OLD
+    // file line, and a comment on the wrong SIDE of the diff is the failure
+    // this phase exists to prevent. Line 11 exists as an added NEW line here;
+    // asking for it as 'removed' must not find it.
+    const asRemoved = positionFor({ line: 11, lineType: 'removed' }, file)
+    if (asRemoved !== null) {
+      // If line 11 also exists as a removed OLD line, the only acceptable
+      // answer is the old-side one: oldLine set, newLine absent.
+      expect(asRemoved.newLine).toBeNull()
+      expect(asRemoved.oldLine).toBe(11)
+    }
   })
 
   it('finds a line across multiple hunks in the same file', () => {

@@ -261,3 +261,50 @@ describe('validateReviewConfig — skip_forks documents a boundary, it cannot mo
     expect(validateReviewConfig(buildReviewConfig(review(), env()), env())).toHaveLength(0)
   })
 })
+
+describe('buildReviewConfig — phase 3, inline discussions', () => {
+  it('defaults ON, which deliberately disagrees with design §14', () => {
+    const cfg = buildReviewConfig(review(), env())
+
+    // Design §14 says "behind a config flag, default off, until it has run
+    // against real MRs", and the phase 3 brief repeated it. The owner decided
+    // otherwise: this deployment is not live anywhere and watches one test
+    // repository, so shipping it off would only mean turning it on by hand
+    // immediately. Asserted rather than left implicit precisely BECAUSE it
+    // contradicts the design document — a future reader comparing the two
+    // should find the disagreement pinned down, not discover it by surprise.
+    expect(cfg.inlineComments).toBe(true)
+  })
+
+  it('can be turned off, which is the first move if a comment lands on a wrong line', () => {
+    const cfg = buildReviewConfig(review({ inline_comments: false }), env())
+    expect(cfg.inlineComments).toBe(false)
+  })
+
+  it('turning it on creates no place to put a credential', () => {
+    // Same check the checkout flag gets. Inline publishing needs the token the
+    // controller already holds; it must not introduce a config key that could
+    // carry one, because no secret may enter config from a file.
+    const cfg = buildReviewConfig(review({ inline_comments: true }), env())
+    const serialized = JSON.stringify(cfg)
+    expect(serialized).not.toContain('glpat')
+    expect(serialized.toLowerCase()).not.toContain('token')
+  })
+})
+
+describe('buildReviewConfig — diff_endpoint', () => {
+  it('defaults to auto, which probes /diffs once per process', () => {
+    expect(buildReviewConfig(review(), env()).diffEndpoint).toBe('auto')
+  })
+
+  it('can be pinned to changes, for an instance whose /diffs is permanently broken', () => {
+    // GitLab 17.5.1 answers 500 on /diffs for some merge requests. `auto`
+    // handles it correctly but spends one failed request per process and logs
+    // a warning on every restart that reads like a fault. Pinning removes both.
+    expect(buildReviewConfig(review({ diff_endpoint: 'changes' }), env()).diffEndpoint).toBe('changes')
+  })
+
+  it('rejects a value that is not one of the three', () => {
+    expect(() => buildReviewConfig(review({ diff_endpoint: 'nonsense' }), env())).toThrow()
+  })
+})

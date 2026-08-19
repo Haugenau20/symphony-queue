@@ -12,12 +12,11 @@ import type { TrackerAdapter } from './tracker/base.js'
 import { parseCliArgs, guardrailsBanner, usageMessage } from './cli.js'
 import { loadWorkflow } from './workflow.js'
 import { buildReviewConfig, validateReviewConfig } from './config.js'
-import { GitLabMergeRequestClient } from './review/gitlab_mr.js'
 import { DirectoryReviewStore } from './review/store.js'
 import { ReviewWorker } from './review/worker.js'
 import { AgentFindingsCritic } from './review/critique.js'
 import { GitShallowCheckout } from './review/checkout.js'
-import { ReviewPublisher } from './review/publisher.js'
+import { buildReviewMergeRequestClient, buildReviewPublisher } from './review/pipeline.js'
 import { ReviewJobRunner } from './review/job_runner.js'
 import { ReviewController } from './review/controller.js'
 import { ConcurrencyGate } from './concurrency.js'
@@ -68,6 +67,8 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
       excludeGenerated: config.excludeGenerated,
       critique: config.critique,
       checkout: config.checkout,
+      inlineComments: config.inlineComments,
+      diffEndpoint: config.diffEndpoint,
       maxChunkBytes: config.maxChunkBytes,
       maxChunks: config.maxChunks,
       maxContextBytes: config.maxContextBytes,
@@ -75,12 +76,7 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     'review_config_loaded',
   )
 
-  const client = new GitLabMergeRequestClient({
-    baseUrl: config.baseUrl,
-    // From the environment, never the file — there is no config key that could hold it.
-    token: process.env.SYMPHONY_REVIEW_GITLAB_TOKEN!,
-    ...(config.groupId ? { group: config.groupId } : { projects: config.projects }),
-  })
+  const client = buildReviewMergeRequestClient(config, process.env.SYMPHONY_REVIEW_GITLAB_TOKEN!)
 
   const store = new DirectoryReviewStore({
     root: config.storeRoot,
@@ -145,7 +141,7 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     ...(wf.promptTemplate.trim() ? { promptOverride: wf.promptTemplate } : {}),
   })
 
-  const publisher = new ReviewPublisher({ mrClient: client })
+  const publisher = buildReviewPublisher(client, config)
 
   const jobRunner = new ReviewJobRunner({
     worker,
