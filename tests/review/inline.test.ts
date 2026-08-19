@@ -215,17 +215,22 @@ describe('placeFinding — refusals', () => {
     expect(result).toEqual({ kind: 'unplaceable', reason: 'ambiguous_file' })
   })
 
-  it('places an "added" claim on a line that is actually context, with the CONTEXT position', () => {
-    // New line 13 ("unchanged two") is a context line. The claim is wrong; the
-    // line is not. Both labels name the new file, so the diff decides, and a
-    // context line requires BOTH line numbers — emitting the added-line shape
-    // here (newLine only) would be a malformed position, not a lenient one.
+  it('REFUSES an "added" claim on a line that is actually context — the number is not corroborated', () => {
+    // New line 13 ("unchanged two") is a context line. "Added" is a specific
+    // claim -- this line is part of the diff's additions -- and the diff says
+    // it is not, so the model is wrong about something. The likeliest thing is
+    // the line NUMBER.
+    //
+    // This is not hypothetical. Accepting this placed a comment describing
+    // JSONLinesDataSource onto an untouched line inside CSVDataSource on a
+    // real merge request: the model cited a line number belonging to different
+    // code, and the type mismatch was the only thing that knew. The lineType
+    // match corroborates the number; that is a second job it does beyond
+    // choosing a position shape, and it is why the leniency in the mirror test
+    // below runs in ONE direction only.
     const finding = makeFinding({ line: 13, lineType: 'added' })
     const result = placeFinding(finding, [makeFile()], makeJob())
-    expect(result.kind).toBe('placed')
-    if (result.kind !== 'placed') throw new Error('unreachable')
-    expect(result.position.newLine).toBe(13)
-    expect(result.position.oldLine).not.toBeNull()
+    expect(result).toEqual({ kind: 'unplaceable', reason: 'outside_hunk' })
   })
 
   it('places a "context" claim on a genuinely added line, with the ADDED position (the mirror case)', () => {
