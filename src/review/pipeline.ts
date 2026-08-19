@@ -16,6 +16,7 @@
  */
 
 import { ReviewPublisher } from './publisher.js'
+import { GitLabMergeRequestClient } from './gitlab_mr.js'
 import type { ReviewConfig } from '../config.js'
 
 /**
@@ -43,4 +44,30 @@ export function buildReviewPublisher(
   config: Pick<ReviewConfig, 'inlineComments'>,
 ): ReviewPublisher {
   return new ReviewPublisher({ mrClient: client, inlineComments: config.inlineComments })
+}
+
+/**
+ * The GitLab client, built from config.
+ *
+ * Extracted for the same reason as the publisher above: `main.ts` is not
+ * importable from a test without booting the CLI, so every setting it forwards
+ * to this constructor is a line no behavioural test can reach. `diffEndpoint`
+ * proved that immediately — deleting it from the call left the whole suite
+ * green and the setting inert, and a source-text assertion did not catch it
+ * either, because the same words appear in a nearby log line at a different
+ * indentation. A factory is testable; a grep is a guess.
+ *
+ * The token is a parameter and never read from config: no code path may pull a
+ * secret out of a config file.
+ */
+export function buildReviewMergeRequestClient(
+  config: Pick<ReviewConfig, 'baseUrl' | 'groupId' | 'projects' | 'diffEndpoint'>,
+  token: string,
+): GitLabMergeRequestClient {
+  return new GitLabMergeRequestClient({
+    baseUrl: config.baseUrl,
+    token,
+    ...(config.groupId ? { group: config.groupId } : { projects: config.projects }),
+    diffEndpoint: config.diffEndpoint,
+  })
 }

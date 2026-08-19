@@ -356,6 +356,20 @@ const ReviewRawSchema = z.object({
    * first move if a comment ever lands on a wrong line.
    */
   inline_comments: z.boolean().default(true),
+  /**
+   * Which endpoint supplies a merge request's changed files.
+   *
+   * `auto` (the default) tries `/diffs` and falls back to `/changes` for the
+   * life of the process if the instance answers 404 or 5xx. That costs exactly
+   * one failed request per process — but on an instance where `/diffs` is
+   * permanently broken (GitLab 17.5.1 answers 500 for some merge requests) it
+   * also logs a WARNING on every restart that reads like a fault and is not
+   * one. Setting `changes` skips the probe entirely.
+   *
+   * `diffs` forces the modern endpoint and surfaces its failure instead of
+   * falling back — useful for finding out whether an instance has been fixed.
+   */
+  diff_endpoint: z.enum(['auto', 'diffs', 'changes']).default('auto'),
   per_project_max_in_flight: z.number().int().positive().default(1),
   /**
    * Leave the sandbox on disk when a review does not produce findings, so it can
@@ -428,6 +442,7 @@ export interface ReviewConfig {
   critiqueTimeoutMs: number
   checkout: boolean
   inlineComments: boolean
+  diffEndpoint: 'auto' | 'diffs' | 'changes'
   perProjectMaxInFlight: number
   keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
@@ -468,6 +483,7 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     critiqueTimeoutMs: rRaw.critique_timeout_ms,
     checkout: rRaw.checkout,
     inlineComments: rRaw.inline_comments,
+    diffEndpoint: rRaw.diff_endpoint,
     perProjectMaxInFlight: rRaw.per_project_max_in_flight,
     // The environment wins, so this can be turned on for one restart without
     // editing (and later forgetting to un-edit) a config file.

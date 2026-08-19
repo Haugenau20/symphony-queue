@@ -291,3 +291,20 @@ describe('buildReviewConfig — phase 3, inline discussions', () => {
     expect(serialized.toLowerCase()).not.toContain('token')
   })
 })
+
+describe('buildReviewConfig — diff_endpoint', () => {
+  it('defaults to auto, which probes /diffs once per process', () => {
+    expect(buildReviewConfig(review(), env()).diffEndpoint).toBe('auto')
+  })
+
+  it('can be pinned to changes, for an instance whose /diffs is permanently broken', () => {
+    // GitLab 17.5.1 answers 500 on /diffs for some merge requests. `auto`
+    // handles it correctly but spends one failed request per process and logs
+    // a warning on every restart that reads like a fault. Pinning removes both.
+    expect(buildReviewConfig(review({ diff_endpoint: 'changes' }), env()).diffEndpoint).toBe('changes')
+  })
+
+  it('rejects a value that is not one of the three', () => {
+    expect(() => buildReviewConfig(review({ diff_endpoint: 'nonsense' }), env())).toThrow()
+  })
+})
