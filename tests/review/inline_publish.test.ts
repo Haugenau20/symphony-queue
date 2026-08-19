@@ -391,8 +391,39 @@ describe('inline comments ON — placement', () => {
     })
     const p = asPublished(result)
     expect(client.calls.createNote).toHaveLength(1)
-    expect(p.body).toContain('No findings.')
+    // NOT "No findings." — that is the whole point. A note saying "No findings."
+    // directly above "1 finding was posted as inline comment on this revision"
+    // reads, at a glance, as "the reviewer found nothing", which is the one
+    // meaning silence must never be able to carry here. A real review published
+    // exactly that: "No findings." over "4 findings were posted as inline
+    // comments".
+    expect(p.body).not.toContain('No findings.')
+    expect(p.body).toContain('Every finding was placed on its own line')
     expect(p.body).toContain('posted as inline comment')
+  })
+
+  it('says "No findings." only when there genuinely were none', async () => {
+    const client = fakeInlineClient()
+    const result = await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 'nothing to report', findings: [] },
+      diffFiles,
+    })
+    const p = asPublished(result)
+    expect(p.body).toContain('No findings.')
+    expect(p.body).not.toContain('Every finding was placed')
+  })
+
+  it('an unplaceable finding is listed, so the note is not falsely empty', async () => {
+    const client = fakeInlineClient()
+    const result = await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [unplaceableFinding()] },
+      diffFiles,
+    })
+    const p = asPublished(result)
+    expect(p.body).not.toContain('No findings.')
+    expect(p.body).not.toContain('Every finding was placed')
   })
 })
 
@@ -671,5 +702,53 @@ describe('inline comments ON — nothing sensitive ever reaches a log line', () 
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('inline comments ON — supersession is logged, after it has actually happened', () => {
+  it('logs review_inline_superseded with the counts, and resolvePermitted false on a 403', async () => {
+    // The counts live in step 7, which runs AFTER review_published is logged —
+    // so logging them there reported nothing while looking like it reported
+    // something. A real run superseded four threads and the only evidence in
+    // the log was four WARN lines about refused resolves; had the resolves
+    // SUCCEEDED there would have been no evidence at all.
+    const info = vi.spyOn(getLogger(), 'info')
+    const fp = threadFingerprint(placeableFinding(), 0)
+    const client = fakeInlineClient({
+      discussions: [{
+        id: 'disc-old',
+        resolvable: true,
+        resolved: false,
+        notes: [{ id: 'n1', body: `${inlineThreadMarker('older-sha', fp)}\n\nold`, authorId: 'self' }],
+      }],
+      // A Reporter token cannot resolve a discussion it authored on our
+      // instance: GitLab answers 403, which the client reports as false.
+      resolveResult: () => false,
+    })
+
+    await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [placeableFinding()] },
+      diffFiles,
+    })
+
+    const call = info.mock.calls.find((c) => c[1] === 'review_inline_superseded')
+    expect(call).toBeDefined()
+    expect(call![0]).toMatchObject({ superseded: 1, resolved: 0, resolvePermitted: false })
+    info.mockRestore()
+  })
+
+  it('stays quiet on an ordinary first review, where nothing was superseded', async () => {
+    const info = vi.spyOn(getLogger(), 'info')
+    const client = fakeInlineClient()
+
+    await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [placeableFinding()] },
+      diffFiles,
+    })
+
+    expect(info.mock.calls.find((c) => c[1] === 'review_inline_superseded')).toBeUndefined()
+    info.mockRestore()
   })
 })

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { readFile } from 'node:fs/promises'
-import { buildReviewPublisher } from '../../src/review/pipeline.js'
+import { buildReviewMergeRequestClient, buildReviewPublisher } from '../../src/review/pipeline.js'
 import type { DiscussionPosition, FindingsDocument, MergeRequestClient, MergeRequestDiffFile, MergeRequestDiscussionClient, ReviewJob } from '../../src/review/types.js'
 
 /**
@@ -97,5 +97,44 @@ describe('deployment wiring — main.ts actually calls the factory', () => {
     expect(source).toContain('buildReviewPublisher(client, config)')
     // And it must not go around the factory.
     expect(source).not.toContain('new ReviewPublisher(')
+    expect(source).toContain('buildReviewMergeRequestClient(config,')
+    expect(source).not.toContain('new GitLabMergeRequestClient(')
+  })
+})
+
+describe('deployment wiring — diff_endpoint reaches the client', () => {
+  function capturingFetch() {
+    const urls: string[] = []
+    const fake = async (url: string) => {
+      urls.push(String(url))
+      return { ok: true, status: 200, json: async () => [], text: async () => '[]' }
+    }
+    return { urls, fake: fake as never }
+  }
+
+  it('changes: never probes /diffs at all', async () => {
+    const { urls, fake } = capturingFetch()
+    const client = buildReviewMergeRequestClient(
+      { baseUrl: 'https://gl.example', groupId: null, projects: ['g/p'], diffEndpoint: 'changes' },
+      'glpat-x',
+    )
+    // Swap in the capturing fetch the same way the client's own tests do.
+    ;(client as unknown as { fetchImpl: unknown }).fetchImpl = fake
+    await client.listDiffs('g/p', 1)
+
+    expect(urls.some((u) => u.includes('/diffs'))).toBe(false)
+    expect(urls.some((u) => u.includes('/changes'))).toBe(true)
+  })
+
+  it('auto: does probe /diffs — proving the setting is what changed the behaviour', async () => {
+    const { urls, fake } = capturingFetch()
+    const client = buildReviewMergeRequestClient(
+      { baseUrl: 'https://gl.example', groupId: null, projects: ['g/p'], diffEndpoint: 'auto' },
+      'glpat-x',
+    )
+    ;(client as unknown as { fetchImpl: unknown }).fetchImpl = fake
+    await client.listDiffs('g/p', 1)
+
+    expect(urls.some((u) => u.includes('/diffs'))).toBe(true)
   })
 })
