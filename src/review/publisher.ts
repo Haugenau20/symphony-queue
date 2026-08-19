@@ -77,14 +77,13 @@ import type {
  * these; `ReviewMaterialClient` (worker.ts) stays exactly as narrow as it
  * always was.
  *
- * The four discussion methods are `Partial` here rather than mandatory: a
- * caller wiring a `ReviewPublisher` with `inlineComments` left off (or a test
- * fixture standing in for GitLab's read/write-note surface only) should not
- * have to invent no-op discussion methods it will never be asked to run.
- * `inlineComments: true` is where the real requirement is enforced — the
- * constructor below checks all four are actually present and throws a clear,
- * immediate error otherwise, rather than let a missing method surface as an
- * opaque `undefined is not a function` the first time step 5 runs.
+ * All four are MANDATORY, not `Partial`. They were briefly optional plus a
+ * constructor-time runtime check, so that two test fixtures typed as a bare
+ * `MergeRequestClient` would keep compiling — which traded a compile-time
+ * guarantee for a thrown string in order to spare two fixtures. The fixtures
+ * grew the methods instead. The `Pick` discipline is the reason this boundary
+ * holds by compilation rather than convention; weakening it to accommodate a
+ * test is backwards.
  */
 export type ReviewPublishClient = Pick<
   MergeRequestClient,
@@ -316,7 +315,13 @@ const SEVERITY_SECTIONS: Array<{ severity: Finding['severity']; label: string }>
  * merge-request-authored, so it is written through as-is rather than run
  * through the escaping helpers below.
  */
-export function renderReviewNote(findings: FindingsDocument, headSha: string, extraLine?: string): string {
+export function renderReviewNote(
+  findings: FindingsDocument,
+  headSha: string,
+  extraLine?: string,
+  /** What an EMPTY findings list means here. Defaults to "No findings." */
+  emptyMeans?: string,
+): string {
   const bySeverity = new Map<Finding['severity'], Finding[]>()
   for (const { severity } of SEVERITY_SECTIONS) bySeverity.set(severity, [])
   for (const finding of findings.findings) {
@@ -336,7 +341,14 @@ export function renderReviewNote(findings: FindingsDocument, headSha: string, ex
   }
 
   if (findings.findings.length === 0) {
-    lines.push('No findings.')
+    // `emptyMeans` distinguishes the two very different reasons this list can
+    // be empty, and getting it wrong undermines the oldest property in this
+    // design. With inline comments on, the note lists only what FELL BACK — so
+    // a review that placed all four of its findings inline printed "No
+    // findings." directly above "4 findings were posted as inline comments on
+    // this revision." Read quickly, that says the reviewer found nothing, which
+    // is the one thing silence must never be able to mean here.
+    lines.push(emptyMeans ?? 'No findings.')
   } else {
     for (const { severity, label } of SEVERITY_SECTIONS) {
       const items = bySeverity.get(severity)!
@@ -701,7 +713,13 @@ export class ReviewPublisher {
       ? { summary: sanitized.summary, findings: fallback }
       : sanitized
     const extraLine = this.inlineComments ? renderInlineSummaryLine(inline) : undefined
-    const noteBody = renderReviewNote(notedFindings, headSha, extraLine)
+    // An empty note list means "nothing fell back" when findings exist and went
+    // inline, and "nothing was found" only when there were no findings at all.
+    const placedSomething = inline.placed + inline.alreadyPresent > 0
+    const emptyMeans = this.inlineComments && placedSomething
+      ? 'Every finding was placed on its own line — see the **Changes** tab.'
+      : undefined
+    const noteBody = renderReviewNote(notedFindings, headSha, extraLine, emptyMeans)
     const body = request.provenance ? `${noteBody}\n${renderProvenanceFooter(request.provenance)}\n` : noteBody
     const noteId = await this.mrClient.createNote(projectId, mrIid, body)
     log.info(

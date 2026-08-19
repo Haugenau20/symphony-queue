@@ -391,8 +391,39 @@ describe('inline comments ON — placement', () => {
     })
     const p = asPublished(result)
     expect(client.calls.createNote).toHaveLength(1)
-    expect(p.body).toContain('No findings.')
+    // NOT "No findings." — that is the whole point. A note saying "No findings."
+    // directly above "1 finding was posted as inline comment on this revision"
+    // reads, at a glance, as "the reviewer found nothing", which is the one
+    // meaning silence must never be able to carry here. A real review published
+    // exactly that: "No findings." over "4 findings were posted as inline
+    // comments".
+    expect(p.body).not.toContain('No findings.')
+    expect(p.body).toContain('Every finding was placed on its own line')
     expect(p.body).toContain('posted as inline comment')
+  })
+
+  it('says "No findings." only when there genuinely were none', async () => {
+    const client = fakeInlineClient()
+    const result = await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 'nothing to report', findings: [] },
+      diffFiles,
+    })
+    const p = asPublished(result)
+    expect(p.body).toContain('No findings.')
+    expect(p.body).not.toContain('Every finding was placed')
+  })
+
+  it('an unplaceable finding is listed, so the note is not falsely empty', async () => {
+    const client = fakeInlineClient()
+    const result = await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [unplaceableFinding()] },
+      diffFiles,
+    })
+    const p = asPublished(result)
+    expect(p.body).not.toContain('No findings.')
+    expect(p.body).not.toContain('Every finding was placed')
   })
 })
 
