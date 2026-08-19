@@ -395,6 +395,32 @@ Left exactly as it is, deliberately. Pushing the model toward removed-line repor
 a marginally better anchor and spend it on the only path that can produce a wrong-side
 comment. An unexercised safety net is a good outcome here, not a gap.
 
+### A Reporter token cannot resolve a discussion it authored — confirmed, 403
+
+Left open by the design and by the phase 3 handoff, which flagged it as worth deciding early.
+It was not designed around in either direction: `resolveDiscussion` returns `boolean` and turns
+403/404/405 into `false` rather than an exception, the supersede reply is posted FIRST and
+unconditionally, and resolution is treated as a bonus. So the answer stayed out of the
+architecture.
+
+Production answered it. On a re-review, all four prior threads were replied to and all four
+resolves came back **403**. The reply-only fallback is therefore the normal path here, not a
+degraded one: prior-revision threads carry a "superseded by `<sha>`" reply and stay **open**.
+
+Nothing needs changing, and widening the review token to buy thread resolution would trade the
+boundary the whole deployment rests on for tidier threads. `review_inline_superseded` reports
+`resolvePermitted`, so if a future GitLab version or role changes this, the log says so without
+anyone having to go looking.
+
+**A consequence worth knowing before it surprises someone:** re-review is whole-diff, not
+incremental. A new head SHA re-reviews the merge request against its base, so a finding about
+untouched code is re-raised as a NEW thread on the new revision while the old one is superseded.
+A trivial push therefore produces a fresh thread per surviving finding. That is correct — the
+merge request is what gets merged, not the last push — but thread count grows with pushes, and
+if that becomes the dominant noise complaint the change to consider is replying "still present
+at `<sha>`" to the existing thread instead of opening a new one. Not done here: an old thread's
+line may not exist at the new revision, and re-anchoring it is the guessing this phase forbids.
+
 ### Unplaceable is ordinary, and the note must never imply approval
 
 Every `InlineSkipReason` is a normal answer. A review that places half its findings and lists

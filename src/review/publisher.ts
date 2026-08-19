@@ -778,6 +778,31 @@ export class ReviewPublisher {
       }
     }
 
+    // Step 7's own outcome, logged HERE and not with `review_published` above —
+    // that line is emitted before this block runs, so `superseded` and
+    // `resolved` are necessarily still zero there. Logging them at that point
+    // reported nothing and looked like it reported something.
+    //
+    // Only when supersession actually did something, so an ordinary first
+    // review stays quiet. `resolved` is the interesting number: it answers,
+    // from production rather than from documentation, whether this token may
+    // resolve a discussion it authored. On our instance it may not — GitLab
+    // returns 403 to a Reporter — so the reply stands alone and the thread
+    // stays open, which is the designed fallback and not a failure.
+    if (inline.superseded > 0) {
+      log.info(
+        {
+          projectId,
+          mrIid,
+          headSha,
+          superseded: inline.superseded,
+          resolved: inline.resolved,
+          resolvePermitted: inline.resolved > 0,
+        },
+        'review_inline_superseded',
+      )
+    }
+
     return { status: 'published', noteId, body, inline }
   }
 }

@@ -704,3 +704,51 @@ describe('inline comments ON — nothing sensitive ever reaches a log line', () 
     }
   })
 })
+
+describe('inline comments ON — supersession is logged, after it has actually happened', () => {
+  it('logs review_inline_superseded with the counts, and resolvePermitted false on a 403', async () => {
+    // The counts live in step 7, which runs AFTER review_published is logged —
+    // so logging them there reported nothing while looking like it reported
+    // something. A real run superseded four threads and the only evidence in
+    // the log was four WARN lines about refused resolves; had the resolves
+    // SUCCEEDED there would have been no evidence at all.
+    const info = vi.spyOn(getLogger(), 'info')
+    const fp = threadFingerprint(placeableFinding(), 0)
+    const client = fakeInlineClient({
+      discussions: [{
+        id: 'disc-old',
+        resolvable: true,
+        resolved: false,
+        notes: [{ id: 'n1', body: `${inlineThreadMarker('older-sha', fp)}\n\nold`, authorId: 'self' }],
+      }],
+      // A Reporter token cannot resolve a discussion it authored on our
+      // instance: GitLab answers 403, which the client reports as false.
+      resolveResult: () => false,
+    })
+
+    await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [placeableFinding()] },
+      diffFiles,
+    })
+
+    const call = info.mock.calls.find((c) => c[1] === 'review_inline_superseded')
+    expect(call).toBeDefined()
+    expect(call![0]).toMatchObject({ superseded: 1, resolved: 0, resolvePermitted: false })
+    info.mockRestore()
+  })
+
+  it('stays quiet on an ordinary first review, where nothing was superseded', async () => {
+    const info = vi.spyOn(getLogger(), 'info')
+    const client = fakeInlineClient()
+
+    await publisher(client, true).publish({
+      job: job(),
+      findings: { summary: 's', findings: [placeableFinding()] },
+      diffFiles,
+    })
+
+    expect(info.mock.calls.find((c) => c[1] === 'review_inline_superseded')).toBeUndefined()
+    info.mockRestore()
+  })
+})
