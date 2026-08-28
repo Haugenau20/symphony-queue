@@ -170,20 +170,20 @@ starts what the image store already has, and it will never build this for you.
 This repository is the other half of that interface:
 
 ```bash
-npm run image:build            # opencode-workplace-symphony:local
+npm run image:build            # opencode-symphony:local
 ```
 
 or, for a real registry:
 
 ```bash
-IMAGE_REGISTRY=registry.example.com/team/opencode-workplace \
+IMAGE_REGISTRY=registry.example.com/team/opencode \
 IMAGE_TAG=2026-08-11 \
   ./scripts/build-image.sh --push
 ```
 
 The name matters. Both `docker-compose.symphony.yml` and
 `docker-compose.review.yml` resolve
-`${IMAGE_REGISTRY:-opencode-workplace}-symphony:${IMAGE_TAG:-local}`, so use
+`${IMAGE_REGISTRY:-opencode}-symphony:${IMAGE_TAG:-local}`, so use
 the same two values here as in the launcher's `.env` or `symphony up` will
 look for an image this build did not produce.
 

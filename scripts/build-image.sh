@@ -2,14 +2,14 @@
 #
 # Build the orchestrator image under the exact name Symphony-Launcher resolves.
 #
-#   ./scripts/build-image.sh                 # opencode-workplace-symphony:local
-#   IMAGE_TAG=v3 ./scripts/build-image.sh    # opencode-workplace-symphony:v3
-#   IMAGE_REGISTRY=registry.example.com/team/opencode-workplace \
+#   ./scripts/build-image.sh                 # opencode-symphony:local
+#   IMAGE_TAG=v3 ./scripts/build-image.sh    # opencode-symphony:v3
+#   IMAGE_REGISTRY=registry.example.com/team/opencode \
 #     IMAGE_TAG=2026-08-11 ./scripts/build-image.sh --push
 #
 # The name is not cosmetic: both docker-compose.symphony.yml and
 # docker-compose.review.yml reference
-# `${IMAGE_REGISTRY:-opencode-workplace}-symphony:${IMAGE_TAG:-local}`, and the
+# `${IMAGE_REGISTRY:-opencode}-symphony:${IMAGE_TAG:-local}`, and the
 # launcher is pull-only — it will never build this for you, so a mismatched tag
 # surfaces as "image not found" at `symphony up`, not at build time.
 #
@@ -20,7 +20,7 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
 
-IMAGE_REGISTRY="${IMAGE_REGISTRY:-opencode-workplace}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-opencode}"
 IMAGE_TAG="${IMAGE_TAG:-local}"
 IMAGE="${IMAGE_REGISTRY}-symphony:${IMAGE_TAG}"
 
@@ -45,7 +45,7 @@ if [ "$PUSH" -eq 1 ]; then
   case "$IMAGE_REGISTRY" in
     */*) ;;
     *)
-      echo "error: --push needs a registry-qualified IMAGE_REGISTRY (e.g. registry.example.com/team/opencode-workplace)." >&2
+      echo "error: --push needs a registry-qualified IMAGE_REGISTRY (e.g. registry.example.com/team/opencode)." >&2
       echo "       '${IMAGE_REGISTRY}' is a bare local name and cannot be pushed." >&2
       exit 1
       ;;
