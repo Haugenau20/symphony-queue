@@ -395,31 +395,33 @@ Left exactly as it is, deliberately. Pushing the model toward removed-line repor
 a marginally better anchor and spend it on the only path that can produce a wrong-side
 comment. An unexercised safety net is a good outcome here, not a gap.
 
-### A Reporter token cannot resolve a discussion it authored — confirmed, 403
+### Prior-revision cleanup never adds a user-visible reply
 
-Left open by the design and by the phase 3 handoff, which flagged it as worth deciding early.
-It was not designed around in either direction: `resolveDiscussion` returns `boolean` and turns
-403/404/405 into `false` rather than an exception, the supersede reply is posted FIRST and
-unconditionally, and resolution is treated as a bonus. So the answer stayed out of the
-architecture.
+`resolveDiscussion` returns `boolean` and turns 403/404/405 into `false` rather than an
+exception. Production confirmed that a Reporter token cannot resolve a discussion it authored
+on the current instance: GitLab returned **403** for every prior thread in the observed
+re-review. Widening the review token merely to tidy old threads would weaken the credential
+boundary the deployment rests on.
 
-Production answered it. On a re-review, all four prior threads were replied to and all four
-resolves came back **403**. The reply-only fallback is therefore the normal path here, not a
-degraded one: prior-revision threads carry a "superseded by `<sha>`" reply and stay **open**.
+After the new review has published safely, cleanup therefore attempts to resolve each older
+Symphony-owned thread directly. When GitLab refuses, the older thread is left untouched. There
+is deliberately no fallback reply: cleanup must not add "superseded" comments or any other
+user-visible noise. A thrown transport or 5xx failure is logged and swallowed for the same
+reason that cleanup runs after publication — tidying an old thread must never turn a successful
+new review into a failed job.
 
-Nothing needs changing, and widening the review token to buy thread resolution would trade the
-boundary the whole deployment rests on for tidier threads. `review_inline_superseded` reports
-`resolvePermitted`, so if a future GitLab version or role changes this, the log says so without
-anyone having to go looking.
+`review_inline_prior_revision_cleanup` reports `priorRevisionThreads`,
+`priorRevisionThreadsResolved`, and `resolvePermitted`, so a future GitLab version or role
+change remains observable without publishing extra discussion notes.
 
 **A consequence worth knowing before it surprises someone:** re-review is whole-diff, not
 incremental. A new head SHA re-reviews the merge request against its base, so a finding about
-untouched code is re-raised as a NEW thread on the new revision while the old one is superseded.
+untouched code is re-raised as a NEW thread on the new revision while the old one is left
+untouched when the token cannot resolve it.
 A trivial push therefore produces a fresh thread per surviving finding. That is correct — the
 merge request is what gets merged, not the last push — but thread count grows with pushes, and
-if that becomes the dominant noise complaint the change to consider is replying "still present
-at `<sha>`" to the existing thread instead of opening a new one. Not done here: an old thread's
-line may not exist at the new revision, and re-anchoring it is the guessing this phase forbids.
+an old thread's line may not exist at the new revision. Reusing or re-anchoring it would be the
+guessing this phase forbids.
 
 ### Unplaceable is ordinary, and the note must never imply approval
 
@@ -453,3 +455,53 @@ deployment path can be tested behaviourally instead of grepped for.
 
 **Standing practice, extending §8: after the suite is green, break the wires, not just the
 logic.** Delete an argument at a call site and see whether anything fails.
+
+## 12. Review lifecycle and parallel reviewer fan-out
+
+### Starting is a published lifecycle event
+
+After a job is claimed and recorded as `running`, the publisher checks that the merge request
+still points at the job's head SHA and posts a top-level `Symphony review started.` note. Its
+hidden `symphony-review-started:<sha>` marker is separate from the final review marker, so a
+retry can find its own start note without mistaking it for a completed review. The marker is
+matched against the authenticated GitLab user when that identity is available.
+
+This announcement is a prerequisite for agent work. A stale head becomes `superseded`; a note
+transport failure becomes an ordinary retryable job failure. If GitLab accepted a note but the
+response was lost, the retry sees the marker and continues without posting a second start note.
+`publishedNoteId` remains reserved for the final review note.
+
+### Reviewers are configuration, not branches in the worker
+
+`review.reviewers` is an ordered list of named prompt specializations. Exactly one entry must
+set `primary: true`; it cannot set `max_chunks`, because every accepted review needs one broad,
+unconditional pass. A supplemental entry may set `max_chunks` and is skipped when the material
+plan contains more batches than that ceiling. Omitting the list synthesizes one `default`
+primary with no extra instructions, preserving the old one-reviewer behavior.
+
+Each eligible `(reviewer, chunk)` pair is an independent session. The base material is prepared
+once, then copied into a fresh sibling workspace for each session. Copies share no inodes and
+reject symbolic links or special files, so one reviewer cannot change another reviewer's input
+or contaminate the critic. The critic receives another clean copy made from the base, never a
+reviewer's workspace. Because checkout context is optional, a repository containing a tracked
+symbolic link declines that wider context and continues with diff/file material instead of
+allowing the link into a session or failing the review during fan-out.
+
+### One global pool bounds and fairly schedules agent work
+
+`review.max_parallel_review_agents` limits all reviewer and critic sessions in the process,
+across all active merge requests. It defaults to `max_concurrent_reviews`, so existing config
+does not silently increase concurrency. Work stays FIFO within one review and rotates among
+review keys when several have queued work; one large fan-out therefore cannot monopolize every
+newly freed slot. A running task continues to occupy its slot until it actually settles, even
+after cancellation, because releasing it sooner would make the reported ceiling untrue for an
+agent operation that is slow to observe its abort signal.
+
+Session results are merged in configured-reviewer order and then chunk order, regardless of
+completion timing. Fully identical findings are removed mechanically; the existing independent
+critic then validates candidates and removes semantic near-duplicates. A failed reviewer
+session does not erase successful peers. Publication records eligible and skipped reviewers,
+successful and failed session counts, exact duplicates removed, and any batch with no successful
+coverage. If every reviewer session fails, the job fails and follows the normal retry policy.
+Failed-session provenance names the reviewer and one-based batch in the final note; failure
+reasons stay in logs so internal agent/runtime errors are not published to merge requests.

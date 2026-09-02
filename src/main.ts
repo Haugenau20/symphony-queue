@@ -16,7 +16,11 @@ import { DirectoryReviewStore } from './review/store.js'
 import { ReviewWorker } from './review/worker.js'
 import { AgentFindingsCritic } from './review/critique.js'
 import { GitShallowCheckout } from './review/checkout.js'
-import { buildReviewMergeRequestClient, buildReviewPublisher } from './review/pipeline.js'
+import {
+  buildReviewMergeRequestClient,
+  buildReviewPublisher,
+  buildReviewSessionPool,
+} from './review/pipeline.js'
 import { ReviewJobRunner } from './review/job_runner.js'
 import { ReviewController } from './review/controller.js'
 import { ConcurrencyGate } from './concurrency.js'
@@ -72,6 +76,8 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
       maxChunkBytes: config.maxChunkBytes,
       maxChunks: config.maxChunks,
       maxContextBytes: config.maxContextBytes,
+      maxParallelReviewAgents: config.maxParallelReviewAgents,
+      reviewerIds: config.reviewers.map((reviewer) => reviewer.id),
     },
     'review_config_loaded',
   )
@@ -96,13 +102,22 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     sessionTimeoutMs: config.agent.sessionTimeoutMs,
   })
 
+  // One process-wide pool accounts for every primary reviewer and critic
+  // session across every active MR. The controller's gate bounds MR jobs;
+  // this separate pool bounds the agent sessions those jobs fan out into.
+  const reviewSessionPool = buildReviewSessionPool(config)
+
   // The self-critique pass runs as its OWN agent session, deliberately: a model
   // asked to disown findings still sitting in its context window defends them,
   // while one meeting them cold can disagree. It shares the runner (same
   // OpenCode server, same permission set) and holds no GitLab client of any
   // kind — the type it takes makes reaching GitLab a compile error.
   const critic = config.critique
-    ? new AgentFindingsCritic({ agentRunner, timeoutMs: config.critiqueTimeoutMs })
+    ? new AgentFindingsCritic({
+        agentRunner,
+        timeoutMs: config.critiqueTimeoutMs,
+        sessionPool: reviewSessionPool,
+      })
     : null
 
   // Optional wider-context checkout. TRUSTED code does the clone, because it is
@@ -127,6 +142,8 @@ async function runReviewMode(args: ReturnType<typeof parseCliArgs>): Promise<voi
     maxChunkBytes: config.maxChunkBytes,
     maxChunks: config.maxChunks,
     maxContextBytes: config.maxContextBytes,
+    reviewers: config.reviewers,
+    sessionPool: reviewSessionPool,
     ...(critic ? { critic } : {}),
     ...(checkout ? { checkout, enableCheckout: true } : {}),
     keepFailedWorkspaces: config.keepFailedWorkspaces,

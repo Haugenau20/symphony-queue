@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { ReviewJobRunner } from '../../src/review/job_runner.js'
 import type { FindingsProducer, FindingsPublisher } from '../../src/review/job_runner.js'
-import type { DiscussionPosition, MergeRequestDiffFile, ReviewJob, ReviewJobKey, ReviewJobState, ReviewStore, FindingsDocument } from '../../src/review/types.js'
+import type { DiscussionPosition, MergeRequestDiffFile, ReviewJob, ReviewJobKey, ReviewJobState, ReviewStore, FindingsDocument, ReviewStartAnnouncementResult } from '../../src/review/types.js'
 import { UNCHUNKED_PROVENANCE } from '../../src/review/types.js'
 import type { ReviewWorkOutcome } from '../../src/review/worker.js'
 import type { PublishResult } from '../../src/review/publisher.js'
@@ -28,7 +28,7 @@ const findings: FindingsDocument = { summary: 's', findings: [] }
  */
 const INLINE_OFF = {
   attempted: false, placed: 0, alreadyPresent: 0, fellBack: 0,
-  fallbackReasons: {}, failed: 0, superseded: 0, resolved: 0,
+  fallbackReasons: {}, failed: 0, priorRevisionThreads: 0, priorRevisionThreadsResolved: 0,
 } as const
 
 // Full MergeRequestDiffFile objects, diff body included. `diffFiles` narrowed
@@ -73,6 +73,8 @@ function runner(opts: {
   outcome?: ReviewWorkOutcome | (() => Promise<ReviewWorkOutcome>)
   publish?: PublishResult
   publishFn?: FindingsPublisher['publish']
+  announce?: ReviewStartAnnouncementResult
+  announceFn?: FindingsPublisher['announceStarted']
   store?: ReturnType<typeof fakeStore>
   maxAttempts?: number
 }) {
@@ -84,10 +86,13 @@ function runner(opts: {
   const worker: FindingsProducer = { run }
   const publishFn: FindingsPublisher['publish'] = opts.publishFn
     ?? vi.fn(async (): Promise<PublishResult> => opts.publish ?? { status: 'published', noteId: 'n1', body: 'b', inline: INLINE_OFF })
-  const publisher: FindingsPublisher = { publish: publishFn }
+  const announceFn: FindingsPublisher['announceStarted'] = opts.announceFn
+    ?? vi.fn(async (): Promise<ReviewStartAnnouncementResult> => opts.announce ?? { kind: 'announced', noteId: 'start-1' })
+  const publisher: FindingsPublisher = { announceStarted: announceFn, publish: publishFn }
   return {
     s,
     publishFn,
+    announceFn,
     runner: new ReviewJobRunner({
       worker, publisher, store: s.store,
       maxAttempts: opts.maxAttempts ?? 3,
@@ -156,6 +161,83 @@ describe('ReviewJobRunner — outcome to job state', () => {
   })
 })
 
+describe('ReviewJobRunner — start announcement lifecycle', () => {
+  it('announces only after running is stored, and before invoking the worker', async () => {
+    const events: string[] = []
+    const s = fakeStore()
+    const originalUpdate = s.store.update
+    s.store.update = async (updated) => {
+      await originalUpdate(updated)
+      events.push(`state:${updated.state}`)
+    }
+    const r = new ReviewJobRunner({
+      publisher: {
+        announceStarted: async () => { events.push('announce'); return { kind: 'announced', noteId: 'start' } },
+        publish: async () => { events.push('publish'); return { status: 'published', noteId: 'final', body: 'b', inline: INLINE_OFF } },
+      },
+      worker: {
+        run: async () => { events.push('worker'); return { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } },
+      },
+      store: s.store,
+    })
+
+    await r.runJob(job(), new AbortController().signal)
+
+    expect(events).toEqual([
+      'state:running', 'announce', 'worker', 'state:publishing', 'publish', 'state:published',
+    ])
+    expect(s.final().publishedNoteId).toBe('final')
+  })
+
+  it('continues normally when a retry finds the start note already present', async () => {
+    const { s, runner: r } = runner({ announce: { kind: 'already_announced', noteId: 'start-existing' } })
+
+    await r.runJob(job(), new AbortController().signal)
+
+    expect(s.final().state).toBe('published')
+    expect(s.final().publishedNoteId).toBe('n1')
+  })
+
+  it('marks a stale head superseded without invoking the worker or final publisher', async () => {
+    const workerRun = vi.fn(async (): Promise<ReviewWorkOutcome> => ({ kind: 'failed', reason: 'must not run' }))
+    const publishFn: FindingsPublisher['publish'] = vi.fn(async (): Promise<PublishResult> => ({
+      status: 'published', noteId: 'must-not-publish', body: 'b', inline: INLINE_OFF,
+    }))
+    const s = fakeStore()
+    const r = new ReviewJobRunner({
+      worker: { run: workerRun },
+      publisher: {
+        announceStarted: async () => ({ kind: 'superseded', currentHeadSha: 'new-head' }),
+        publish: publishFn,
+      },
+      store: s.store,
+    })
+
+    await r.runJob(job(), new AbortController().signal)
+
+    expect(s.states()).toEqual(['running', 'superseded'])
+    expect(workerRun).not.toHaveBeenCalled()
+    expect(publishFn).not.toHaveBeenCalled()
+    expect(s.final().publishedNoteId).toBeNull()
+  })
+
+  it('records an announcement error as retryable and invokes no agent work', async () => {
+    const workerRun = vi.fn(async (): Promise<ReviewWorkOutcome> => ({ kind: 'failed', reason: 'must not run' }))
+    const { s, publishFn, runner: r } = runner({
+      announceFn: async () => { throw new Error('gitlab 503') },
+      outcome: workerRun,
+    })
+
+    await expect(r.runJob(job(), new AbortController().signal)).resolves.toBeUndefined()
+
+    expect(s.states()).toEqual(['running', 'failed'])
+    expect(s.final().attempts).toBe(1)
+    expect(s.final().nextRetryAt).toBeInstanceOf(Date)
+    expect(workerRun).not.toHaveBeenCalled()
+    expect(publishFn).not.toHaveBeenCalled()
+  })
+})
+
 describe('ReviewJobRunner — failure and retry', () => {
   it('worker failure increments attempts and sets a retry deadline', async () => {
     const { s, runner: r } = runner({ outcome: { kind: 'failed', reason: 'no FINDINGS.json' } })
@@ -217,7 +299,7 @@ describe('ReviewJobRunner — the credential boundary', () => {
     const s = fakeStore()
     const r = new ReviewJobRunner({
       worker: { run: async (_j, sig) => { seen = sig; return { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } } } },
-      publisher: { publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) },
+      publisher: { announceStarted: async () => ({ kind: 'announced', noteId: 'start' }), publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) },
       store: s.store,
     })
 
@@ -262,6 +344,7 @@ describe('ReviewJobRunner — the credential boundary', () => {
       return { status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }
     }
     const provenance = {
+      ...UNCHUNKED_PROVENANCE,
       chunkCount: 3,
       chunksFailed: 1,
       excluded: [{ path: 'dist/bundle.js', reason: 'exclude_path' as const }],
@@ -316,7 +399,7 @@ describe('ReviewJobRunner — an aborted run distinguishes supersession from sto
         throw new Error('The operation was aborted')
       },
     }
-    const publisher: FindingsPublisher = { publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) }
+    const publisher: FindingsPublisher = { announceStarted: async () => ({ kind: 'announced', noteId: 'start' }), publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) }
     const r = new ReviewJobRunner({ worker, publisher, store, now: () => new Date('2026-01-01T12:00:00Z') })
 
     await expect(r.runJob(job({ attempts: 0 }), ac.signal)).resolves.toBeUndefined()
@@ -350,6 +433,33 @@ describe('ReviewJobRunner — an aborted run distinguishes supersession from sto
     expect(s.final().nextRetryAt).toBeInstanceOf(Date)
   })
 
+  it('does not publish when a non-cooperative worker returns reviewed after stop() aborted it', async () => {
+    const ac = new AbortController()
+    const publishFn = vi.fn<FindingsPublisher['publish']>(async () => ({
+      status: 'published', noteId: 'must-not-publish', body: 'b', inline: INLINE_OFF,
+    }))
+    const s = fakeStore()
+    const r = new ReviewJobRunner({
+      worker: {
+        run: async () => {
+          ac.abort(new Error('shutdown'))
+          return { kind: 'reviewed', findings, diffFiles, provenance: { ...UNCHUNKED_PROVENANCE } }
+        },
+      },
+      publisher: {
+        announceStarted: async () => ({ kind: 'announced', noteId: 'start' }),
+        publish: publishFn,
+      },
+      store: s.store,
+    })
+
+    await r.runJob(job({ attempts: 0 }), ac.signal)
+
+    expect(publishFn).not.toHaveBeenCalled()
+    expect(s.final().state).toBe('failed')
+    expect(s.final().attempts).toBe(1)
+  })
+
   it('a re-read that throws (store error) falls back to normal failure handling rather than silently dropping the failure', async () => {
     const updates: ReviewJob[] = []
     const store: ReviewStore = {
@@ -364,7 +474,7 @@ describe('ReviewJobRunner — an aborted run distinguishes supersession from sto
       listForMergeRequest: async () => [],
     }
     const worker: FindingsProducer = { run: async () => { throw new Error('aborted') } }
-    const publisher: FindingsPublisher = { publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) }
+    const publisher: FindingsPublisher = { announceStarted: async () => ({ kind: 'announced', noteId: 'start' }), publish: async () => ({ status: 'published', noteId: 'n', body: 'b', inline: INLINE_OFF }) }
     const r = new ReviewJobRunner({ worker, publisher, store, now: () => new Date('2026-01-01T12:00:00Z') })
 
     await expect(r.runJob(job({ attempts: 0 }), new AbortController().signal)).resolves.toBeUndefined()
@@ -409,7 +519,6 @@ describe('ReviewJobRunner -> ReviewPublisher — inline placement survives the r
           created.push({ body, position })
           return `disc-${created.length}`
         },
-        replyToDiscussion: async () => 'reply-1',
         resolveDiscussion: async () => true,
       },
     }

@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest'
 import {
   ReviewPublisher,
   reviewNoteMarker,
+  reviewStartedNoteMarker,
+  renderReviewStartedNote,
   renderReviewNote,
   renderProvenanceFooter,
   sanitizeFindings,
@@ -168,9 +170,6 @@ function fakePublishClient(opts: {
     async createDiscussion(): Promise<never> {
       throw new Error('publisher must not create a discussion when inline comments are off')
     },
-    async replyToDiscussion(): Promise<never> {
-      throw new Error('publisher must not reply to a discussion when inline comments are off')
-    },
     async resolveDiscussion(): Promise<never> {
       throw new Error('publisher must not resolve a discussion when inline comments are off')
     },
@@ -203,6 +202,70 @@ describe('ReviewPublisher — happy path, 3 findings', () => {
     expect(result.body.indexOf('### Concern')).toBeLessThan(result.body.indexOf('### Minor'))
     expect(result.body).toContain('src/tracker/gitlab.ts:342')
     expect(result.body).toContain('Token may be logged on retry')
+  })
+})
+
+describe('ReviewPublisher — review-start announcement', () => {
+  it('posts one static per-head note before review work can begin', async () => {
+    const client = fakePublishClient()
+
+    const result = await publisher(client).announceStarted(job({ title: 'untrusted MR title' }))
+
+    expect(result).toEqual({ kind: 'announced', noteId: 'note-1' })
+    expect(client.calls.createNote).toEqual([{
+      projectId: 'my-org/service-a',
+      mrIid: 412,
+      body: renderReviewStartedNote('deadbeef00cafe11'),
+    }])
+    expect(client.calls.createNote[0]!.body).toContain('Symphony review started.')
+    expect(client.calls.createNote[0]!.body).toContain(reviewStartedNoteMarker('deadbeef00cafe11'))
+    expect(client.calls.createNote[0]!.body).not.toContain('untrusted MR title')
+  })
+
+  it('is idempotent across retries for the same head', async () => {
+    const client = fakePublishClient()
+    const p = publisher(client)
+
+    expect((await p.announceStarted(job())).kind).toBe('announced')
+    expect(await p.announceStarted(job())).toEqual({ kind: 'already_announced', noteId: 'note-1' })
+    expect(client.calls.createNote).toHaveLength(1)
+  })
+
+  it('does not let a foreign author spoof the start marker', async () => {
+    const marker = reviewStartedNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      notes: [{ id: 'impostor', body: marker, authorId: 'someone-else' }],
+    })
+
+    const result = await publisher(client).announceStarted(job())
+
+    expect(result).toEqual({ kind: 'announced', noteId: 'note-1' })
+    expect(client.calls.createNote).toHaveLength(1)
+  })
+
+  it('degrades to marker-only deduplication when the current user id is unavailable', async () => {
+    const marker = reviewStartedNoteMarker('deadbeef00cafe11')
+    const client = fakePublishClient({
+      selfUserId: null,
+      notes: [{ id: 'existing', body: marker, authorId: null }],
+    })
+
+    expect(await publisher(client).announceStarted(job())).toEqual({
+      kind: 'already_announced',
+      noteId: 'existing',
+    })
+    expect(client.calls.createNote).toHaveLength(0)
+  })
+
+  it('returns superseded without listing or creating notes when the live head moved', async () => {
+    const client = fakePublishClient({ summaries: [summary({ headSha: 'new-head' })] })
+
+    expect(await publisher(client).announceStarted(job())).toEqual({
+      kind: 'superseded',
+      currentHeadSha: 'new-head',
+    })
+    expect(client.calls.listNotes).toBe(0)
+    expect(client.calls.createNote).toHaveLength(0)
   })
 })
 
@@ -509,6 +572,88 @@ describe('renderProvenanceFooter', () => {
     expect(some).toContain('2 matched exclude_paths')
     expect(some).toContain('1 generated')
   })
+
+  it('keeps the synthesized one-reviewer success footer free of fan-out noise', () => {
+    const footer = renderProvenanceFooter(provenance())
+
+    expect(footer).not.toContain('Eligible reviewers')
+    expect(footer).not.toContain('Reviewer sessions')
+    expect(footer).not.toContain('exact duplicate')
+    expect(footer).not.toContain('Uncovered batch')
+  })
+
+  it('reports multi-reviewer eligibility, session totals, and exact de-duplication', () => {
+    const footer = renderProvenanceFooter(
+      provenance({
+        fanout: {
+          eligibleReviewerIds: ['general', 'security'],
+          skippedReviewers: [],
+          sessionsPlanned: 4,
+          sessionsSucceeded: 3,
+          sessionsFailed: 1,
+          failedSessions: [{ reviewerId: 'security', chunkIndex: 1 }],
+          candidateFindingCount: 7,
+          exactDuplicatesRemoved: 2,
+          uncoveredChunkIndexes: [],
+        },
+      }),
+    )
+
+    expect(footer).toContain('Eligible reviewers: `general`, `security`.')
+    expect(footer).toContain('Reviewer sessions: 3 succeeded, 1 failed (4 planned); 2 exact duplicates removed.')
+    expect(footer).toContain('Failed reviewer sessions: `security` batch 2.')
+  })
+
+  it('reports reviewers skipped by chunk ceilings and one-based uncovered batches', () => {
+    const footer = renderProvenanceFooter(
+      provenance({
+        chunkCount: 4,
+        fanout: {
+          eligibleReviewerIds: ['general'],
+          skippedReviewers: [
+            { reviewerId: 'security', reason: 'max_chunks_exceeded', maxChunks: 2 },
+            { reviewerId: 'reliability', reason: 'max_chunks_exceeded', maxChunks: 3 },
+          ],
+          sessionsPlanned: 4,
+          sessionsSucceeded: 2,
+          sessionsFailed: 2,
+          failedSessions: [
+            { reviewerId: 'general', chunkIndex: 1 },
+            { reviewerId: 'general', chunkIndex: 3 },
+          ],
+          candidateFindingCount: 3,
+          exactDuplicatesRemoved: 0,
+          uncoveredChunkIndexes: [1, 3],
+        },
+      }),
+    )
+
+    expect(footer).toContain(
+      'Skipped at 4 batches: `security` (limit 2 batches), `reliability` (limit 3 batches).',
+    )
+    expect(footer).toContain('Reviewer sessions: 2 succeeded, 2 failed (4 planned); 0 exact duplicates removed.')
+    expect(footer).toContain('Uncovered batches: 2, 4.')
+  })
+
+  it('renders reviewer ids safely even if a direct caller bypasses config validation', () => {
+    const footer = renderProvenanceFooter(
+      provenance({
+        fanout: {
+          eligibleReviewerIds: ['sec`urity\n<!-- hostile -->'],
+          skippedReviewers: [],
+          sessionsPlanned: 1,
+          sessionsSucceeded: 1,
+          sessionsFailed: 0,
+          failedSessions: [],
+          candidateFindingCount: 0,
+          exactDuplicatesRemoved: 0,
+          uncoveredChunkIndexes: [],
+        },
+      }),
+    )
+
+    expect(footer).toContain('``sec`urity <!-- hostile -->``')
+  })
 })
 
 describe('ReviewPublisher — provenance footer end to end through publish()', () => {
@@ -605,7 +750,7 @@ describe('the provenance footer is not a second channel for merge-request text',
     // into the note. The escaping added alongside this makes listing them a
     // choice rather than a hazard, and "5 binary" tells a reader nothing about
     // whether the right five were skipped.
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1,
       chunksFailed: 0,
       excluded: [
@@ -615,7 +760,7 @@ describe('the provenance footer is not a second channel for merge-request text',
       ],
       critique: null,
       checkoutUsed: false,
-    })
+    }))
 
     expect(footer).toContain('3 files not reviewed')
     expect(footer).toContain('1 matched exclude_paths')
@@ -635,13 +780,13 @@ describe('the provenance footer is not a second channel for merge-request text',
   it('a hostile filename still cannot inject markup — it is listed inside a code span', () => {
     // Paths come from the diff, so the author of a merge request chooses them.
     // Listing them is safe only because of how they are listed.
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1,
       chunksFailed: 0,
       excluded: [{ path: 'src/we`ird`<!--hide.png', reason: 'binary' }],
       critique: null,
       checkoutUsed: false,
-    })
+    }))
 
     expect(footer).toContain('``src/we`ird`<!--hide.png``')
     // The comment opener is inside a code span, where it is inert, and the
@@ -656,9 +801,9 @@ describe('the provenance footer is not a second channel for merge-request text',
       path: `vendor/lib-${i}.min.js`,
       reason: 'binary' as const,
     }))
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1, chunksFailed: 0, excluded, critique: null, checkoutUsed: false,
-    })
+    }))
 
     expect(footer).toContain('14 files not reviewed')
     expect(footer).toContain('vendor/lib-9.min.js')
@@ -799,10 +944,10 @@ describe('renderProvenanceFooter — an operator-configured exclusion is counted
     // The real shape of the complaint: a __pycache__ rule matches the same five
     // files on every revision, and naming them adds five lines of noise that
     // never change. The operator wrote the glob; the count line proves it fired.
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
       excluded: [pyc('__init__'), pyc('aggregator'), pyc('calculator'), pyc('reporter'), pyc('visualizer')],
-    })
+    }))
 
     expect(footer).toContain('5 files not reviewed')
     expect(footer).toContain('matched exclude_paths')
@@ -811,7 +956,7 @@ describe('renderProvenanceFooter — an operator-configured exclusion is counted
   })
 
   it('still names a binary, generated or collapsed file — those are surprises, not instructions', () => {
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
       excluded: [
         pyc('__init__'),
@@ -819,7 +964,7 @@ describe('renderProvenanceFooter — an operator-configured exclusion is counted
         { path: 'src/schema.generated.ts', reason: 'generated' },
         { path: 'src/huge.ts', reason: 'collapsed' },
       ],
-    })
+    }))
 
     expect(footer).toContain('4 files not reviewed')
     expect(footer).not.toContain('__pycache__')   // configured — counted only
@@ -833,10 +978,10 @@ describe('renderProvenanceFooter — an operator-configured exclusion is counted
     // more" while naming none of them, which is arithmetic about an invisible
     // list.
     const many = Array.from({ length: 100 }, (_, i) => pyc(`m${i}`))
-    const footer = renderProvenanceFooter({
+    const footer = renderProvenanceFooter(provenance({
       chunkCount: 1, chunksFailed: 0, critique: null, checkoutUsed: false,
       excluded: [...many, { path: 'a.png', reason: 'binary' }],
-    })
+    }))
 
     expect(footer).toContain('101 files not reviewed')
     expect(footer).toContain('a.png')

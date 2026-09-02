@@ -20,6 +20,10 @@
  *
  * Where the states come from:
  *
+ *   every claimed job     -> 'running', then an idempotent per-head start
+ *                            announcement. A moved head becomes
+ *                            'superseded'; an announcement error is retried;
+ *                            agent work starts only after success.
  *   worker 'reviewed'   -> publisher decides: published / already_published
  *                          (both terminal 'published'), superseded, or a
  *                          rejected document (a failed run, retried)
@@ -37,7 +41,13 @@
  * through the publisher it is given.
  */
 
-import type { MergeRequestDiffFile, ReviewJob, ReviewProvenance, ReviewStore } from './types.js'
+import type {
+  MergeRequestDiffFile,
+  ReviewJob,
+  ReviewProvenance,
+  ReviewStartAnnouncementResult,
+  ReviewStore,
+} from './types.js'
 import type { ReviewWorkOutcome } from './worker.js'
 import type { PublishResult } from './publisher.js'
 import { backoffDelay } from '../orchestrator.js'
@@ -50,6 +60,7 @@ export interface FindingsProducer {
 
 /** The half that writes to GitLab. Structural, so tests need no network. */
 export interface FindingsPublisher {
+  announceStarted(job: ReviewJob): Promise<ReviewStartAnnouncementResult>
   publish(request: {
     job: ReviewJob
     findings: unknown
@@ -106,7 +117,32 @@ export class ReviewJobRunner {
     try {
       await this.store.update({ ...job, state: 'running' })
 
+      const announcement = await this.publisher.announceStarted(job)
+      if (announcement.kind === 'superseded') {
+        log.info(
+          {
+            project: projectId,
+            mrIid,
+            headSha,
+            currentHeadSha: announcement.currentHeadSha,
+          },
+          'review_superseded_before_start',
+        )
+        await this.store.update({
+          ...job,
+          state: 'superseded',
+          skipReason: 'merge request head changed before review started',
+        })
+        return
+      }
+
+      // stop() and supersession both abort this signal. Do not launch work if
+      // cancellation arrived while GitLab was answering the announcement,
+      // and do not publish if a non-cooperative worker returned a successful
+      // document after cancellation instead of rejecting.
+      signal.throwIfAborted()
       const outcome = await this.worker.run(job, signal)
+      signal.throwIfAborted()
 
       switch (outcome.kind) {
         case 'too_large':

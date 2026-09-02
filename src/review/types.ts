@@ -268,7 +268,37 @@ export interface ReviewProvenance {
   /** null means the critique did not run — the note says so rather than implying it passed. */
   critique: CritiqueOutcome | null
   checkoutUsed: boolean
+  /** Parallel reviewer selection, execution, coverage, and exact de-duplication. */
+  fanout: ReviewFanoutProvenance
 }
+
+export interface SkippedReviewerProvenance {
+  reviewerId: string
+  reason: 'max_chunks_exceeded'
+  maxChunks: number
+}
+
+export interface ReviewFanoutProvenance {
+  /** Configured reviewers eligible for this material plan, in configuration order. */
+  eligibleReviewerIds: string[]
+  skippedReviewers: SkippedReviewerProvenance[]
+  sessionsPlanned: number
+  sessionsSucceeded: number
+  sessionsFailed: number
+  /** Failed coordinates in deterministic reviewer/chunk order; reasons remain logs-only. */
+  failedSessions: Array<{ reviewerId: string; chunkIndex: number }>
+  /** Candidate count before the mechanical exact-duplicate pass. */
+  candidateFindingCount: number
+  exactDuplicatesRemoved: number
+  /** Zero-based chunks for which no eligible reviewer session succeeded. */
+  uncoveredChunkIndexes: number[]
+}
+
+/** Result of the idempotent, per-head start announcement. */
+export type ReviewStartAnnouncementResult =
+  | { kind: 'announced'; noteId: string }
+  | { kind: 'already_announced'; noteId: string }
+  | { kind: 'superseded'; currentHeadSha: string | null }
 
 export interface ReviewedOutcome {
   kind: 'reviewed'
@@ -334,6 +364,17 @@ export const UNCHUNKED_PROVENANCE: ReviewProvenance = {
   excluded: [],
   critique: null,
   checkoutUsed: false,
+  fanout: {
+    eligibleReviewerIds: ['default'],
+    skippedReviewers: [],
+    sessionsPlanned: 1,
+    sessionsSucceeded: 1,
+    sessionsFailed: 0,
+    failedSessions: [],
+    candidateFindingCount: 0,
+    exactDuplicatesRemoved: 0,
+    uncoveredChunkIndexes: [],
+  },
 }
 
 // ===========================================================================
@@ -484,20 +525,20 @@ export interface InlinePublishOutcome {
    * outcome worse than a fallback.
    */
   failed: number
-  /** Prior-revision threads replied to. */
-  superseded: number
+  /** Older Symphony-owned revision threads encountered during cleanup. */
+  priorRevisionThreads: number
   /**
    * Of those, how many the token was actually PERMITTED to resolve. Whether a
    * Reporter-role token may resolve a discussion it authored is unverified on
    * our instance, so this is how the answer arrives — from the first live run,
    * as a number, rather than from documentation this environment cannot reach.
    */
-  resolved: number
+  priorRevisionThreadsResolved: number
 }
 
 /**
- * The four discussion operations, deliberately a SEPARATE interface rather
- * than four more methods on {@link MergeRequestClient}.
+ * The three discussion operations, deliberately a SEPARATE interface rather
+ * than three more methods on {@link MergeRequestClient}.
  *
  * Two reasons, and the second one is why it is worth the extra name:
  *
@@ -523,14 +564,6 @@ export interface MergeRequestDiscussionClient {
     position: DiscussionPosition,
   ): Promise<string>
 
-  /** Adds a note to an existing discussion. Returns the new note's id. */
-  replyToDiscussion(
-    projectId: string,
-    mrIid: number,
-    discussionId: string,
-    body: string,
-  ): Promise<string>
-
   /**
    * Attempts to resolve a discussion. Returns false — never throws — when the
    * instance or the token refuses (403/404/405) or the discussion is not
@@ -539,10 +572,8 @@ export interface MergeRequestDiscussionClient {
    *
    * A boolean rather than void, and a refusal rather than an exception,
    * because whether a Reporter-role token can resolve a discussion it authored
-   * is UNVERIFIED on our instance. The caller replies FIRST and unconditionally
-   * and treats resolution as a bonus, so the reply-only fallback is simply what
-   * happens when this returns false — no second code path, no config key, and
-   * no architecture riding on an answer nobody has yet.
+   * is UNVERIFIED on our instance. Refusal leaves the older thread untouched;
+   * it must never create a user-visible fallback reply.
    */
   resolveDiscussion(projectId: string, mrIid: number, discussionId: string): Promise<boolean>
 }

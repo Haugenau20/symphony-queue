@@ -136,6 +136,46 @@ Set `SYMPHONY_GITLAB_TOKEN` in the process environment. There is deliberately no
 generic environment-variable resolver in the workflow schema, so credentials cannot be read
 from `WORKFLOW.md`.
 
+### Merge-request review profiles
+
+Review mode reads YAML front matter and a shared prompt from `REVIEW.md`. Named reviewers add
+small, trusted specializations to that shared prompt and run independently over every material
+batch. Exactly one reviewer is primary and always runs; supplemental reviewers may opt out of
+large reviews with `max_chunks`.
+
+```yaml
+---
+review:
+  base_url: https://gitlab.example.com
+  group_id: my-group
+  max_concurrent_reviews: 3
+  max_parallel_review_agents: 6
+  reviewers:
+    - id: general
+      primary: true
+      instructions: Review the change broadly for correctness and maintainability.
+    - id: security
+      max_chunks: 2
+      instructions: Focus on trust boundaries, authorization, secrets, and unsafe input.
+    - id: reliability
+      max_chunks: 2
+      instructions: Focus on failure recovery, retries, concurrency, and data loss.
+agent:
+  max_turns: 10
+  completion_marker: SYMPHONY_REVIEW_DONE
+---
+
+Review the supplied merge-request material. Write the required FINDINGS.json and finish with
+SYMPHONY_REVIEW_DONE.
+```
+
+`max_parallel_review_agents` is one process-wide ceiling shared by reviewer and critic
+sessions across all active merge requests; it defaults to `max_concurrent_reviews`. Work is
+scheduled fairly across merge requests. Omitting `reviewers` preserves the previous single
+broad reviewer. The review token and durable/workspace roots remain environment-only:
+`SYMPHONY_REVIEW_GITLAB_TOKEN`, `SYMPHONY_REVIEW_STORE_ROOT`, and
+`SYMPHONY_REVIEW_WORKSPACES_ROOT`.
+
 Workspace hooks are optional trusted shell commands:
 
 ```yaml

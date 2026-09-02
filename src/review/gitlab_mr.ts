@@ -557,20 +557,6 @@ export class GitLabMergeRequestClient implements MergeRequestClient, MergeReques
     return String(raw.id)
   }
 
-  async replyToDiscussion(
-    projectId: string,
-    mrIid: number,
-    discussionId: string,
-    body: string,
-  ): Promise<string> {
-    const raw = await this.request<RawNote>(
-      'POST',
-      `/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}/discussions/${encodeURIComponent(discussionId)}/notes`,
-      { body },
-    )
-    return String(raw.id)
-  }
-
   /**
    * Whether a Reporter-role token can resolve a discussion it authored is
    * UNVERIFIED on our instance (design §16), so 403/404/405 are treated as an

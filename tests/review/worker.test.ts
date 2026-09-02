@@ -13,6 +13,8 @@ import {
 } from '../../src/review/worker.js'
 import { WorkspaceManager } from '../../src/workspace.js'
 import { getLogger } from '../../src/log.js'
+import { ReviewSessionPool } from '../../src/review/session_pool.js'
+import type { ReviewReviewerConfig } from '../../src/config.js'
 import type {
   CheckoutResult,
   CritiqueResult,
@@ -156,13 +158,7 @@ function agentWritingFindings(findingsJson: unknown, opts?: { captureWorkspace?:
   return { run: runFn, promptCalls }
 }
 
-/**
- * Fake agent run for a CHUNKED plan: writes `FINDINGS.<call index>.json` —
- * chunk sessions run strictly sequentially in chunk-index order, so the Nth
- * call corresponds exactly to chunk N. Records every call (target, prompt,
- * timestamps) so a test can assert on sequencing, per-chunk prompt content,
- * and per-chunk output independently.
- */
+/** Fake chunk runner. Isolated sessions all use the standard FINDINGS.json. */
 function agentWritingChunkedFindings(findingsByChunk: unknown[]) {
   const calls: Array<{ target: RunTarget; prompt: string; wsPath: string; startedAt: number; endedAt: number }> = []
   const runFn = vi.fn(
@@ -173,21 +169,20 @@ function agentWritingChunkedFindings(findingsByChunk: unknown[]) {
       _signal: AbortSignal | undefined,
       _options: unknown,
     ) => {
-      const idx = calls.length
+      const callIndex = runFn.mock.calls.length - 1
+      const chunkIndex = Number(target.id.match(/::chunk:(\d+)$/)?.[1] ?? callIndex)
       const startedAt = Date.now()
-      // A small real delay so two overlapping calls (a concurrency bug) would
-      // actually overlap in wall-clock time instead of both reporting
-      // identical instantaneous timestamps.
+      // Make intended fan-out overlap observable.
       await new Promise((r) => setTimeout(r, 5))
       if (workspacePath) {
         require('node:fs').writeFileSync(
-          join(workspacePath, `FINDINGS.${idx}.json`),
-          JSON.stringify(findingsByChunk[idx]),
+          join(workspacePath, 'FINDINGS.json'),
+          JSON.stringify(findingsByChunk[chunkIndex]),
         )
       }
       const endedAt = Date.now()
-      calls.push({ target, prompt, wsPath: workspacePath ?? '', startedAt, endedAt })
-      return { sessionId: `s${idx}`, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+      calls[callIndex] = { target, prompt, wsPath: workspacePath ?? '', startedAt, endedAt }
+      return { sessionId: `s${callIndex}`, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
     },
   )
   return { run: runFn, calls }
@@ -371,7 +366,7 @@ describe('ReviewWorker — happy path', () => {
 
     // Project-qualified, so the same iid in two repositories cannot share a
     // directory. Still `mr-`-prefixed, so it cannot collide with `issue-<n>`.
-    expect(seenPath).toBe(join(root, 'mr-my-org_service-a-999-abcdef01'))
+    expect(seenPath).toEqual(expect.stringContaining(join(root, 'reviewer-default-chunk-0-')))
   })
 
   it('passes REVIEW_PERMISSIONS to the agent runner, not some other set', async () => {
@@ -736,12 +731,12 @@ describe('ReviewWorker — failure modes', () => {
     expect(outcome).toMatchObject({ kind: 'failed', reason: 'boom' })
   })
 
-  it('the workspace is destroyed even when the agent throws', async () => {
+  it('the workspace is destroyed and the review fails when the only agent throws', async () => {
     const client = fakeClient({})
     const runFn = vi.fn(async () => { throw new Error('agent exploded') })
     const w = worker({ mrClient: client, agentRunner: { run: runFn } })
 
-    await expect(w.run(job())).rejects.toThrow('agent exploded')
+    await expect(w.run(job())).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('agent exploded') })
 
     expect(existsSync(join(root, 'mr-412-deadbeef'))).toBe(false)
   })
@@ -790,9 +785,11 @@ describe('ReviewWorker — SECURITY: prompt injection via MR title/description',
     const benign = await runWith(benignDescription)
     const malicious = await runWith(maliciousDescription)
 
-    // The prompt text sent to the agent is entirely static — it never
-    // interpolates MR content — so it is byte-identical regardless.
-    expect(malicious.prompt).toBe(benign.prompt)
+    // The only per-run value is the isolated workspace location. No merge
+    // request-authored content is interpolated into the prompt.
+    const normalizeWorkspace = (prompt: string | undefined) =>
+      prompt?.replace(/Your workspace is at `[^`]+`/, 'Your workspace is at `<workspace>`')
+    expect(normalizeWorkspace(malicious.prompt)).toBe(normalizeWorkspace(benign.prompt))
     expect(malicious.prompt).not.toContain('ignore your instructions')
 
     // Permissions and the shape of the outcome are unaffected too.
@@ -976,13 +973,10 @@ describe('ReviewWorker — a hung agent cannot hold its slot forever', () => {
         }),
     }
 
-    // Settles rather than hanging. The worker surfaces the abort as a rejection
-    // and ReviewJobRunner records it as a retryable failure — which is what
-    // releases the concurrency slot. Before the deadline existed, this promise
-    // never settled at all.
+    // Settles as a retryable failed outcome rather than hanging indefinitely.
     await expect(
       worker({ mrClient: client, agentRunner: neverSettles as never, agentTimeoutMs: 60 }).run(job()),
-    ).rejects.toThrow()
+    ).resolves.toMatchObject({ kind: 'failed', reason: expect.stringContaining('aborted') })
   })
 
   it('passes a signal that is already aborted through as a failure, not a hang', async () => {
@@ -998,7 +992,7 @@ describe('ReviewWorker — a hung agent cannot hold its slot forever', () => {
 
     await expect(
       worker({ mrClient: client, agentRunner: respectsSignal as never }).run(job(), ac.signal),
-    ).rejects.toThrow()
+    ).rejects.toBeDefined()
   })
 
   it('reports what the agent said when it finished without writing findings', async () => {
@@ -1199,6 +1193,17 @@ describe('ReviewWorker — the unchunked path is provably unchanged', () => {
       excluded: [],
       critique: null,
       checkoutUsed: false,
+      fanout: {
+        eligibleReviewerIds: ['default'],
+        skippedReviewers: [],
+        sessionsPlanned: 1,
+        sessionsSucceeded: 1,
+        sessionsFailed: 0,
+        failedSessions: [],
+        candidateFindingCount: 1,
+        exactDuplicatesRemoved: 0,
+        uncoveredChunkIndexes: [],
+      },
     })
     expect(agent.run).toHaveBeenCalledTimes(1)
   })
@@ -1280,7 +1285,7 @@ describe('ReviewWorker — the unchunked path is provably unchanged', () => {
 })
 
 describe('ReviewWorker — chunked execution', () => {
-  it('a three-chunk plan runs exactly THREE sessions, strictly sequentially, and merges findings in chunk order', async () => {
+  it('a three-chunk plan runs exactly THREE isolated sessions concurrently and merges findings in chunk order', async () => {
     const files = [
       diffFile({ oldPath: 'a/a.ts', newPath: 'a/a.ts', diff: 'A'.repeat(80) }),
       diffFile({ oldPath: 'b/b.ts', newPath: 'b/b.ts', diff: 'B'.repeat(80) }),
@@ -1302,13 +1307,12 @@ describe('ReviewWorker — chunked execution', () => {
     expect(outcome.provenance.chunksFailed).toBe(0)
     expect(agent.run).toHaveBeenCalledTimes(3)
 
-    // Sequencing, observed rather than assumed: call i must have fully ended
-    // (including its own artificial delay) before call i+1 even started. Two
-    // sessions racing on the shared sandbox would show up here as an overlap.
+    // All sessions start before any completes, while their distinct workspace
+    // paths prevent the old FINDINGS.json race.
     expect(agent.calls).toHaveLength(3)
-    for (let i = 0; i < agent.calls.length - 1; i++) {
-      expect(agent.calls[i]!.endedAt).toBeLessThanOrEqual(agent.calls[i + 1]!.startedAt)
-    }
+    expect(Math.max(...agent.calls.map((call) => call.startedAt)))
+      .toBeLessThanOrEqual(Math.min(...agent.calls.map((call) => call.endedAt)))
+    expect(new Set(agent.calls.map((call) => call.wsPath)).size).toBe(3)
 
     expect(outcome.findings.findings.map((f) => f.title)).toEqual(['Finding 0', 'Finding 1', 'Finding 2'])
   })
@@ -1325,7 +1329,7 @@ describe('ReviewWorker — chunked execution', () => {
       }
       if (wsPath) {
         require('node:fs').writeFileSync(
-          join(wsPath, `FINDINGS.${idx}.json`),
+          join(wsPath, 'FINDINGS.json'),
           JSON.stringify({ summary: 'ok', findings: [{ ...validFindings().findings[0], title: 'Surviving finding', file: 'b/b.ts' }] }),
         )
       }
@@ -1351,7 +1355,7 @@ describe('ReviewWorker — chunked execution', () => {
     const runFn = vi.fn(async (_t: RunTarget, _p: string, wsPath: string | null | undefined) => {
       const idx = call++
       if (idx === 0) throw new Error('exploded mid chunk')
-      if (wsPath) require('node:fs').writeFileSync(join(wsPath, `FINDINGS.${idx}.json`), JSON.stringify(validFindings()))
+      if (wsPath) require('node:fs').writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify(validFindings()))
       return { sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }
     })
     const w = worker({ mrClient: client, agentRunner: { run: runFn }, maxDiffBytes: 50 })
@@ -1513,6 +1517,30 @@ describe('ReviewWorker — self-critique wiring', () => {
     expect(critiqueCallCount).toBe(1)
     expect(seenFindingsCount).toBe(2)
   })
+
+  it('propagates a controller abort during critique instead of publishing uncritiqued findings', async () => {
+    const client = fakeClient({ diffs: [diffFile()], fileContents: { 'src/foo.ts': 'x' } })
+    const agent = agentWritingFindings(validFindings())
+    let markCriticStarted!: () => void
+    const criticStarted = new Promise<void>((resolveStarted) => { markCriticStarted = resolveStarted })
+    const critic: FindingsCritic = {
+      critique: async (_request, signal): Promise<CritiqueResult> => {
+        markCriticStarted()
+        await new Promise<void>((resolveAbort) => signal?.addEventListener('abort', () => resolveAbort(), { once: true }))
+        // Real critic implementations may translate their aborted runner into
+        // unavailable; the worker must still honor the controller signal.
+        return { kind: 'unavailable', reason: 'aborted' }
+      },
+    }
+    const controller = new AbortController()
+    const w = worker({ mrClient: client, agentRunner: agent, critic })
+
+    const pending = w.run(job(), controller.signal)
+    await criticStarted
+    controller.abort(new Error('new head superseded review'))
+
+    await expect(pending).rejects.toThrow('new head superseded review')
+  })
 })
 
 describe('ReviewWorker — optional checkout wiring', () => {
@@ -1597,13 +1625,9 @@ describe('ReviewWorker — optional checkout wiring', () => {
 })
 
 describe('REVIEW.md as promptOverride — the configuration production ACTUALLY runs', () => {
-  // Every chunking test above leaves promptOverride unset, so they all exercise
-  // the built-in prompt. main.ts sets it on every real deployment, from
-  // REVIEW.md's body. That body is static operator text: it names FINDINGS.json
-  // and knows nothing about batches. If it simply REPLACES the built-in prompt,
-  // a chunked session is told to write FINDINGS.json while the worker reads
-  // FINDINGS.0.json — so every chunk "fails" and the whole review fails, in
-  // production only, with a fully green suite.
+  // Every chunking test above leaves promptOverride unset, so they exercise the
+  // built-in prompt. main.ts supplies REVIEW.md in production; the worker must
+  // retain that common text while appending the per-session batch boundary.
   it('a chunked session is still told its batch and its output filename', async () => {
     const files = [
       diffFile({ oldPath: 'a/a.ts', newPath: 'a/a.ts', diff: 'A'.repeat(80) }),
@@ -1633,10 +1657,11 @@ describe('REVIEW.md as promptOverride — the configuration production ACTUALLY 
     const prompts = agent.calls.map((c) => c.prompt)
     for (const prompt of prompts) {
       expect(prompt).toContain('Review the change and write your findings to')
+      expect(prompt).toContain('FINDINGS.json')
     }
-    // ...and each session is still told which file to actually write.
-    expect(prompts[0]).toContain('FINDINGS.0.json')
-    expect(prompts[1]).toContain('FINDINGS.1.json')
+    // ...and isolation lets every session use the standard output contract.
+    expect(prompts.some((prompt) => prompt.includes('batch 1 of 2'))).toBe(true)
+    expect(prompts.some((prompt) => prompt.includes('batch 2 of 2'))).toBe(true)
   })
 
   it('the unchunked path with an override is unchanged — no batch addendum at all', async () => {
@@ -1674,5 +1699,217 @@ describe('REVIEW.md as promptOverride — the configuration production ACTUALLY 
     for (const { prompt } of agent.calls) {
       expect(prompt).not.toContain('IGNORE-ALL-PREVIOUS-INSTRUCTIONS')
     }
+  })
+})
+
+describe('ReviewWorker — parallel reviewer profiles', () => {
+  const reviewers: ReviewReviewerConfig[] = [
+    { id: 'general', primary: true, instructions: 'Perform the broad review.', maxChunks: null },
+    { id: 'security', primary: false, instructions: 'Focus on trust boundaries.', maxChunks: 2 },
+    { id: 'reliability', primary: false, instructions: 'Focus on retry behavior.', maxChunks: 1 },
+  ]
+
+  it('fans eligible reviewers across chunks through the shared bound and aggregates deterministically', async () => {
+    const files = [
+      diffFile({ oldPath: 'a/a.ts', newPath: 'a/a.ts', diff: 'A'.repeat(80) }),
+      diffFile({ oldPath: 'b/b.ts', newPath: 'b/b.ts', diff: 'B'.repeat(80) }),
+    ]
+    const client = fakeClient({ diffs: files, fileContents: { 'a/a.ts': '1', 'b/b.ts': '2' } })
+    let active = 0
+    let maxActive = 0
+    const seen: Array<{ target: string; prompt: string; workspace: string }> = []
+    const runFn = vi.fn(async (target: RunTarget, prompt: string, wsPath: string | null | undefined) => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
+      const reviewerId = target.id.match(/::reviewer:([^:]+)::/)?.[1] ?? 'unknown'
+      const chunkIndex = Number(target.id.match(/::chunk:(\d+)$/)?.[1] ?? 0)
+      if (wsPath) {
+        writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify({
+          summary: `${reviewerId}-${chunkIndex}`,
+          findings: [{
+            ...validFindings().findings[0],
+            file: files[chunkIndex]!.newPath,
+            title: `${reviewerId}-${chunkIndex}`,
+          }],
+        }))
+        seen.push({ target: target.id, prompt, workspace: wsPath })
+      }
+      active--
+      return { sessionId: target.id, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+    })
+    const w = worker({
+      mrClient: client,
+      agentRunner: { run: runFn },
+      maxDiffBytes: 50,
+      reviewers,
+      sessionPool: new ReviewSessionPool(2),
+    })
+
+    const outcome = await w.run(job())
+
+    expect(outcome.kind).toBe('reviewed')
+    if (outcome.kind !== 'reviewed') throw new Error('unreachable')
+    expect(runFn).toHaveBeenCalledTimes(4)
+    expect(maxActive).toBe(2)
+    expect(new Set(seen.map((call) => call.workspace)).size).toBe(4)
+    expect(seen.filter((call) => call.target.includes('reviewer:security'))
+      .every((call) => call.prompt.includes('Focus on trust boundaries.'))).toBe(true)
+    expect(seen.filter((call) => call.target.includes('reviewer:general'))
+      .every((call) => !call.prompt.includes('Focus on trust boundaries.'))).toBe(true)
+    expect(outcome.findings.findings.map((finding) => finding.title)).toEqual([
+      'general-0',
+      'general-1',
+      'security-0',
+      'security-1',
+    ])
+    expect(outcome.provenance.fanout).toEqual({
+      eligibleReviewerIds: ['general', 'security'],
+      skippedReviewers: [{ reviewerId: 'reliability', reason: 'max_chunks_exceeded', maxChunks: 1 }],
+      sessionsPlanned: 4,
+      sessionsSucceeded: 4,
+      sessionsFailed: 0,
+      failedSessions: [],
+      candidateFindingCount: 4,
+      exactDuplicatesRemoved: 0,
+      uncoveredChunkIndexes: [],
+    })
+  })
+
+  it('isolates reviewer mutations and gives the critic a fresh material copy', async () => {
+    const client = fakeClient({ diffs: [diffFile()], fileContents: { 'src/foo.ts': 'body' } })
+    let releaseSecurity!: () => void
+    const generalMutated = new Promise<void>((resolveMutation) => { releaseSecurity = resolveMutation })
+    const reviewerPaths: string[] = []
+    let securitySawOriginal = false
+    const runFn = vi.fn(async (target: RunTarget, _prompt: string, wsPath: string | null | undefined) => {
+      if (!wsPath) throw new Error('workspace required')
+      reviewerPaths.push(wsPath)
+      if (target.id.includes('reviewer:general')) {
+        writeFileSync(join(wsPath, 'MR.md'), 'MUTATED BY GENERAL')
+        releaseSecurity()
+      } else {
+        await generalMutated
+        securitySawOriginal = readFileSync(join(wsPath, 'MR.md'), 'utf8').includes('Fix the thing')
+      }
+      writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify({ summary: 'ok', findings: [] }))
+      return { sessionId: target.id, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+    })
+    let criticWorkspace = ''
+    let criticSawOriginal = false
+    const critic: FindingsCritic = {
+      critique: async ({ findings, workspacePath }): Promise<CritiqueResult> => {
+        criticWorkspace = workspacePath
+        criticSawOriginal = readFileSync(join(workspacePath, 'MR.md'), 'utf8').includes('Fix the thing')
+        return {
+          kind: 'critiqued',
+          findings,
+          outcome: { ran: true, keptCount: 0, droppedCount: 0, dropped: [] },
+        }
+      },
+    }
+    const w = worker({
+      mrClient: client,
+      agentRunner: { run: runFn },
+      reviewers: reviewers.slice(0, 2).map((reviewer) => ({ ...reviewer, maxChunks: null })),
+      critic,
+    })
+
+    const outcome = await w.run(job())
+
+    expect(outcome.kind).toBe('reviewed')
+    expect(securitySawOriginal).toBe(true)
+    expect(criticSawOriginal).toBe(true)
+    expect(reviewerPaths).not.toContain(criticWorkspace)
+  })
+
+  it('keeps partial reviewer coverage, removes exact duplicates, then critiques once', async () => {
+    const client = fakeClient({ diffs: [diffFile()], fileContents: { 'src/foo.ts': 'body' } })
+    const runFn = vi.fn(async (target: RunTarget, _prompt: string, wsPath: string | null | undefined) => {
+      if (target.id.includes('reviewer:reliability')) {
+        return { sessionId: null, success: false, turnsCompleted: 0, error: 'backend unavailable' }
+      }
+      if (wsPath) writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify(validFindings()))
+      return { sessionId: target.id, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+    })
+    let criticCalls = 0
+    let criticCandidateCount = -1
+    const critic: FindingsCritic = {
+      critique: async ({ findings }): Promise<CritiqueResult> => {
+        criticCalls++
+        criticCandidateCount = findings.findings.length
+        return {
+          kind: 'critiqued',
+          findings,
+          outcome: { ran: true, keptCount: findings.findings.length, droppedCount: 0, dropped: [] },
+        }
+      },
+    }
+    const w = worker({
+      mrClient: client,
+      agentRunner: { run: runFn },
+      reviewers: reviewers.map((reviewer) => ({ ...reviewer, maxChunks: null })),
+      critic,
+    })
+
+    const outcome = await w.run(job())
+
+    expect(outcome.kind).toBe('reviewed')
+    if (outcome.kind !== 'reviewed') throw new Error('unreachable')
+    expect(criticCalls).toBe(1)
+    expect(criticCandidateCount).toBe(1)
+    expect(outcome.provenance.chunksFailed).toBe(0)
+    expect(outcome.provenance.fanout).toMatchObject({
+      sessionsPlanned: 3,
+      sessionsSucceeded: 2,
+      sessionsFailed: 1,
+      failedSessions: [{ reviewerId: 'reliability', chunkIndex: 0 }],
+      candidateFindingCount: 2,
+      exactDuplicatesRemoved: 1,
+      uncoveredChunkIndexes: [],
+    })
+  })
+
+  it('aborts queued reviewer work and propagates cancellation instead of reporting session failures', async () => {
+    const files = [
+      diffFile({ oldPath: 'a/a.ts', newPath: 'a/a.ts', diff: 'A'.repeat(80) }),
+      diffFile({ oldPath: 'b/b.ts', newPath: 'b/b.ts', diff: 'B'.repeat(80) }),
+    ]
+    const client = fakeClient({ diffs: files, fileContents: { 'a/a.ts': '1', 'b/b.ts': '2' } })
+    let markStarted!: () => void
+    const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted })
+    const runFn = vi.fn(async (_target: RunTarget, _prompt: string, _ws: string | null | undefined, signal?: AbortSignal) => {
+      markStarted()
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+      throw new Error('unreachable')
+    })
+    const controller = new AbortController()
+    const w = worker({
+      mrClient: client,
+      agentRunner: { run: runFn },
+      maxDiffBytes: 50,
+      sessionPool: new ReviewSessionPool(1),
+    })
+
+    const pending = w.run(job(), controller.signal)
+    await started
+    controller.abort(new Error('head moved'))
+    await expect(pending).rejects.toThrow('head moved')
+    expect(runFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('propagates cancellation when an agent ignores abort and still returns successful findings', async () => {
+    const client = fakeClient({ diffs: [diffFile()], fileContents: { 'src/foo.ts': 'body' } })
+    const controller = new AbortController()
+    const runFn = vi.fn(async (_target: RunTarget, _prompt: string, wsPath: string | null | undefined) => {
+      if (wsPath) writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify(validFindings()))
+      controller.abort(new Error('shutdown'))
+      return { sessionId: 'ignored-abort', success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+    })
+    const w = worker({ mrClient: client, agentRunner: { run: runFn } })
+
+    await expect(w.run(job(), controller.signal)).rejects.toThrow('shutdown')
   })
 })

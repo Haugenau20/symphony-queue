@@ -691,17 +691,6 @@ describe('createDiscussion', () => {
   })
 })
 
-describe('replyToDiscussion', () => {
-  it('posts to the discussion notes endpoint, URL-encoding the discussion id, and returns the new note id', async () => {
-    route('POST', '/discussions/disc%2Fweird/notes', { id: 55 })
-    const id = await client().replyToDiscussion('g/p', 5, 'disc/weird', 'a reply')
-    expect(id).toBe('55')
-    const call = calls.find((c) => c.method === 'POST')!
-    expect(call.url).toContain('/merge_requests/5/discussions/disc%2Fweird/notes')
-    expect(call.body).toEqual({ body: 'a reply' })
-  })
-})
-
 describe('resolveDiscussion', () => {
   for (const status of [403, 404, 405]) {
     it(`returns false without throwing on ${status}`, async () => {
@@ -729,7 +718,6 @@ describe('discussion transport — token and error hygiene', () => {
   it('sends PRIVATE-TOKEN and never puts the token in any discussion-related URL', async () => {
     route('GET', '/merge_requests/5/discussions', [])
     route('POST', '/merge_requests/5/discussions', { id: 'd' })
-    route('POST', '/discussions/disc-1/notes', { id: 'n' })
     route('PUT', '/discussions/disc-1', { resolved: true })
 
     const c = client()
@@ -738,7 +726,6 @@ describe('discussion transport — token and error hygiene', () => {
       baseSha: 'b', startSha: 's', headSha: 'h', oldPath: 'a', newPath: 'a',
       positionType: 'text', oldLine: 1, newLine: 1,
     })
-    await c.replyToDiscussion('g/p', 5, 'disc-1', 'x')
     await c.resolveDiscussion('g/p', 5, 'disc-1')
 
     expect(calls.length).toBeGreaterThan(0)
@@ -748,11 +735,10 @@ describe('discussion transport — token and error hygiene', () => {
     }
   })
 
-  it('no error from any of the four discussion methods echoes the response body', async () => {
+  it('no error from any of the three discussion methods echoes the response body', async () => {
     const SECRET = 'SECRET-BODY-abc'
     route('GET', '/merge_requests/5/discussions', { message: SECRET }, 500)
     route('POST', '/merge_requests/5/discussions', { message: SECRET }, 500)
-    route('POST', '/discussions/disc-1/notes', { message: SECRET }, 500)
     route('PUT', '/discussions/disc-1', { message: SECRET }, 500)
 
     const c = client()
@@ -763,7 +749,6 @@ describe('discussion transport — token and error hygiene', () => {
         positionType: 'text', oldLine: 1, newLine: 1,
       }),
     ).rejects.not.toThrow(new RegExp(SECRET))
-    await expect(c.replyToDiscussion('g/p', 5, 'disc-1', 'x')).rejects.not.toThrow(new RegExp(SECRET))
     // resolveDiscussion: 500 still throws (not one of the refusal statuses).
     await expect(c.resolveDiscussion('g/p', 5, 'disc-1')).rejects.not.toThrow(new RegExp(SECRET))
   })

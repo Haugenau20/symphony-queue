@@ -33,16 +33,15 @@
  * or more agent-sized chunks — is entirely material.ts's job (planReviewMaterial).
  * This module's job is turning a plan into sandboxes and agent sessions:
  *
- *   - ONE sandbox is built per review, however many chunks the plan has. The
- *     diff/files/repo material is shared; only the prompt differs per chunk
- *     session, telling that session which files are its own to review.
- *   - Chunk sessions run ONE AT A TIME, in chunk order. Never concurrently:
- *     two sessions racing on one sandbox is how FINDINGS.json got overwritten
- *     once already, and the model backend's own throughput is a real
- *     constraint besides.
- *   - A single chunk's session failing does not fail the review — it is
- *     counted in provenance.chunksFailed and the rest continue. Only every
- *     chunk failing produces a `{ kind: 'failed' }` outcome.
+ *   - ONE immutable material sandbox is built per review. Every eligible
+ *     reviewer/chunk pair gets a private byte-for-byte copy, so sessions can
+ *     safely run concurrently and all retain the standard FINDINGS.json
+ *     output contract.
+ *   - Reviewer sessions are submitted to a shared bounded scheduler. Their
+ *     completion order never affects aggregation order.
+ *   - One failed session does not fail the review. A chunk is uncovered only
+ *     when every eligible reviewer for it fails; only zero successful
+ *     sessions produces a `{ kind: 'failed' }` outcome.
  *
  * If, after exclusion, there is nothing left that GitLab could show at all —
  * or the plan would need more chunks than the configured ceiling — the agent
@@ -53,10 +52,20 @@
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { PermissionRule } from '@opencode-ai/sdk/v2'
+import type { ReviewReviewerConfig } from '../config.js'
 import { getLogger } from '../log.js'
 import { checkContainment } from '../path_safety.js'
 import { safeParseFindingsDocument } from './findings.js'
 import { planReviewMaterial } from './material.js'
+import {
+  aggregateReviewerResults,
+  planReviewerTasks,
+  selectReviewers,
+  type ReviewerTask,
+  type ReviewerTaskResult,
+} from './reviewers.js'
+import type { ReviewSessionPool } from './session_pool.js'
+import { ReviewSessionWorkspaceFactory } from './session_workspace.js'
 import type {
   CritiqueOutcome,
   ExcludedFile,
@@ -239,6 +248,10 @@ export interface ReviewWorkerConfig {
   checkout?: RepoCheckout
   /** Off by default. See {@link checkout}. */
   enableCheckout?: boolean
+  /** Normalized reviewer profiles. Omission preserves the original single broad reviewer. */
+  reviewers?: ReviewReviewerConfig[]
+  /** Shared global scheduler for all primary review-agent sessions. */
+  sessionPool?: Pick<ReviewSessionPool, 'run'>
 }
 
 /**
@@ -276,27 +289,6 @@ function byteLength(s: string): number {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
-}
-
-/**
- * Merges each successful chunk's findings, preserving CHUNK ORDER then INPUT
- * ORDER within a chunk — no attempt at de-duplication here, that is the
- * critic's job (design: "the critic is what de-duplicates across chunks; the
- * merge does not try to be clever about it"). `outcomes` is already only the
- * chunks that succeeded, already in ascending chunk-index order (the loop that
- * builds it iterates the plan's chunks in that order and simply skips
- * failures), so this function does no reordering of its own.
- */
-function mergeChunkFindings(outcomes: Array<{ chunk: ReviewChunk; findings: FindingsDocument }>): FindingsDocument {
-  const findings = outcomes.flatMap((o) => o.findings.findings)
-  const summaries = outcomes
-    .map((o) => o.findings.summary.trim())
-    .filter((s) => s.length > 0)
-    .map((s, i) => `Batch ${outcomes[i]!.chunk.index + 1}: ${s}`)
-  return {
-    summary: summaries.length > 0 ? summaries.join('\n') : '(no summary provided)',
-    findings,
-  }
 }
 
 /**
@@ -467,6 +459,21 @@ function buildSessionAddendum(opts: {
   return lines.join('\n')
 }
 
+/** Trusted, operator-authored specialization for one named reviewer profile. */
+function buildReviewerAddendum(reviewer: ReviewReviewerConfig): string {
+  if (reviewer.instructions.length === 0) return ''
+  return [
+    '',
+    '---',
+    '',
+    `REVIEWER PROFILE: ${reviewer.id}`,
+    'The following specialization was configured by the repository operator.',
+    'Apply it in addition to the common review instructions above:',
+    '',
+    reviewer.instructions,
+  ].join('\n')
+}
+
 function renderMrMarkdown(
   job: ReviewJob,
   summary: MergeRequestSummary,
@@ -543,6 +550,8 @@ export class ReviewWorker {
   private readonly critic: FindingsCritic | null
   private readonly checkout: RepoCheckout | null
   private readonly enableCheckout: boolean
+  private readonly reviewers: ReviewReviewerConfig[]
+  private readonly sessionPool: Pick<ReviewSessionPool, 'run'> | null
 
   constructor(config: ReviewWorkerConfig) {
     this.mrClient = config.mrClient
@@ -559,6 +568,8 @@ export class ReviewWorker {
     this.critic = config.critic ?? null
     this.checkout = config.checkout ?? null
     this.enableCheckout = config.enableCheckout ?? false
+    this.reviewers = config.reviewers ?? [{ id: 'default', primary: true, instructions: '', maxChunks: null }]
+    this.sessionPool = config.sessionPool ?? null
   }
 
   async run(job: ReviewJob, signal?: AbortSignal): Promise<ReviewWorkOutcome> {
@@ -668,17 +679,10 @@ export class ReviewWorker {
     try {
       await this.writeSandbox(ws, job, summary, allFiles, plan.excluded, fileContents, contextOmitted)
 
-      // A workspace can outlive an attempt: removal is best-effort, and
-      // keepFailedWorkspaces preserves it deliberately. createForIssue then
-      // REUSES that directory on the retry, so a findings file from the previous
-      // attempt would still be sitting there — and if this attempt's agent
-      // writes nothing, the worker would read the old document and publish it as
-      // though it were fresh. Clear it first, so anything read afterwards can
-      // only have come from this run. Sweeps BOTH the unchunked name and every
-      // FINDINGS.<n>.json variant: a retry can land on a differently-sized plan
-      // than the attempt before it (5 chunks last time, 2 this time), so a
-      // leftover FINDINGS.3.json from the abandoned attempt has to go too, even
-      // though nothing in THIS run will ever ask for that name again.
+      // A base workspace can outlive an attempt when failure preservation is
+      // enabled. Clear every historical findings-name variant before it is
+      // copied into isolated sessions, so no agent can accidentally inherit an
+      // output from an earlier implementation or attempt.
       await this.clearStaleFindings(ws.path)
 
       // Optional wider-context checkout. Never a prerequisite: a thrown
@@ -701,72 +705,133 @@ export class ReviewWorker {
         }
       }
 
-      const chunkResults: Array<{ chunk: ReviewChunk; findings: FindingsDocument }> = []
-      let chunksFailed = 0
+      const selection = selectReviewers(this.reviewers, chunks.length)
+      const reviewerTasks = planReviewerTasks(selection, chunks)
+      const sessionFactory = new ReviewSessionWorkspaceFactory({
+        root: dirname(ws.path),
+        baseWorkspacePath: ws.path,
+      })
+      const workKey = `${projectId}::${mrIid}::${headSha}`
 
-      if (single) {
-        // THE UNCHANGED PATH. One session, filename FINDINGS.json, the base
-        // (unparameterized) prompt, and — critically — an agent-runner
-        // exception propagates OUT of run() uncaught, exactly as it always
-        // has. Nothing below this branch may change that: several existing
-        // tests assert the promise itself rejects, not that it resolves to a
-        // 'failed' outcome.
-        const chunk = chunks[0]!
-        const findingsFilename = FINDINGS_FILENAME
-        const prompt = (this.promptOverride ?? buildReviewPrompt(ws.path))
-          + buildSessionAddendum({ findingsFilename, chunk: null, hasRepo: checkoutUsed })
-        const target: RunTarget = { id: `${projectId}::${mrIid}::${headSha}`, identifier: workspaceKey, title: summary.title }
+      log.info(
+        {
+          projectId,
+          mrIid,
+          chunkCount: chunks.length,
+          reviewerIds: selection.eligible.map((reviewer) => reviewer.id),
+          skippedReviewerCount: selection.skipped.length,
+          sessionsPlanned: reviewerTasks.length,
+        },
+        'review_worker_fanout_planned',
+      )
 
-        const outcome = await this.runChunkAgent({
-          ws, job, prompt, target, findingsFilename, chunkIndex: null, workspaceKey, signal,
-        })
-        if (!outcome.ok) {
-          return { kind: 'failed', reason: outcome.reason }
-        }
-        chunkResults.push({ chunk, findings: outcome.findings })
-      } else {
-        // THE CHUNKED PATH. Sequential, on purpose (see the module header): a
-        // `for...of` with `await` inside never starts session i+1 before
-        // session i has settled. Any failure mode for one chunk — the runner
-        // throwing, a bad exit, a missing or malformed FINDINGS.<n>.json —
-        // is caught HERE and only counts against chunksFailed; it must never
-        // propagate and take down the chunks that already succeeded.
-        for (const chunk of chunks) {
-          const findingsFilename = `FINDINGS.${chunk.index}.json`
-          const chunkFiles = chunk.files.map((f) => f.newPath || f.oldPath)
-          // BATCH.md is rewritten before each session. The chunks run
-          // sequentially, so exactly one batch manifest is ever current.
-          await this.writeBatchManifest(ws.path, chunk.index, chunks.length, chunkFiles)
-          const prompt = (this.promptOverride ?? buildReviewPrompt(ws.path))
+      const runReviewerTask = async (task: ReviewerTask): Promise<ReviewerTaskResult> => {
+        let sessionWs: Awaited<ReturnType<ReviewSessionWorkspaceFactory['createReviewerWorkspace']>> | null = null
+        let taskSucceeded = false
+        try {
+          sessionWs = await sessionFactory.createReviewerWorkspace({
+            reviewerId: task.reviewer.id,
+            chunkIndex: task.chunk.index,
+            signal,
+          })
+          if (!single) {
+            const chunkFiles = task.chunk.files.map((file) => file.newPath || file.oldPath)
+            await this.writeBatchManifest(sessionWs.path, task.chunk.index, chunks.length, chunkFiles)
+          }
+
+          const findingsFilename = FINDINGS_FILENAME
+          const prompt = (this.promptOverride ?? buildReviewPrompt(sessionWs.path))
+            + buildReviewerAddendum(task.reviewer)
             + buildSessionAddendum({
               findingsFilename,
-              chunk: { index: chunk.index, count: chunks.length },
+              chunk: single ? null : { index: task.chunk.index, count: chunks.length },
               hasRepo: checkoutUsed,
             })
-          const target: RunTarget = {
-            id: `${projectId}::${mrIid}::${headSha}::chunk${chunk.index}`,
-            identifier: `${workspaceKey}-chunk${chunk.index}`,
-            title: summary.title,
-          }
+          const isDefaultSession = single
+            && task.reviewer.id === 'default'
+            && task.reviewer.instructions.length === 0
+          const target: RunTarget = isDefaultSession
+            ? { id: `${projectId}::${mrIid}::${headSha}`, identifier: workspaceKey, title: summary.title }
+            : {
+                id: `${projectId}::${mrIid}::${headSha}::reviewer:${task.reviewer.id}::chunk:${task.chunk.index}`,
+                identifier: `${workspaceKey}-${task.reviewer.id}-chunk${task.chunk.index}`,
+                title: summary.title,
+              }
 
-          try {
-            const outcome = await this.runChunkAgent({
-              ws, job, prompt, target, findingsFilename, chunkIndex: chunk.index, workspaceKey, signal,
-            })
-            if (!outcome.ok) throw new Error(outcome.reason)
-            chunkResults.push({ chunk, findings: outcome.findings })
-          } catch (err) {
-            chunksFailed++
-            log.warn({ projectId, mrIid, chunkIndex: chunk.index, error: errMsg(err) }, 'review_worker_chunk_failed')
+          const outcome = await this.runChunkAgent({
+            ws: sessionWs,
+            job,
+            prompt,
+            target,
+            findingsFilename,
+            chunkIndex: single ? null : task.chunk.index,
+            workspaceKey: sessionWs.workspaceKey,
+            signal,
+          })
+          signal?.throwIfAborted()
+          if (!outcome.ok) throw new Error(outcome.reason)
+          taskSucceeded = true
+          log.info(
+            { projectId, mrIid, reviewerId: task.reviewer.id, chunkIndex: task.chunk.index },
+            'review_worker_session_completed',
+          )
+          return { kind: 'succeeded', task, findings: outcome.findings }
+        } catch (err) {
+          // A controller abort means this review revision is no longer ours to
+          // complete (usually a newer head superseded it). Let that abort
+          // escape the fan-out so ReviewJobRunner can preserve the store's
+          // controller-written superseded state instead of recording an agent
+          // failure over it.
+          if (signal?.aborted) throw signal.reason ?? err
+          log.warn(
+            { projectId, mrIid, reviewerId: task.reviewer.id, chunkIndex: task.chunk.index, error: errMsg(err) },
+            'review_worker_session_failed',
+          )
+          return { kind: 'failed', task, reason: errMsg(err) }
+        } finally {
+          if (sessionWs && (taskSucceeded || !this.keepFailedWorkspaces)) {
+            try {
+              await sessionWs.cleanup()
+            } catch (err) {
+              log.warn(
+                { projectId, mrIid, reviewerId: task.reviewer.id, chunkIndex: task.chunk.index, error: errMsg(err) },
+                'review_worker_session_workspace_cleanup_failed',
+              )
+            }
+          } else if (sessionWs) {
+            log.warn(
+              { projectId, mrIid, reviewerId: task.reviewer.id, chunkIndex: task.chunk.index, path: sessionWs.path },
+              'review_worker_session_workspace_kept_for_inspection',
+            )
           }
-        }
-
-        if (chunkResults.length === 0) {
-          return { kind: 'failed', reason: `all ${chunks.length} chunks failed to produce findings` }
         }
       }
 
-      const mergedFindings: FindingsDocument = single ? chunkResults[0]!.findings : mergeChunkFindings(chunkResults)
+      const reviewerResults = await Promise.all(reviewerTasks.map(async (task) => {
+        if (this.sessionPool) {
+          try {
+            return await this.sessionPool.run(workKey, signal, () => runReviewerTask(task))
+          } catch (err) {
+            if (signal?.aborted) throw signal.reason ?? err
+            return { kind: 'failed', task, reason: errMsg(err) } satisfies ReviewerTaskResult
+          }
+        }
+        return runReviewerTask(task)
+      }))
+      signal?.throwIfAborted()
+
+      const aggregation = aggregateReviewerResults(reviewerTasks, reviewerResults, selection)
+      if (aggregation.provenance.sessionsSucceeded === 0) {
+        const onlyFailure = reviewerResults.length === 1 && reviewerResults[0]!.kind === 'failed'
+          ? reviewerResults[0]!.reason
+          : null
+        return {
+          kind: 'failed',
+          reason: onlyFailure ?? `all ${aggregation.provenance.sessionsPlanned} reviewer sessions failed to produce findings`,
+        }
+      }
+
+      const mergedFindings = aggregation.findings
 
       // Self-critique, on the MERGED findings, after every chunk. Strictly
       // optional and never fatal: no critic configured, a critic returning
@@ -777,9 +842,14 @@ export class ReviewWorker {
       let critiqueOutcome: CritiqueOutcome | null = null
       let finalFindings = mergedFindings
       if (this.critic) {
+        let criticWs: Awaited<ReturnType<ReviewSessionWorkspaceFactory['createCriticWorkspace']>> | null = null
+        let criticSucceeded = false
         try {
-          const critiqueResult = await this.critic.critique({ findings: mergedFindings, workspacePath: ws.path, job }, signal)
+          criticWs = await sessionFactory.createCriticWorkspace({ signal })
+          const critiqueResult = await this.critic.critique({ findings: mergedFindings, workspacePath: criticWs.path, job }, signal)
+          signal?.throwIfAborted()
           if (critiqueResult.kind === 'critiqued') {
+            criticSucceeded = true
             finalFindings = critiqueResult.findings
             critiqueOutcome = critiqueResult.outcome
             log.info(
@@ -790,10 +860,25 @@ export class ReviewWorker {
             log.info({ projectId, mrIid, reason: critiqueResult.reason }, 'review_worker_critique_unavailable')
           }
         } catch (err) {
+          if (signal?.aborted) throw signal.reason ?? err
           log.warn({ projectId, mrIid, error: errMsg(err) }, 'review_worker_critique_threw')
+        } finally {
+          if (criticWs && (criticSucceeded || !this.keepFailedWorkspaces)) {
+            try {
+              await criticWs.cleanup()
+            } catch (err) {
+              log.warn({ projectId, mrIid, error: errMsg(err) }, 'review_worker_critic_workspace_cleanup_failed')
+            }
+          } else if (criticWs) {
+            log.warn({ projectId, mrIid, path: criticWs.path }, 'review_worker_critic_workspace_kept_for_inspection')
+          }
         }
       }
 
+      // Cancellation can arrive while the last session or its workspace
+      // cleanup is settling. A completed findings document is not permission
+      // to publish after the controller has stopped or superseded this job.
+      signal?.throwIfAborted()
       succeeded = true
       return {
         kind: 'reviewed',
@@ -805,10 +890,11 @@ export class ReviewWorker {
         diffFiles: allFiles,
         provenance: {
           chunkCount: chunks.length,
-          chunksFailed,
+          chunksFailed: aggregation.provenance.uncoveredChunkIndexes.length,
           excluded: plan.excluded,
           critique: critiqueOutcome,
           checkoutUsed,
+          fanout: aggregation.provenance,
         },
       }
     } finally {
@@ -835,16 +921,9 @@ export class ReviewWorker {
   }
 
   /**
-   * Runs exactly one agent session for one chunk (or for the whole review, in
-   * the unchunked case) and returns its parsed, validated findings.
-   *
-   * Deliberately does NOT catch `agentRunner.run()` throwing — that exception
-   * is left to propagate to whichever caller invoked this method. The single
-   * (unchunked) branch of `run()` relies on that: it calls this with no
-   * try/catch of its own, so a thrown error surfaces as a rejected `run()`
-   * promise, exactly as it always has. The chunked branch wraps ITS OWN call
-   * to this method in a try/catch, which is where that propagation is turned
-   * into a per-chunk failure instead.
+   * Runs one isolated reviewer session and returns parsed, validated findings.
+   * Runner errors intentionally propagate to the fan-out task wrapper, which
+   * records them as per-session failures without discarding other results.
    */
   private async runChunkAgent(args: {
     ws: Workspace
