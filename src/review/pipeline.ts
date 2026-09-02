@@ -17,7 +17,19 @@
 
 import { ReviewPublisher } from './publisher.js'
 import { GitLabMergeRequestClient } from './gitlab_mr.js'
+import { ReviewSessionPool } from './session_pool.js'
 import type { ReviewConfig } from '../config.js'
+
+/**
+ * Builds the one process-wide limiter shared by reviewer and critic sessions.
+ * Keeping this at the deployment seam makes max_parallel_review_agents
+ * behaviorally testable without importing main.ts (which boots the CLI).
+ */
+export function buildReviewSessionPool(
+  config: Pick<ReviewConfig, 'maxParallelReviewAgents'>,
+): ReviewSessionPool {
+  return new ReviewSessionPool(config.maxParallelReviewAgents)
+}
 
 /**
  * The line that decides whether inline discussions happen at all.

@@ -1,6 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
@@ -429,6 +438,29 @@ describe('size and file ceilings', () => {
   it('default ceilings are sane positive numbers', () => {
     expect(DEFAULT_MAX_CHECKOUT_BYTES).toBeGreaterThan(0)
     expect(DEFAULT_MAX_CHECKOUT_FILES).toBeGreaterThan(0)
+  })
+})
+
+describe('isolated-workspace compatibility', () => {
+  it('treats a tracked symlink as unavailable context instead of failing reviewer sessions later', async () => {
+    gitFixture(repoDir())
+    symlinkSync('a.txt', join(repoDir(), 'a-link'))
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
+    }
+    execFileSync('git', ['add', 'a-link'], { cwd: repoDir(), env })
+    execFileSync('git', ['commit', '--quiet', '-m', 'add symlink'], { cwd: repoDir(), env })
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir(), env }).toString().trim()
+    const destination = join(sandboxRoot, 'work')
+
+    const result = await checkout().fetch({ projectId: 'repo', headSha: sha, destination })
+
+    expect(result.kind).toBe('unavailable')
+    if (result.kind !== 'unavailable') throw new Error('unreachable')
+    expect(result.reason).toMatch(/symbolic link/i)
+    expect(existsSync(destination)).toBe(false)
   })
 })
 

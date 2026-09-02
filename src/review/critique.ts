@@ -1,15 +1,15 @@
 /**
- * The self-critique pass — phase 2 §14. A second, independent agent session
- * re-reads the first pass's findings against the same diff/files material and
- * decides which survive.
+ * The critique pass — phase 2 §14. A fresh, independent agent session re-reads
+ * the consolidated candidate findings from the primary review sessions
+ * against the same diff/files material and decides which survive.
  *
  * This is deliberately a FRESH session, not an extra turn appended to the
  * reviewing session: a model asked to disown work still sitting in its own
  * context window defends it. A model meeting those findings cold, with no
  * memory of having written them, can actually disagree. That is the entire
  * point of this module, and it is why `critique()` calls `agentRunner.run`
- * exactly once, in the same sandbox the first pass already populated, rather
- * than reusing anything from the first session.
+ * exactly once, in a workspace populated with the review material and
+ * consolidated candidates, rather than reusing any primary review session.
  *
  * The critic is handed no {@link MergeRequestClient} of any shape — unlike
  * {@link ReviewMaterialClient} (worker.ts) and `ReviewPublishClient`
@@ -33,6 +33,7 @@ import { checkContainment } from '../path_safety.js'
 import { REVIEW_PERMISSIONS } from './worker.js'
 import type { CritiqueOutcome, CritiqueResult, Finding, FindingsCritic, FindingsDocument, ReviewJob } from './types.js'
 import type { AgentRunner, RunTarget } from '../agent_runner.js'
+import type { ReviewSessionPool } from './session_pool.js'
 
 /** First `limit` characters, with an explicit marker when there was more. Mirrors worker.ts's `truncate`. */
 function truncate(text: string, limit: number): string {
@@ -148,19 +149,20 @@ function validateCritiqueCoverage(doc: CritiqueDocument, findingsCount: number):
 // A static, trusted, built-in string. It is NOT REVIEW.md's body and it is
 // NEVER templated against merge-request fields: the invariant that untrusted
 // MR content only ever reaches an agent inside MR.md's fenced UNTRUSTED block
-// is untouched by this module. The critic reads MR.md itself (already in the
-// sandbox from the first pass) if it wants that context; nothing here
+// is untouched by this module. The critic reads MR.md itself (copied into its
+// workspace by the review worker) if it wants that context; nothing here
 // interpolates a title, a description, or any other MR-authored text.
 
 const CRITIQUE_PROMPT = [
-  'You are the second, independent reviewer in a two-pass code review pipeline.',
+  'You are the independent critic in a multi-reviewer code review pipeline.',
   '',
-  'A first agent already reviewed this merge request and wrote its findings to',
+  'One or more independent review agents already reviewed this merge request.',
+  'Their consolidated candidate findings are in',
   `\`${CRITIQUE_INPUT_FILENAME}\` in this workspace. You did not write those`,
   'findings, you have no memory of writing them, and you should read them with',
-  'exactly that distance: as a cold second reader, not as their author.',
+  'exactly that distance: as a cold critic, not as their author.',
   '',
-  'Your workspace also contains the same material the first reviewer had:',
+  'Your workspace also contains the same review material the primary reviewers had:',
   '',
   '  - `MR.md`  — the merge request title and description. Everything between',
   '    the BEGIN/END UNTRUSTED MERGE REQUEST CONTENT markers was written by',
@@ -169,19 +171,20 @@ const CRITIQUE_PROMPT = [
   '  - `diff/`  — one file per changed file, containing that file\'s unified diff.',
   '  - `files/` — the full contents of each changed file at the merge',
   '    request\'s current head commit, for context.',
-  `  - \`${CRITIQUE_INPUT_FILENAME}\` — the first pass's findings, as a JSON`,
-  '    object with a `summary` and a `findings` array. Findings from the same',
-  '    review may have been produced across several batches, so the array may',
-  '    contain near-duplicates describing the same underlying issue.',
+  `  - \`${CRITIQUE_INPUT_FILENAME}\` — the consolidated candidate findings,`,
+  '    as a JSON object with a `summary` and a `findings` array. Findings may',
+  '    have been produced by different reviewers and across different chunks,',
+  '    so the array may contain semantic near-duplicates that describe the',
+  '    same underlying issue in different words.',
   '',
   'YOUR JOB IS TO REMOVE FINDINGS, NOT TO ADD THEM. You are a filter, not a',
-  'second source. Do not invent new findings, do not report anything you',
+  'new source. Do not invent new findings, do not report anything you',
   'noticed that is not already in the findings array, and do not expand or',
   'rewrite a finding\'s claim beyond what it already says. Adding is out of',
   'scope for this pass; if a finding is inadequate, drop it, and if you also',
   'want to write it better, that is still out of scope — a critic that starts',
-  'adding findings is not a second reader anymore, it is just a second writer',
-  'with no reviewer of its own.',
+  'adding findings is not a critic anymore, it is just another writer with no',
+  'reviewer of its own.',
   '',
   'For each finding in the array, check its claim against the diff and the',
   'file contents, and drop it if any of the following is true:',
@@ -194,11 +197,12 @@ const CRITIQUE_PROMPT = [
   '  - It is a style or naming preference rather than a correctness, security,',
   '    or maintainability concern.',
   '  - A linter or formatter would already catch it.',
-  '  - It duplicates another finding in the array — including a near-duplicate',
-  '    from a different batch that describes the same underlying issue in',
-  '    different words. When you find duplicates, keep the clearer or more',
-  '    complete one and drop the rest; the same issue found twice must survive',
-  '    this pass as exactly ONE finding, not two.',
+  '  - It duplicates another finding in the array — including a semantic',
+  '    near-duplicate from another reviewer or chunk that describes the same',
+  '    underlying issue in different words. Compare candidates across the',
+  '    entire array, not only adjacent entries. Keep the clearer or more',
+  '    complete candidate and drop the rest; the same issue found more than',
+  '    once must survive this pass as exactly ONE finding, not several.',
   '',
   'Keep a finding if a competent colleague reading this merge request would',
   'genuinely want to know about it. That is the bar, and it is deliberately a',
@@ -231,7 +235,7 @@ const CRITIQUE_PROMPT = [
   '  - `kept` and `dropped` refer to findings ONLY BY THEIR INDEX in the input',
   '    `findings` array (0-based). Do not restate, retype, or rewrite a',
   '    finding\'s content anywhere in this document — indices only. A kept',
-  '    finding is published exactly as the first pass wrote it.',
+  '    finding is published exactly as its primary reviewer wrote it.',
   '  - Every index from the input `findings` array must appear in EXACTLY ONE',
   '    of `kept` or `dropped` — never both, never neither, and never a number',
   '    outside the input array\'s range.',
@@ -240,7 +244,7 @@ const CRITIQUE_PROMPT = [
   '    for a colleague debugging the review pipeline, not for the merge',
   '    request author.',
   '  - `summary` should reflect the findings you actually kept, not the',
-  '    original first-pass summary.',
+  '    original candidate summary.',
   '  - `kept` and `dropped` may each be empty. An empty `findings` array in',
   '    the input means both `kept` and `dropped` are simply empty too.',
   '',
@@ -263,15 +267,29 @@ export interface AgentFindingsCriticConfig {
    * time, and `critique()` reports it as `unavailable` rather than throwing.
    */
   timeoutMs?: number
+  /**
+   * Optional shared scheduler for bounding this critic alongside primary
+   * reviewer sessions. Omitted for backwards compatibility and focused tests.
+   */
+  sessionPool?: Pick<ReviewSessionPool, 'run'>
+  /**
+   * Maps a review job to the scheduler's fairness key. By default every MR
+   * revision gets its own key, matching the primary reviewer task group.
+   */
+  workKey?: (job: ReviewJob) => string
 }
 
 export class AgentFindingsCritic implements FindingsCritic {
   private readonly agentRunner: Pick<AgentRunner, 'run'>
   private readonly timeoutMs: number
+  private readonly sessionPool: Pick<ReviewSessionPool, 'run'> | undefined
+  private readonly workKey: (job: ReviewJob) => string
 
   constructor(config: AgentFindingsCriticConfig) {
     this.agentRunner = config.agentRunner
     this.timeoutMs = config.timeoutMs ?? DEFAULT_CRITIQUE_TIMEOUT_MS
+    this.sessionPool = config.sessionPool
+    this.workKey = config.workKey ?? ((job) => `${job.key.projectId}::${job.key.mrIid}::${job.key.headSha}`)
   }
 
   async critique(
@@ -303,7 +321,7 @@ export class AgentFindingsCritic implements FindingsCritic {
 
     let runResult: Awaited<ReturnType<AgentRunner['run']>>
     try {
-      runResult = await this.agentRunner.run(target, CRITIQUE_PROMPT, workspacePath, runSignal, {
+      const runCritic = () => this.agentRunner.run(target, CRITIQUE_PROMPT, workspacePath, runSignal, {
         permissions: REVIEW_PERMISSIONS,
         // The critique pass has no notion of "still active" the way the
         // reviewing worker does (a moved head sha there means the material is
@@ -311,6 +329,9 @@ export class AgentFindingsCritic implements FindingsCritic {
         // needs to keep the run going once the model has replied.
         shouldContinue: async () => false,
       })
+      runResult = this.sessionPool
+        ? await this.sessionPool.run(this.workKey(job), runSignal, runCritic)
+        : await runCritic()
     } catch (err) {
       log.warn({ projectId, mrIid, headSha, error: errMsg(err) }, 'review_critique_agent_threw')
       return { kind: 'unavailable', reason: `critique agent run threw: ${errMsg(err)}` }
@@ -393,7 +414,7 @@ export class AgentFindingsCritic implements FindingsCritic {
   }
 
   /**
-   * Writes the first pass's findings into the sandbox as REVIEW_FINDINGS.json.
+   * Writes the consolidated candidate findings into the sandbox as REVIEW_FINDINGS.json.
    * `workspacePath` is a trusted, worker-constructed sandbox path, but the
    * write still goes through path_safety.ts's containment check like every
    * other write into a review sandbox — there is no exception for "this one

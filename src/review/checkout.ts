@@ -40,7 +40,7 @@
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -392,10 +392,18 @@ export class GitShallowCheckout implements RepoCheckout {
           stack.push(full)
           continue
         }
-        // Symlinks and regular files are both counted by their own lstat
-        // size — a symlink is never followed, so it cannot be used to make
-        // this walk see bytes that live outside the checkout.
-        const st = await stat(full).catch(() => null)
+        // Session isolation deliberately refuses links instead of following
+        // or reproducing them: a committed absolute link (or a relative one
+        // that escapes the repository) would otherwise let the review agent
+        // read outside its copied workspace. Checkout context is optional, so
+        // a repository containing any link degrades to the ordinary diff-only
+        // review rather than making every reviewer session fail later.
+        const st = await lstat(full).catch(() => null)
+        if (st?.isSymbolicLink()) {
+          throw new CheckoutAbandoned(
+            'checkout contains a symbolic link and cannot be copied into isolated review workspaces',
+          )
+        }
         bytes += st?.size ?? 0
         files += 1
         if (files > this.maxFiles || bytes > this.maxBytes) return { bytes, files }

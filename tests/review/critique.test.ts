@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'no
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { AgentFindingsCritic } from '../../src/review/critique.js'
+import { ReviewSessionPool } from '../../src/review/session_pool.js'
 import { AgentRunner } from '../../src/agent_runner.js'
 import { REVIEW_PERMISSIONS } from '../../src/review/worker.js'
 import { IMPLEMENTATION_PERMISSIONS } from '../../src/agent_runner.js'
@@ -96,10 +97,17 @@ function agentWritingCritique(critiqueJson: unknown) {
   return { run: runFn, promptCalls, permissionCalls }
 }
 
-function critic(overrides: Partial<{ agentRunner: Pick<AgentRunner, 'run'>; timeoutMs: number }> = {}) {
+function critic(overrides: Partial<{
+  agentRunner: Pick<AgentRunner, 'run'>
+  timeoutMs: number
+  sessionPool: ReviewSessionPool
+  workKey: (job: ReviewJob) => string
+}> = {}) {
   return new AgentFindingsCritic({
     agentRunner: overrides.agentRunner ?? agentWritingCritique({ kept: [], dropped: [], summary: 'n/a' }),
     ...(overrides.timeoutMs !== undefined ? { timeoutMs: overrides.timeoutMs } : {}),
+    ...(overrides.sessionPool !== undefined ? { sessionPool: overrides.sessionPool } : {}),
+    ...(overrides.workKey !== undefined ? { workKey: overrides.workKey } : {}),
   })
 }
 
@@ -239,10 +247,55 @@ describe('AgentFindingsCritic — keeping a subset', () => {
     if (result.kind !== 'critiqued') throw new Error('unreachable')
     expect(result.outcome.ran).toBe(true)
   })
+
+  it('keeps one byte-identical candidate when independent reviewers report the same issue', async () => {
+    const duplicateFromGeneral = finding({
+      title: 'Retry can publish stale findings',
+      detail: 'The head is not checked after the reviewer finishes.',
+    })
+    const clearerDuplicateFromReliability = finding({
+      title: 'Head movement during review can publish stale findings',
+      detail: 'Re-fetch the merge request head after all reviewer sessions settle and before publication.',
+    })
+    const findings: FindingsDocument = {
+      summary: 'Candidates from the general and reliability reviewers.',
+      findings: [duplicateFromGeneral, clearerDuplicateFromReliability],
+    }
+    const agent = agentWritingCritique({
+      kept: [1],
+      dropped: [{ index: 0, reason: 'Semantic duplicate; index 1 states the same issue more clearly.' }],
+      summary: 'One unique issue remains.',
+    })
+
+    const result = await critic({ agentRunner: agent }).critique({ findings, workspacePath: ws, job: job() })
+
+    expect(result.kind).toBe('critiqued')
+    if (result.kind !== 'critiqued') throw new Error('unreachable')
+    expect(result.findings.findings).toEqual([clearerDuplicateFromReliability])
+    expect(result.findings.findings[0]).toBe(clearerDuplicateFromReliability)
+    expect(result.outcome.dropped[0]?.reason).toContain('Semantic duplicate')
+  })
+
+  it('preserves distinct candidates on the same line from different reviewers', async () => {
+    const findings: FindingsDocument = {
+      summary: 'Two independent concerns at one call site.',
+      findings: [
+        finding({ title: 'Authorization is skipped', line: 42, detail: 'The handler calls the service before checking access.' }),
+        finding({ title: 'Failure is not retried', line: 42, detail: 'A transient upstream failure is returned immediately.' }),
+      ],
+    }
+    const agent = agentWritingCritique({ kept: [0, 1], dropped: [], summary: 'Both distinct issues remain.' })
+
+    const result = await critic({ agentRunner: agent }).critique({ findings, workspacePath: ws, job: job() })
+
+    expect(result.kind).toBe('critiqued')
+    if (result.kind !== 'critiqued') throw new Error('unreachable')
+    expect(result.findings.findings).toEqual(findings.findings)
+  })
 })
 
 describe('AgentFindingsCritic — REVIEW_FINDINGS.json is written into the sandbox', () => {
-  it('writes the first pass findings as REVIEW_FINDINGS.json before running the agent', async () => {
+  it('writes the consolidated candidate findings as REVIEW_FINDINGS.json before running the agent', async () => {
     const findings = fiveFindings()
     let seenAtRunTime: string | null = null
     const agent = {
@@ -401,6 +454,75 @@ describe('AgentFindingsCritic — failure is never fatal', () => {
   }, 5000)
 })
 
+describe('AgentFindingsCritic — shared session scheduling', () => {
+  it('waits for a shared slot and uses the configured MR work key', async () => {
+    const pool = new ReviewSessionPool(1)
+    const blockerController = new AbortController()
+    let releaseBlocker!: () => void
+    const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve })
+    const blocker = pool.run('another-mr', blockerController.signal, () => blockerGate)
+    const agent = agentWritingCritique({ kept: [0, 1, 2, 3, 4], dropped: [], summary: 'kept all' })
+    const workKey = vi.fn(() => 'my-org/service-a::412::deadbeef00cafe11')
+    const resultPromise = critic({ agentRunner: agent, sessionPool: pool, workKey })
+      .critique({ findings: fiveFindings(), workspacePath: ws, job: job() })
+
+    await vi.waitFor(() => {
+      expect(pool.runningCount).toBe(1)
+      expect(pool.queuedCountFor('my-org/service-a::412::deadbeef00cafe11')).toBe(1)
+    })
+    expect(agent.run).not.toHaveBeenCalled()
+
+    releaseBlocker()
+    await blocker
+    const result = await resultPromise
+
+    expect(result.kind).toBe('critiqued')
+    expect(agent.run).toHaveBeenCalledTimes(1)
+    expect(workKey).toHaveBeenCalledWith(expect.objectContaining({ key: key() }))
+    expect(pool.runningCount).toBe(0)
+    expect(pool.queuedCount).toBe(0)
+  })
+
+  it('returns unavailable when an externally aborted critique is queued and never starts its agent', async () => {
+    const pool = new ReviewSessionPool(1)
+    const blockerController = new AbortController()
+    let releaseBlocker!: () => void
+    const blockerGate = new Promise<void>((resolve) => { releaseBlocker = resolve })
+    const blocker = pool.run('another-mr', blockerController.signal, () => blockerGate)
+    const agent = agentWritingCritique({ kept: [0, 1, 2, 3, 4], dropped: [], summary: 'kept all' })
+    const abortController = new AbortController()
+    const resultPromise = critic({ agentRunner: agent, sessionPool: pool, timeoutMs: 5_000 })
+      .critique({ findings: fiveFindings(), workspacePath: ws, job: job() }, abortController.signal)
+
+    await vi.waitFor(() => expect(pool.queuedCount).toBe(1))
+    abortController.abort(new Error('review head moved'))
+    const result = await resultPromise
+
+    expect(result.kind).toBe('unavailable')
+    if (result.kind === 'unavailable') expect(result.reason).toContain('review head moved')
+    expect(agent.run).not.toHaveBeenCalled()
+    expect(pool.queuedCount).toBe(0)
+    expect(pool.runningCount).toBe(1)
+
+    releaseBlocker()
+    await blocker
+    expect(pool.runningCount).toBe(0)
+  })
+
+  it('releases its shared slot when the critic agent throws', async () => {
+    const pool = new ReviewSessionPool(1)
+    const agent = { run: vi.fn(async () => { throw new Error('critic crashed') }) }
+
+    const result = await critic({ agentRunner: agent, sessionPool: pool })
+      .critique({ findings: fiveFindings(), workspacePath: ws, job: job() })
+
+    expect(result.kind).toBe('unavailable')
+    expect(pool.runningCount).toBe(0)
+    await expect(pool.run('next-review', new AbortController().signal, async () => 42)).resolves.toBe(42)
+    expect(pool.runningCount).toBe(0)
+  })
+})
+
 describe('AgentFindingsCritic — no MR-authored text in the prompt', () => {
   it('the prompt passed to run() contains no merge-request title or description text', async () => {
     const findings = fiveFindings()
@@ -437,6 +559,17 @@ describe('AgentFindingsCritic — no MR-authored text in the prompt', () => {
     await c.critique({ findings, workspacePath: ws, job: job() })
 
     expect(agent.promptCalls[0]).toMatch(/not to add/i)
+  })
+
+  it('the prompt directs semantic deduplication across independent reviewers and chunks', async () => {
+    const findings = fiveFindings()
+    const agent = agentWritingCritique({ kept: [0, 1, 2, 3, 4], dropped: [], summary: 's' })
+
+    await critic({ agentRunner: agent }).critique({ findings, workspacePath: ws, job: job() })
+
+    expect(agent.promptCalls[0]).toMatch(/different reviewers and across different chunks/i)
+    expect(agent.promptCalls[0]).toMatch(/semantic\s+near-duplicate/i)
+    expect(agent.promptCalls[0]).toMatch(/exactly ONE finding/i)
   })
 })
 

@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { readFile } from 'node:fs/promises'
-import { buildReviewMergeRequestClient, buildReviewPublisher } from '../../src/review/pipeline.js'
+import {
+  buildReviewMergeRequestClient,
+  buildReviewPublisher,
+  buildReviewSessionPool,
+} from '../../src/review/pipeline.js'
 import type { DiscussionPosition, FindingsDocument, MergeRequestClient, MergeRequestDiffFile, MergeRequestDiscussionClient, ReviewJob } from '../../src/review/types.js'
 
 /**
@@ -52,7 +56,6 @@ function fakeClient() {
     getCurrentUserId: async () => 'self',
     listDiscussions: async () => [],
     createDiscussion: async (_p, _i, _b, position) => { created.push(position); return 'disc-1' },
-    replyToDiscussion: async () => 'r1',
     resolveDiscussion: async () => true,
   }
   return { client, created }
@@ -99,6 +102,19 @@ describe('deployment wiring — main.ts actually calls the factory', () => {
     expect(source).not.toContain('new ReviewPublisher(')
     expect(source).toContain('buildReviewMergeRequestClient(config,')
     expect(source).not.toContain('new GitLabMergeRequestClient(')
+
+    // Fan-out capacity is process-wide, not one limiter per active MR. The
+    // same instance must reach both primary reviewer work and the critic or
+    // either side can silently exceed max_parallel_review_agents.
+    expect(source).toContain('buildReviewSessionPool(config)')
+    expect(source.match(/sessionPool: reviewSessionPool/g)).toHaveLength(2)
+    expect(source).toContain('reviewers: config.reviewers')
+  })
+})
+
+describe('deployment wiring — max_parallel_review_agents reaches the shared pool', () => {
+  it('constructs the pool with the configured process-wide capacity', () => {
+    expect(buildReviewSessionPool({ maxParallelReviewAgents: 7 }).maxConcurrency).toBe(7)
   })
 })
 

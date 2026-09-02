@@ -1,6 +1,6 @@
 /**
  * SLICE C: inline discussion publishing — placement, escaping, dedup across
- * re-reviews, supersession of prior-revision threads, and the fallback into
+ * re-reviews, cleanup of prior-revision threads, and the fallback into
  * the summary note.
  *
  * Kept separate from publisher.test.ts (which SLICE C must not touch — its
@@ -155,14 +155,13 @@ interface FakeCalls {
   createNote: string[]
   listDiscussions: number
   createDiscussion: Array<{ body: string; position: DiscussionPosition }>
-  replyToDiscussion: Array<{ discussionId: string; body: string }>
   resolveDiscussion: Array<{ discussionId: string }>
   callOrder: string[]
 }
 
 /**
  * A fake implementing the FULL {@link ReviewPublishClient} surface — the read
- * methods AND all four discussion operations — so `inlineComments: true`
+ * methods AND all three discussion operations — so `inlineComments: true`
  * always finds a client it can use.
  */
 function fakeInlineClient(
@@ -173,7 +172,6 @@ function fakeInlineClient(
     selfUserId?: string | null
     /** Return true to make this create call throw instead of succeeding. */
     createShouldThrow?: (body: string, position: DiscussionPosition) => boolean
-    replyShouldThrow?: (discussionId: string) => boolean
     resolveShouldThrow?: (discussionId: string) => boolean
     resolveResult?: (discussionId: string) => boolean
     /** Injected into thrown errors, to prove it never reaches a log line. */
@@ -198,7 +196,6 @@ function fakeInlineClient(
     createNote: [],
     listDiscussions: 0,
     createDiscussion: [],
-    replyToDiscussion: [],
     resolveDiscussion: [],
     callOrder: [],
   }
@@ -256,16 +253,6 @@ function fakeInlineClient(
       discussions.push({ id, resolvable: true, resolved: false, notes: [{ id: `${id}-n1`, body, authorId: selfUserId }] })
       return id
     },
-    async replyToDiscussion(_p: string, _i: number, discussionId: string, body: string) {
-      calls.replyToDiscussion.push({ discussionId, body })
-      calls.callOrder.push('replyToDiscussion')
-      if (opts.replyShouldThrow?.(discussionId)) {
-        throw Object.assign(new Error(`reply failed${opts.hostilePayload ? `: ${opts.hostilePayload}` : ''}`), {
-          status: 500,
-        })
-      }
-      return `${discussionId}-reply`
-    },
     async resolveDiscussion(_p: string, _i: number, discussionId: string) {
       calls.resolveDiscussion.push({ discussionId })
       calls.callOrder.push('resolveDiscussion')
@@ -318,7 +305,6 @@ describe('inline comments OFF — byte-identical to today', () => {
     for (const c of [clientDefault, clientExplicit]) {
       expect(c.calls.listDiscussions).toBe(0)
       expect(c.calls.createDiscussion).toHaveLength(0)
-      expect(c.calls.replyToDiscussion).toHaveLength(0)
       expect(c.calls.resolveDiscussion).toHaveLength(0)
       expect(c.calls.createNote).toHaveLength(1)
     }
@@ -511,7 +497,7 @@ describe('inline comments ON — dedup against our own existing threads', () => 
     }
   })
 
-  it('a DIFFERENT headSha with the same fingerprint gets a new thread at this head, and the old one gets a reply', async () => {
+  it('a DIFFERENT headSha with the same fingerprint gets a new thread and directly resolves the old one without posting a reply', async () => {
     const finding = placeableFinding()
     const fp = threadFingerprint(finding, 0)
     const oldMarker = inlineThreadMarker('an-older-sha', fp)
@@ -528,15 +514,14 @@ describe('inline comments ON — dedup against our own existing threads', () => 
 
     expect(client.calls.createDiscussion).toHaveLength(1)
     expect(p.inline.placed).toBe(1)
-    expect(client.calls.replyToDiscussion).toHaveLength(1)
-    expect(client.calls.replyToDiscussion[0]!.discussionId).toBe('old-thread')
-    expect(client.calls.replyToDiscussion[0]!.body).toContain('head-sha-1')
-    expect(p.inline.superseded).toBe(1)
-    expect(p.inline.resolved).toBe(1)
+    expect(p.inline.priorRevisionThreads).toBe(1)
+    expect(p.inline.priorRevisionThreadsResolved).toBe(1)
     expect(client.calls.resolveDiscussion).toHaveLength(1)
+    expect(client.calls.resolveDiscussion[0]!.discussionId).toBe('old-thread')
+    expect(client.calls.callOrder).toEqual(['createDiscussion', 'createNote', 'resolveDiscussion'])
   })
 
-  it('resolveDiscussion returning false leaves the reply posted, the publish successful, resolved at zero, superseded counting it', async () => {
+  it('resolveDiscussion returning false leaves the old thread untouched and the publish successful without a fallback comment', async () => {
     const finding = placeableFinding()
     const fp = threadFingerprint(finding, 0)
     const oldMarker = inlineThreadMarker('an-older-sha', fp)
@@ -552,9 +537,11 @@ describe('inline comments ON — dedup against our own existing threads', () => 
     })
     const p = asPublished(result)
 
-    expect(client.calls.replyToDiscussion).toHaveLength(1)
-    expect(p.inline.superseded).toBe(1)
-    expect(p.inline.resolved).toBe(0)
+    expect(client.calls.createNote).toHaveLength(1)
+    expect(client.calls.callOrder).toEqual(['createDiscussion', 'createNote', 'resolveDiscussion'])
+    expect(p.inline.priorRevisionThreads).toBe(1)
+    expect(p.inline.priorRevisionThreadsResolved).toBe(0)
+    expect(client.calls.resolveDiscussion).toEqual([{ discussionId: 'old-thread' }])
   })
 
   it('two findings sharing (file, lineType, title) get DIFFERENT fingerprints, and therefore two threads', async () => {
@@ -615,7 +602,6 @@ describe('inline comments ON — earlier steps still short-circuit before any di
     expect(result.status).toBe('superseded')
     expect(client.calls.listDiscussions).toBe(0)
     expect(client.calls.createDiscussion).toHaveLength(0)
-    expect(client.calls.replyToDiscussion).toHaveLength(0)
     expect(client.calls.resolveDiscussion).toHaveLength(0)
   })
 
@@ -632,7 +618,6 @@ describe('inline comments ON — earlier steps still short-circuit before any di
     expect(result.status).toBe('already_published')
     expect(client.calls.listDiscussions).toBe(0)
     expect(client.calls.createDiscussion).toHaveLength(0)
-    expect(client.calls.replyToDiscussion).toHaveLength(0)
     expect(client.calls.resolveDiscussion).toHaveLength(0)
   })
 })
@@ -664,7 +649,7 @@ describe('inline comments ON — discussions are created sequentially, in severi
 })
 
 describe('inline comments ON — nothing sensitive ever reaches a log line', () => {
-  it('a create failure, a reply failure and a resolve failure never leak a message or body into a log', async () => {
+  it('a create failure and a resolve failure never leak a message or body into a log', async () => {
     const secret = 'PRIVATE-TOKEN-abc123-<html>leaked response body</html>'
     const logged: Array<Record<string, unknown>> = []
     const spy = vi.spyOn(getLogger(), 'warn').mockImplementation(((obj: unknown) => {
@@ -679,7 +664,7 @@ describe('inline comments ON — nothing sensitive ever reaches a log line', () 
       const client = fakeInlineClient({
         discussions: [{ id: 'old-thread', resolvable: true, resolved: false, notes: [{ id: 'n1', body: `${oldMarker}\nold`, authorId: 'self' }] }],
         createShouldThrow: () => true,
-        replyShouldThrow: () => true,
+        resolveShouldThrow: () => true,
         hostilePayload: secret,
       })
 
@@ -705,11 +690,11 @@ describe('inline comments ON — nothing sensitive ever reaches a log line', () 
   })
 })
 
-describe('inline comments ON — supersession is logged, after it has actually happened', () => {
-  it('logs review_inline_superseded with the counts, and resolvePermitted false on a 403', async () => {
+describe('inline comments ON — prior-revision cleanup is logged after it has actually happened', () => {
+  it('logs review_inline_prior_revision_cleanup with the counts, and resolvePermitted false on a 403', async () => {
     // The counts live in step 7, which runs AFTER review_published is logged —
     // so logging them there reported nothing while looking like it reported
-    // something. A real run superseded four threads and the only evidence in
+    // something. A real run encountered four threads and the only evidence in
     // the log was four WARN lines about refused resolves; had the resolves
     // SUCCEEDED there would have been no evidence at all.
     const info = vi.spyOn(getLogger(), 'info')
@@ -732,9 +717,13 @@ describe('inline comments ON — supersession is logged, after it has actually h
       diffFiles,
     })
 
-    const call = info.mock.calls.find((c) => c[1] === 'review_inline_superseded')
+    const call = info.mock.calls.find((c) => c[1] === 'review_inline_prior_revision_cleanup')
     expect(call).toBeDefined()
-    expect(call![0]).toMatchObject({ superseded: 1, resolved: 0, resolvePermitted: false })
+    expect(call![0]).toMatchObject({
+      priorRevisionThreads: 1,
+      priorRevisionThreadsResolved: 0,
+      resolvePermitted: false,
+    })
     info.mockRestore()
   })
 
@@ -748,7 +737,7 @@ describe('inline comments ON — supersession is logged, after it has actually h
       diffFiles,
     })
 
-    expect(info.mock.calls.find((c) => c[1] === 'review_inline_superseded')).toBeUndefined()
+    expect(info.mock.calls.find((c) => c[1] === 'review_inline_prior_revision_cleanup')).toBeUndefined()
     info.mockRestore()
   })
 })

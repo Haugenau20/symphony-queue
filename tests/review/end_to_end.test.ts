@@ -23,6 +23,8 @@ import { ReviewJobRunner } from '../../src/review/job_runner.js'
 import { ReviewController } from '../../src/review/controller.js'
 import { ConcurrencyGate } from '../../src/concurrency.js'
 import { WorkspaceManager } from '../../src/workspace.js'
+import { ReviewSessionPool } from '../../src/review/session_pool.js'
+import type { ReviewReviewerConfig } from '../../src/config.js'
 import type {
   MergeRequestClient,
   MergeRequestSummary,
@@ -64,7 +66,12 @@ function diffFile(over: Partial<MergeRequestDiffFile> = {}): MergeRequestDiffFil
 }
 
 /** Records every write attempt so the test can assert on what reached "GitLab". */
-function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequestDiffFile[]; headAt?: () => string } = {}) {
+function fakeGitLab(opts: {
+  summaries?: MergeRequestSummary[]
+  diffs?: MergeRequestDiffFile[]
+  headAt?: () => string
+  failStartNote?: boolean
+} = {}) {
   const notes: Array<{ id: string; body: string; authorId: string | null }> = []
   const posted: string[] = []
   const discussions: Array<{ id: string; body: string }> = []
@@ -79,6 +86,7 @@ function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequ
     listNotes: async () => notes,
     getCurrentUserId: async () => 'self',
     createNote: async (_p, _i, body) => {
+      if (opts.failStartNote && posted.length === 0) throw new Error('GitLab note transport failed')
       posted.push(body)
       const id = `note-${notes.length + 1}`
       notes.push({ id, body, authorId: 'self' })
@@ -94,7 +102,6 @@ function fakeGitLab(opts: { summaries?: MergeRequestSummary[]; diffs?: MergeRequ
       discussions.push({ id, body })
       return id
     },
-    replyToDiscussion: async () => 'reply-1',
     resolveDiscussion: async () => true,
   }
   return { client, notes, posted, discussions }
@@ -151,13 +158,13 @@ function directJob(overrides: Partial<ReviewJob> = {}): ReviewJob {
   }
 }
 
-/** Fake agent for a CHUNKED plan: writes FINDINGS.<call index>.json, matching chunk order. */
+/** Fake agent for a CHUNKED plan: every isolated session owns its standard FINDINGS.json. */
 function fakeChunkedAgent(findingsByIndex: unknown[]) {
   let call = 0
   return {
     run: async (_t: unknown, _p: string, wsPath?: string | null) => {
       const idx = call++
-      if (wsPath) writeFileSync(join(wsPath, `FINDINGS.${idx}.json`), JSON.stringify(findingsByIndex[idx]), 'utf8')
+      if (wsPath) writeFileSync(join(wsPath, 'FINDINGS.json'), JSON.stringify(findingsByIndex[idx]), 'utf8')
       return { sessionId: `s${idx}`, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
     },
   }
@@ -178,20 +185,24 @@ async function settle(): Promise<void> {
 }
 
 describe('review pipeline end to end', () => {
-  it('discovers an MR, reviews it, and publishes exactly one note carrying the head-sha marker', async () => {
+  it('discovers an MR, announces it once, and publishes exactly one final note carrying the head-sha marker', async () => {
     const gl = fakeGitLab()
     const { store, controller } = pipeline(gl, fakeAgent(goodFindings))
 
     await controller.poll()
     await settle()
 
-    expect(gl.posted).toHaveLength(1)
-    expect(gl.posted[0]).toContain('<!-- symphony-review:head1 -->')
-    expect(gl.posted[0]).toContain('Unbounded retry backoff')
+    expect(gl.posted).toHaveLength(2)
+    expect(gl.posted[0]).toContain('Symphony review started.')
+    expect(gl.posted[0]).toContain('<!-- symphony-review-started:head1 -->')
+    expect(gl.posted[1]).toContain('<!-- symphony-review:head1 -->')
+    expect(gl.posted[1]).toContain('Unbounded retry backoff')
 
     const job = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head1' })
     expect(job?.state).toBe('published')
-    expect(job?.publishedNoteId).toBe('note-1')
+    // The announcement is note-1. Only the final result belongs in the job's
+    // publication field, so retry/idempotency continues to key off the result.
+    expect(job?.publishedNoteId).toBe('note-2')
   })
 
   it('is idempotent: a second poll over the same head does not post twice', async () => {
@@ -203,7 +214,35 @@ describe('review pipeline end to end', () => {
     await controller.poll()
     await settle()
 
-    expect(gl.posted).toHaveLength(1)
+    expect(gl.posted).toHaveLength(2)
+  })
+
+  it('posts exactly one start note and one final note for each reviewed head', async () => {
+    let currentHead = 'head1'
+    const summaries = [summary()]
+    const gl = fakeGitLab({ summaries, headAt: () => currentHead })
+    const { store, controller } = pipeline(gl, fakeAgent(goodFindings))
+
+    await controller.poll()
+    await settle()
+
+    currentHead = 'head2'
+    summaries[0] = summary({
+      headSha: 'head2',
+      updatedAt: new Date('2026-01-01T00:01:00Z'),
+    })
+    await controller.poll()
+    await settle()
+
+    expect(gl.posted).toHaveLength(4)
+    expect(gl.posted[0]).toContain('<!-- symphony-review-started:head1 -->')
+    expect(gl.posted[1]).toContain('<!-- symphony-review:head1 -->')
+    expect(gl.posted[2]).toContain('<!-- symphony-review-started:head2 -->')
+    expect(gl.posted[3]).toContain('<!-- symphony-review:head2 -->')
+
+    const second = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head2' })
+    expect(second?.state).toBe('published')
+    expect(second?.publishedNoteId).toBe('note-4')
   })
 
   it('destroys the disposable workspace when the job is done', async () => {
@@ -219,7 +258,7 @@ describe('review pipeline end to end', () => {
     expect(readdirSync(wsRoot)).toEqual([])
   })
 
-  it('a head that moves mid-review supersedes and publishes NOTHING', async () => {
+  it('a head that moves mid-review keeps the start announcement but publishes no final review', async () => {
     let head = 'head1'
     const gl = fakeGitLab({ headAt: () => head })
     const { store, controller } = pipeline(gl, {
@@ -233,18 +272,41 @@ describe('review pipeline end to end', () => {
     await controller.poll()
     await settle()
 
-    expect(gl.posted).toHaveLength(0)
+    expect(gl.posted).toHaveLength(1)
+    expect(gl.posted[0]).toContain('<!-- symphony-review-started:head1 -->')
+    expect(gl.posted[0]).not.toContain('<!-- symphony-review:head1 -->')
     const job = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head1' })
     expect(job?.state).toBe('superseded')
   })
 
-  it('a malformed findings document fails the job and publishes nothing', async () => {
+  it('a malformed findings document fails after the start announcement and publishes no final review', async () => {
     const gl = fakeGitLab()
     const { store, controller } = pipeline(gl, fakeAgent({ summary: 'x', findings: [{ severity: 'wrong' }] }))
 
     await controller.poll()
     await settle()
 
+    expect(gl.posted).toHaveLength(1)
+    expect(gl.posted[0]).toContain('<!-- symphony-review-started:head1 -->')
+    const job = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head1' })
+    expect(job?.state).toBe('failed')
+    expect(job?.attempts).toBe(1)
+  })
+
+  it('does not launch an agent when the mandatory start announcement fails', async () => {
+    let agentRan = false
+    const gl = fakeGitLab({ failStartNote: true })
+    const { store, controller } = pipeline(gl, {
+      run: async () => {
+        agentRan = true
+        return { sessionId: 's', success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+      },
+    })
+
+    await controller.poll()
+    await settle()
+
+    expect(agentRan).toBe(false)
     expect(gl.posted).toHaveLength(0)
     const job = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head1' })
     expect(job?.state).toBe('failed')
@@ -287,8 +349,8 @@ describe('review pipeline end to end', () => {
     await controller.poll()
     await settle()
 
-    expect(gl.posted).toHaveLength(1)
-    const body = gl.posted[0]!
+    expect(gl.posted).toHaveLength(2)
+    const body = gl.posted[1]!
     // The published note is rendered from the validated findings document alone.
     expect(body).toContain('Unbounded retry backoff')
     expect(body).not.toContain('IGNORE ALL PREVIOUS INSTRUCTIONS')
@@ -325,30 +387,72 @@ describe('review pipeline end to end', () => {
     await controller.poll()
     await settle()
 
-    expect(gl.posted).toHaveLength(1)
-    expect(gl.posted[0]).toContain('From chunk 0')
-    expect(gl.posted[0]).toContain('From chunk 1')
+    expect(gl.posted).toHaveLength(2)
+    expect(gl.posted[1]).toContain('From chunk 0')
+    expect(gl.posted[1]).toContain('From chunk 1')
     const job = await store.get({ projectId: 'grp/svc', mrIid: 42, headSha: 'head1' })
     expect(job?.state).toBe('published')
 
     // Idempotent under chunking too — a second poll must not re-run either chunk.
     await controller.poll()
     await settle()
-    expect(gl.posted).toHaveLength(1)
+    expect(gl.posted).toHaveLength(2)
+  })
+
+  it('runs configured reviewer profiles concurrently and publishes one consolidated final review', async () => {
+    const reviewers: ReviewReviewerConfig[] = [
+      { id: 'general', primary: true, instructions: 'Broad correctness.', maxChunks: null },
+      { id: 'security', primary: false, instructions: 'Security boundaries.', maxChunks: 2 },
+      { id: 'reliability', primary: false, instructions: 'Failure paths.', maxChunks: 2 },
+    ]
+    let running = 0
+    let maxRunning = 0
+    let started = 0
+    let release!: () => void
+    const allStarted = new Promise<void>((resolve) => { release = resolve })
+    const agent = {
+      run: async (_t: unknown, _p: string, wsPath?: string | null) => {
+        const call = started++
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        if (started === reviewers.length) release()
+        await allStarted
+        writeFileSync(join(wsPath!, 'FINDINGS.json'), JSON.stringify({
+          summary: `reviewer ${call}`,
+          findings: [{
+            severity: 'concern', file: 'src/fetch.ts', line: 2, lineType: 'added',
+            title: `Reviewer finding ${call}`, detail: `detail ${call}`, suggestion: null,
+          }],
+        }), 'utf8')
+        running--
+        return { sessionId: `s${call}`, success: true, turnsCompleted: 1, stopReason: 'completed' as const }
+      },
+    }
+    const gl = fakeGitLab()
+    const { controller } = pipeline(gl, agent, {
+      reviewers,
+      sessionPool: new ReviewSessionPool(3),
+    })
+
+    await controller.poll()
+    await settle()
+
+    expect(maxRunning).toBe(3)
+    expect(gl.posted).toHaveLength(2)
+    expect(gl.posted[0]).toContain('<!-- symphony-review-started:head1 -->')
+    for (let i = 0; i < reviewers.length; i++) {
+      expect(gl.posted[1]).toContain(`Reviewer finding ${i}`)
+    }
+    expect(gl.posted[1]).toContain('<!-- symphony-review:head1 -->')
   })
 })
 
 // ---------------------------------------------------------------------------
-// SLICE E: worker -> critic/checkout -> publisher, wired directly.
+// Worker -> critic/checkout -> publisher, wired directly.
 //
-// These bypass ReviewJobRunner deliberately. job_runner.ts is frozen for this
-// wave and its own `FindingsPublisher.publish()` call only ever constructs
-// `{ job, findings, diffFiles }` — no `provenance` field — so a review run
-// through the full store/controller/job_runner stack never gets a footer
-// under THIS wave's wiring. Composing ReviewWorker and ReviewPublisher
-// directly (still both real, still no fakes standing in for either) is the
-// only way to exercise the actual data path slice E adds: worker's
-// `outcome.provenance` reaching the publisher's `PublishRequest.provenance`.
+// The full pipeline cases above cover lifecycle and publication. These focused
+// compositions isolate the two optional material passes so failures are easy
+// to attribute while still exercising the real worker/publisher data contract.
 // ---------------------------------------------------------------------------
 
 describe('review pipeline end to end — critic and checkout reaching the published note', () => {

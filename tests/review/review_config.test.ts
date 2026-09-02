@@ -29,7 +29,34 @@ describe('buildReviewConfig', () => {
     expect(cfg.maxAttempts).toBe(3)
     expect(cfg.maxDiffBytes).toBe(400000)
     expect(cfg.perProjectMaxInFlight).toBe(1)
+    expect(cfg.maxParallelReviewAgents).toBe(cfg.maxConcurrentReviews)
+    expect(cfg.reviewers).toEqual([
+      { id: 'default', primary: true, instructions: '', maxChunks: null },
+    ])
     expect(cfg.agent.completionMarker).toBe('SYMPHONY_REVIEW_DONE')
+  })
+
+  it('defaults the session ceiling to a customized merge-request ceiling', () => {
+    const cfg = buildReviewConfig(review({ max_concurrent_reviews: 7 }), env())
+
+    expect(cfg.maxConcurrentReviews).toBe(7)
+    expect(cfg.maxParallelReviewAgents).toBe(7)
+  })
+
+  it('normalizes named reviewer profiles and an explicit session ceiling', () => {
+    const cfg = buildReviewConfig(review({
+      max_parallel_review_agents: 6,
+      reviewers: [
+        { id: 'general', primary: true, instructions: 'Review correctness.' },
+        { id: 'error_paths', instructions: 'Review failure paths.', max_chunks: 2 },
+      ],
+    }), env())
+
+    expect(cfg.maxParallelReviewAgents).toBe(6)
+    expect(cfg.reviewers).toEqual([
+      { id: 'general', primary: true, instructions: 'Review correctness.', maxChunks: null },
+      { id: 'error_paths', primary: false, instructions: 'Review failure paths.', maxChunks: 2 },
+    ])
   })
 
   it('takes the store and workspace roots from the environment, not the file', () => {
@@ -106,6 +133,78 @@ describe('validateReviewConfig', () => {
     const errors = validateReviewConfig(buildReviewConfig(wf, env()), env())
 
     expect(errors.some((x) => x.includes('reserved_review_slots'))).toBe(true)
+  })
+})
+
+describe('validateReviewConfig — reviewer profiles', () => {
+  it('accepts one unconditional primary and bounded supplemental reviewers', () => {
+    const cfg = buildReviewConfig(review({
+      reviewers: [
+        { id: 'general', primary: true, instructions: 'Review broadly.' },
+        { id: 'security', instructions: 'Review trust boundaries.', max_chunks: 2 },
+        { id: 'reliability', instructions: 'Review concurrency and retries.' },
+      ],
+    }), env())
+
+    expect(validateReviewConfig(cfg, env())).toEqual([])
+  })
+
+  it('rejects an explicitly empty reviewer list', () => {
+    const errors = validateReviewConfig(
+      buildReviewConfig(review({ reviewers: [] }), env()),
+      env(),
+    )
+
+    expect(errors.some((x) => x.includes('at least one reviewer'))).toBe(true)
+    expect(errors.some((x) => x.includes('exactly one primary'))).toBe(true)
+  })
+
+  it('requires exactly one primary reviewer', () => {
+    const noPrimary = validateReviewConfig(buildReviewConfig(review({
+      reviewers: [{ id: 'general' }, { id: 'security', max_chunks: 2 }],
+    }), env()), env())
+    const twoPrimaries = validateReviewConfig(buildReviewConfig(review({
+      reviewers: [
+        { id: 'general', primary: true },
+        { id: 'security', primary: true },
+      ],
+    }), env()), env())
+
+    expect(noPrimary.some((x) => x.includes('exactly one primary') && x.includes('found 0'))).toBe(true)
+    expect(twoPrimaries.some((x) => x.includes('exactly one primary') && x.includes('found 2'))).toBe(true)
+  })
+
+  it('requires the primary reviewer to remain eligible for every chunk count', () => {
+    const errors = validateReviewConfig(buildReviewConfig(review({
+      reviewers: [{ id: 'general', primary: true, max_chunks: 2 }],
+    }), env()), env())
+
+    expect(errors.some((x) => x.includes('primary') && x.includes('cannot set max_chunks'))).toBe(true)
+  })
+
+  it('requires unique safe reviewer ids', () => {
+    const errors = validateReviewConfig(buildReviewConfig(review({
+      reviewers: [
+        { id: 'General Review', primary: true },
+        { id: 'duplicate' },
+        { id: 'duplicate', max_chunks: 2 },
+      ],
+    }), env()), env())
+
+    expect(errors.some((x) => x.includes('General Review') && x.includes('lowercase'))).toBe(true)
+    expect(errors.some((x) => x.includes('ids must be unique') && x.includes('duplicate'))).toBe(true)
+  })
+
+  it('rejects non-positive max_chunks and max_parallel_review_agents structurally', () => {
+    expect(() => buildReviewConfig(review({
+      max_parallel_review_agents: 0,
+    }), env())).toThrow()
+    expect(() => buildReviewConfig(review({
+      reviewers: [
+        { id: 'general', primary: true },
+        { id: 'security', max_chunks: 0 },
+      ],
+    }), env())).toThrow()
   })
 })
 

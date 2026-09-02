@@ -281,6 +281,13 @@ export function validateCompletionSignal(cfg: ServiceConfig, promptTemplate: str
 // A review-only deployment ships REVIEW.md and NO WORKFLOW.md at all, which is
 // why this lives beside `buildServiceConfig` rather than inside it.
 
+const ReviewReviewerRawSchema = z.object({
+  id: z.string(),
+  primary: z.boolean().default(false),
+  instructions: z.string().default(''),
+  max_chunks: z.number().int().positive().optional(),
+})
+
 const ReviewRawSchema = z.object({
   base_url: z.string().default(''),
   /** Whole-group coverage: one API call per poll regardless of project count. */
@@ -380,6 +387,17 @@ const ReviewRawSchema = z.object({
    */
   keep_failed_workspaces: z.boolean().default(false),
   max_concurrent_reviews: z.number().int().positive().default(2),
+  /**
+   * Global ceiling for reviewer and critic sessions across all active merge
+   * requests. Optional because its default follows max_concurrent_reviews,
+   * including when that older setting has been customized.
+   */
+  max_parallel_review_agents: z.number().int().positive().optional(),
+  /**
+   * Named review lenses. Omission preserves the historic single-reviewer
+   * behavior; an explicit list is validated below rather than silently fixed.
+   */
+  reviewers: z.array(ReviewReviewerRawSchema).optional(),
   reserved_review_slots: z.number().int().nonnegative().default(1),
 })
 
@@ -423,6 +441,14 @@ function enforcedReviewPermissions(): Record<string, string> {
   return map
 }
 
+export interface ReviewReviewerConfig {
+  id: string
+  primary: boolean
+  instructions: string
+  /** null means the reviewer is eligible regardless of material chunk count. */
+  maxChunks: number | null
+}
+
 export interface ReviewConfig {
   baseUrl: string
   groupId: string | null
@@ -446,6 +472,8 @@ export interface ReviewConfig {
   perProjectMaxInFlight: number
   keepFailedWorkspaces: boolean
   maxConcurrentReviews: number
+  maxParallelReviewAgents: number
+  reviewers: ReviewReviewerConfig[]
   reservedReviewSlots: number
   agent: {
     maxTurns: number
@@ -462,6 +490,15 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
   const root = wf.config as Record<string, unknown>
   const rRaw = ReviewRawSchema.parse((root.review as object) ?? {})
   const aRaw = ReviewAgentRawSchema.parse((root.agent as object) ?? {})
+
+  const reviewers: ReviewReviewerConfig[] = rRaw.reviewers === undefined
+    ? [{ id: 'default', primary: true, instructions: '', maxChunks: null }]
+    : rRaw.reviewers.map((reviewer) => ({
+        id: reviewer.id,
+        primary: reviewer.primary,
+        instructions: reviewer.instructions,
+        maxChunks: reviewer.max_chunks ?? null,
+      }))
 
   return {
     baseUrl: rRaw.base_url,
@@ -489,6 +526,8 @@ export function buildReviewConfig(wf: WorkflowDefinition, env: NodeJS.ProcessEnv
     // editing (and later forgetting to un-edit) a config file.
     keepFailedWorkspaces: truthyEnv(env.SYMPHONY_REVIEW_KEEP_FAILED_WORKSPACES) || rRaw.keep_failed_workspaces,
     maxConcurrentReviews: rRaw.max_concurrent_reviews,
+    maxParallelReviewAgents: rRaw.max_parallel_review_agents ?? rRaw.max_concurrent_reviews,
+    reviewers,
     reservedReviewSlots: rRaw.reserved_review_slots,
     agent: {
       maxTurns: aRaw.max_turns,
@@ -550,6 +589,36 @@ export function validateReviewConfig(cfg: ReviewConfig, env: NodeJS.ProcessEnv =
 
   if (cfg.reservedReviewSlots > cfg.maxConcurrentReviews) {
     errors.push('review.reserved_review_slots cannot exceed review.max_concurrent_reviews')
+  }
+
+  if (cfg.reviewers.length === 0) {
+    errors.push('review.reviewers must contain at least one reviewer when supplied')
+  }
+
+  const reviewerIdPattern = /^[a-z][a-z0-9_-]{0,63}$/
+  const seenReviewerIds = new Set<string>()
+  for (const reviewer of cfg.reviewers) {
+    if (!reviewerIdPattern.test(reviewer.id)) {
+      errors.push(
+        `review.reviewers id ${JSON.stringify(reviewer.id)} must start with a lowercase letter, `
+        + 'contain only lowercase letters, digits, underscores, or hyphens, and be at most 64 characters',
+      )
+    }
+    if (seenReviewerIds.has(reviewer.id)) {
+      errors.push(`review.reviewers ids must be unique; duplicate: ${JSON.stringify(reviewer.id)}`)
+    }
+    seenReviewerIds.add(reviewer.id)
+    if (reviewer.primary && reviewer.maxChunks !== null) {
+      errors.push(
+        `review reviewer ${JSON.stringify(reviewer.id)} is primary and cannot set max_chunks; `
+        + 'the primary reviewer must cover every review',
+      )
+    }
+  }
+
+  const primaryCount = cfg.reviewers.filter((reviewer) => reviewer.primary).length
+  if (primaryCount !== 1) {
+    errors.push(`review.reviewers must contain exactly one primary reviewer; found ${primaryCount}`)
   }
 
   // The permissions block is an assertion about the sandbox, not a control.

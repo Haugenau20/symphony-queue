@@ -26,16 +26,16 @@
  *      the findings that fell back, plus one line saying how many went
  *      inline — so a short note still explains itself. Always posted, even
  *      with zero findings: silence must keep meaning "did not run".
- *   7. NEW, only when inline comments are enabled: reply to every one of our
- *      own inline threads that carries an OLDER headSha, naming the new one,
- *      and attempt to resolve it. Logged and swallowed on failure — the
- *      review is already published by this point.
+ *   7. NEW, only when inline comments are enabled: attempt to resolve each of
+ *      our own inline threads that carries an OLDER headSha. No reply is
+ *      posted. Failures are logged and swallowed — the review is already
+ *      published by this point.
  *
  * The ordering is load-bearing, not cosmetic: swapping 3 and 6 would let a
  * stale review get posted after the code it describes has already changed,
  * dropping 4 would double-post on every retry, running 5 after 6 would leave
  * the note unable to say what went inline, and running 7 before 6 would risk
- * a crash leaving a half-superseded history instead of a published review.
+ * a crash leaving partially cleaned-up history instead of a published review.
  */
 
 import { getLogger } from '../log.js'
@@ -60,6 +60,7 @@ import type {
   MergeRequestSummary,
   ReviewJob,
   ReviewProvenance,
+  ReviewStartAnnouncementResult,
 } from './types.js'
 
 // --- public types -----------------------------------------------------------
@@ -72,12 +73,12 @@ import type {
  *
  * Intersected with the full {@link MergeRequestDiscussionClient} (not another
  * `Pick`) — the publisher is the one place in this pipeline allowed to write
- * inline discussions at all, and it needs all four operations — list, create,
- * reply, resolve — to do steps 5 and 7. No other module's client type gains
+ * inline discussions at all, and it needs all three operations — list, create,
+ * resolve — to do steps 5 and 7. No other module's client type gains
  * these; `ReviewMaterialClient` (worker.ts) stays exactly as narrow as it
  * always was.
  *
- * All four are MANDATORY, not `Partial`. They were briefly optional plus a
+ * All three are MANDATORY, not `Partial`. They were briefly optional plus a
  * constructor-time runtime check, so that two test fixtures typed as a bare
  * `MergeRequestClient` would keep compiling — which traded a compile-time
  * guarantee for a thrown string in order to spare two fixtures. The fixtures
@@ -151,6 +152,19 @@ export type PublishResult =
   | { status: 'superseded' }
   | { status: 'rejected'; reason: string }
 
+/**
+ * The deliberately small, static note posted before any review agent starts.
+ * Keeping this separate from the final review marker means the start signal
+ * can never be mistaken for a completed review on a retry.
+ */
+export function reviewStartedNoteMarker(headSha: string): string {
+  return `<!-- symphony-review-started:${headSha} -->`
+}
+
+export function renderReviewStartedNote(headSha: string): string {
+  return `Symphony review started.\n\n${reviewStartedNoteMarker(headSha)}`
+}
+
 /** All-zero, `attempted: false` — step 5a's exact contract when inline is off. */
 function emptyInlineOutcome(attempted: boolean): InlinePublishOutcome {
   return {
@@ -160,8 +174,8 @@ function emptyInlineOutcome(attempted: boolean): InlinePublishOutcome {
     fellBack: 0,
     fallbackReasons: {},
     failed: 0,
-    superseded: 0,
-    resolved: 0,
+    priorRevisionThreads: 0,
+    priorRevisionThreadsResolved: 0,
   }
 }
 
@@ -397,17 +411,6 @@ export function renderInlineDiscussionBody(finding: Finding, headSha: string, fi
 }
 
 /**
- * Step 7's reply to a prior-revision thread. STATIC text plus a head SHA —
- * nothing else. The SHA is our own job's identity, not merge-request-authored
- * text, but it is still wrapped in a code span rather than trusted verbatim:
- * defence in depth costs one function call here, and every other string this
- * module ever sends to GitLab earns its escaping the same way.
- */
-function renderSupersededReply(newHeadSha: string): string {
-  return `Superseded by a review of the new revision at ${codeSpan(newHeadSha)}. See the new thread(s) posted there.`
-}
-
-/**
  * The provenance footer (design §12: this must be visible to the reader, not
  * hidden). Every value it renders comes from {@link ReviewProvenance} —
  * chunk counts, exclusion reasons, a critic's kept/dropped counts — never
@@ -415,12 +418,13 @@ function renderSupersededReply(newHeadSha: string): string {
  * carry merge-request-authored content. Appended below the findings, never
  * touching step order or the sanitization/head-SHA-recheck steps above it.
  *
- * The chunk line is the ONE conditional element — design §12 only requires
- * the split to be visible "when more than one", so an unchunked (or
- * single-chunk) review's note has no chunk line at all. Whether the
- * self-critique ran is stated unconditionally, in both directions: silence
- * on that point would read as "it must have passed" to anyone who does not
- * already know this pipeline has an optional second pass.
+ * Chunk and fan-out details are conditional: an unchunked review has no chunk
+ * line, and the synthesized one-reviewer success case has no fan-out lines.
+ * Once profiles, skips, failures, de-duplication, or coverage gaps make the
+ * execution materially different, those facts become visible. Whether the
+ * self-critique ran is stated unconditionally, in both directions: silence on
+ * that point would read as "it must have passed" to anyone who does not already
+ * know this pipeline has an optional second pass.
  */
 /**
  * What each exclusion reason means to somebody reading the note, rather than
@@ -467,6 +471,63 @@ export function renderProvenanceFooter(provenance: ReviewProvenance): string {
         ? ` (${provenance.chunksFailed} of ${provenance.chunkCount} failed and were not included)`
         : ''
     lines.push(`- Diff reviewed in ${provenance.chunkCount} batches${failedSuffix}.`)
+  }
+
+  // The synthesized default profile is deliberately invisible: for the
+  // historic one-reviewer/one-session case these counters add no information
+  // and would make every note noisier. As soon as configuration or execution
+  // differs from that default, make the fan-out explicit. Reviewer ids come
+  // from trusted, validated configuration, but still use code spans here so
+  // this renderer stays safe even when called directly in a test or by a
+  // future producer that accidentally bypasses config normalization.
+  const fanout = provenance.fanout
+  const isSynthesizedDefault =
+    fanout.eligibleReviewerIds.length === 1 &&
+    fanout.eligibleReviewerIds[0] === 'default' &&
+    fanout.skippedReviewers.length === 0 &&
+    fanout.sessionsPlanned === 1 &&
+    fanout.sessionsSucceeded === 1 &&
+    fanout.sessionsFailed === 0 &&
+    fanout.failedSessions.length === 0 &&
+    fanout.exactDuplicatesRemoved === 0 &&
+    fanout.uncoveredChunkIndexes.length === 0
+
+  if (!isSynthesizedDefault) {
+    const eligible =
+      fanout.eligibleReviewerIds.length > 0
+        ? fanout.eligibleReviewerIds.map(codeSpan).join(', ')
+        : 'none'
+    let reviewerLine = `- Eligible reviewers: ${eligible}.`
+    if (fanout.skippedReviewers.length > 0) {
+      const skipped = fanout.skippedReviewers
+        .map(
+          ({ reviewerId, maxChunks }) =>
+            `${codeSpan(reviewerId)} (limit ${maxChunks} ${maxChunks === 1 ? 'batch' : 'batches'})`,
+        )
+        .join(', ')
+      reviewerLine += ` Skipped at ${provenance.chunkCount} batches: ${skipped}.`
+    }
+    lines.push(reviewerLine)
+
+    lines.push(
+      `- Reviewer sessions: ${fanout.sessionsSucceeded} succeeded, ${fanout.sessionsFailed} failed ` +
+        `(${fanout.sessionsPlanned} planned); ${fanout.exactDuplicatesRemoved} exact ` +
+        `duplicate${fanout.exactDuplicatesRemoved === 1 ? '' : 's'} removed.`,
+    )
+
+    if (fanout.failedSessions.length > 0) {
+      const failed = fanout.failedSessions
+        .map(({ reviewerId, chunkIndex }) => `${codeSpan(reviewerId)} batch ${chunkIndex + 1}`)
+        .join(', ')
+      lines.push(`- Failed reviewer sessions: ${failed}.`)
+    }
+
+    if (fanout.uncoveredChunkIndexes.length > 0) {
+      const uncovered = fanout.uncoveredChunkIndexes.map((index) => index + 1).join(', ')
+      lines.push(
+        `- Uncovered ${fanout.uncoveredChunkIndexes.length === 1 ? 'batch' : 'batches'}: ${uncovered}.`,
+      )
+    }
   }
 
   if (provenance.critique) {
@@ -534,6 +595,58 @@ export class ReviewPublisher {
   constructor(config: ReviewPublisherConfig) {
     this.mrClient = config.mrClient
     this.inlineComments = config.inlineComments ?? false
+  }
+
+  /**
+   * Announces that Symphony has claimed this exact revision before any agent
+   * work begins. The live head check prevents an obsolete job from announcing
+   * itself, while the per-head marker makes retries and process restarts
+   * idempotent.
+   */
+  async announceStarted(job: ReviewJob): Promise<ReviewStartAnnouncementResult> {
+    const log = getLogger()
+    const { projectId, mrIid, headSha } = job.key
+
+    const fresh: MergeRequestSummary | null = await this.mrClient.getMergeRequest(projectId, mrIid)
+    if (!fresh || fresh.headSha !== headSha) {
+      const currentHeadSha = fresh?.headSha ?? null
+      log.info(
+        { projectId, mrIid, reviewedSha: headSha, currentSha: currentHeadSha },
+        'review_start_superseded',
+      )
+      return { kind: 'superseded', currentHeadSha }
+    }
+
+    const marker = reviewStartedNoteMarker(headSha)
+    const notes = await this.mrClient.listNotes(projectId, mrIid)
+    const selfId = await this.mrClient.getCurrentUserId()
+    const markerNotes = notes.filter((note) => note.body.includes(marker))
+    const existing = selfId === null
+      ? markerNotes[0]
+      : markerNotes.find((note) => note.authorId === selfId)
+
+    if (selfId !== null && markerNotes.length > 0 && !existing) {
+      log.warn(
+        { projectId, mrIid, foreignMarkerNotes: markerNotes.length },
+        'review_start_marker_note_not_ours',
+      )
+    }
+
+    if (existing) {
+      log.info(
+        { projectId, mrIid, noteId: existing.id, authorVerified: selfId !== null },
+        'review_start_already_announced',
+      )
+      return { kind: 'already_announced', noteId: existing.id }
+    }
+
+    const noteId = await this.mrClient.createNote(
+      projectId,
+      mrIid,
+      renderReviewStartedNote(headSha),
+    )
+    log.info({ projectId, mrIid, noteId }, 'review_start_announced')
+    return { kind: 'announced', noteId }
   }
 
   async publish(request: PublishRequest): Promise<PublishResult> {
@@ -743,9 +856,9 @@ export class ReviewPublisher {
       'review_published',
     )
 
-    // 7. supersede prior-revision threads — only when enabled, and only after
+    // 7. clean up prior-revision threads — only when enabled, and only after
     // the note above is safely posted. A crash between 6 and 7 must leave a
-    // published review, never a half-superseded history: superseding is
+    // published review, never partially cleaned-up history: cleanup is
     // tidying, and tidying is what is sacrificed on a partial failure. Never
     // edits the original note or recomputes its position — a thread anchored
     // to an old revision stays exactly where GitLab put it.
@@ -753,53 +866,41 @@ export class ReviewPublisher {
       const discussionClient = this.mrClient
       for (const thread of ourThreads) {
         if (thread.headSha === headSha) continue // this revision, not a prior one
-        try {
-          await discussionClient.replyToDiscussion(projectId, mrIid, thread.discussionId, renderSupersededReply(headSha))
-          inline.superseded++
-        } catch (err) {
-          // Logged and swallowed: the review is already published, and
-          // failing the job now would only retry a publish that already
-          // succeeded.
-          log.warn(
-            { projectId, mrIid, discussionId: thread.discussionId, status: errorStatus(err) },
-            'review_inline_supersede_reply_failed',
-          )
-          continue
-        }
+        inline.priorRevisionThreads++
         try {
           const resolved = await discussionClient.resolveDiscussion(projectId, mrIid, thread.discussionId)
-          if (resolved) inline.resolved++
+          if (resolved) inline.priorRevisionThreadsResolved++
         } catch (err) {
           log.warn(
             { projectId, mrIid, discussionId: thread.discussionId, status: errorStatus(err) },
-            'review_inline_supersede_resolve_failed',
+            'review_inline_prior_revision_resolve_failed',
           )
         }
       }
     }
 
     // Step 7's own outcome, logged HERE and not with `review_published` above —
-    // that line is emitted before this block runs, so `superseded` and
-    // `resolved` are necessarily still zero there. Logging them at that point
+    // that line is emitted before this block runs, so both cleanup counters
+    // are necessarily still zero there. Logging them at that point
     // reported nothing and looked like it reported something.
     //
-    // Only when supersession actually did something, so an ordinary first
-    // review stays quiet. `resolved` is the interesting number: it answers,
+    // Only when cleanup actually had work, so an ordinary first review stays
+    // quiet. The resolved count is the interesting number: it answers,
     // from production rather than from documentation, whether this token may
     // resolve a discussion it authored. On our instance it may not — GitLab
-    // returns 403 to a Reporter — so the reply stands alone and the thread
-    // stays open, which is the designed fallback and not a failure.
-    if (inline.superseded > 0) {
+    // returns 403 to a Reporter — so the thread stays open, which is the
+    // designed fallback and not a failure.
+    if (inline.priorRevisionThreads > 0) {
       log.info(
         {
           projectId,
           mrIid,
           headSha,
-          superseded: inline.superseded,
-          resolved: inline.resolved,
-          resolvePermitted: inline.resolved > 0,
+          priorRevisionThreads: inline.priorRevisionThreads,
+          priorRevisionThreadsResolved: inline.priorRevisionThreadsResolved,
+          resolvePermitted: inline.priorRevisionThreadsResolved > 0,
         },
-        'review_inline_superseded',
+        'review_inline_prior_revision_cleanup',
       )
     }
 
